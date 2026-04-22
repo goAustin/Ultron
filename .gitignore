@@ -13,8 +13,10 @@ coverage/
 .env.*
 .claude/
 reference/
+docs/
 AGENTS.md
 CLAUDE.md
+v2-ROADMAP.md
 
 # Logs
 *.log
