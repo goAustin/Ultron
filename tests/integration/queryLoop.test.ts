@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 
 import { query } from '../../src/core/query.js'
-import { stubDeps } from '../../src/core/queryDeps.js'
+import { stubDeps, adaptRunTool } from '../../src/core/queryDeps.js'
 import { createUserMessage, messageId, toolUseId } from '../../src/core/messages.js'
 import type { Message, UserMessage } from '../../src/core/messages.js'
 import type { QueryEvent } from '../../src/core/queryEvents.js'
@@ -117,7 +117,7 @@ describe('query loop — basic flow', () => {
     const { events, terminal } = await collectEvents({
       messages: [userMsg],
       systemPrompt: 'Test',
-      deps: { callModel, runTool },
+      deps: { callModel, ...adaptRunTool(runTool) },
     })
 
     expect(terminal.reason).toBe('end_turn')
@@ -156,7 +156,7 @@ describe('query loop — basic flow', () => {
     const { terminal } = await collectEvents({
       messages: [userMsg],
       systemPrompt: 'Test',
-      deps: { callModel, runTool },
+      deps: { callModel, ...adaptRunTool(runTool) },
     })
 
     expect(terminal.reason).toBe('end_turn')
@@ -180,7 +180,7 @@ describe('query loop — limits and recovery', () => {
     const { terminal } = await collectEvents({
       messages: [userMsg],
       systemPrompt: 'Test',
-      deps: { callModel, runTool },
+      deps: { callModel, ...adaptRunTool(runTool) },
       maxTurns: 1,
     })
 
@@ -223,7 +223,7 @@ describe('query loop — abort', () => {
     const gen = query({
       messages: [userMsg],
       systemPrompt: 'Test',
-      deps: { callModel, runTool },
+      deps: { callModel, ...adaptRunTool(runTool) },
       signal: ac.signal,
     })
 
@@ -265,7 +265,7 @@ describe('query loop — attachments', () => {
     const { events, terminal } = await collectEvents({
       messages: [userMsg],
       systemPrompt: 'Test',
-      deps: { callModel, runTool, getAttachments },
+      deps: { callModel, ...adaptRunTool(runTool), getAttachments },
     })
 
     expect(terminal.reason).toBe('end_turn')
@@ -286,7 +286,7 @@ describe('query loop — attachments', () => {
     const { events } = await collectEvents({
       messages: [userMsg],
       systemPrompt: 'Test',
-      deps: { callModel, runTool },
+      deps: { callModel, ...adaptRunTool(runTool) },
     })
 
     expect(events.filter((e) => e.type === 'attachment')).toHaveLength(0)

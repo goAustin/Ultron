@@ -4,34 +4,31 @@
  */
 
 import type { ToolUseBlock, ToolUseId } from '../messages.js'
-import type { ToolResult } from './types.js'
+import type { ToolResult, ToolErrorKind } from './types.js'
 import type { ToolUseContext } from './context.js'
-import type { RunToolFn } from '../queryDeps.js'
+import type {
+  AuthorizeToolUseFn,
+  ExecuteToolUseFn,
+} from '../queryDeps.js'
 import type { PermissionOptions } from '../permissions/types.js'
-import { runToolUse } from './runToolUse.js'
+import {
+  authorizeToolUse,
+  executeToolUse,
+} from './runToolUse.js'
 
-// ---------------------------------------------------------------------------
-// Error kinds
-// ---------------------------------------------------------------------------
-
-export type ToolErrorKind =
-  | 'tool_not_found'
-  | 'validation_failed'
-  | 'permission_denied'
-  | 'permission_ask'
-  | 'execution_error'
-  | 'aborted'
+// Re-export for call sites that previously imported ToolErrorKind from here.
+export type { ToolErrorKind }
 
 // ---------------------------------------------------------------------------
 // Error & abort helpers
 // ---------------------------------------------------------------------------
 
 export function makeErrorResult(kind: ToolErrorKind, message: string): ToolResult {
-  return { content: `[${kind}] ${message}`, isError: true }
+  return { content: `[${kind}] ${message}`, isError: true, errorKind: kind }
 }
 
 export function makeAbortResult(): ToolResult {
-  return { content: '[aborted] Interrupted by user', isError: true }
+  return { content: '[aborted] Interrupted by user', isError: true, errorKind: 'aborted' }
 }
 
 /**
@@ -52,11 +49,18 @@ export type ToolResultPair = {
 }
 
 // ---------------------------------------------------------------------------
-// RunToolFn adapter — drop-in replacement for the Phase 1 stub
+// Deps adapters — bind the pipeline halves against a ToolUseContext + permission opts
 // ---------------------------------------------------------------------------
 
-export function createRunToolFn(context: ToolUseContext, permissionOpts?: PermissionOptions): RunToolFn {
-  return async (toolUse: ToolUseBlock, signal: AbortSignal) => {
-    return runToolUse(toolUse, context, signal, permissionOpts)
-  }
+export function createAuthorizeToolUseFn(
+  context: ToolUseContext,
+  permissionOpts?: PermissionOptions,
+): AuthorizeToolUseFn {
+  return async (toolUse: ToolUseBlock, signal: AbortSignal) =>
+    authorizeToolUse(toolUse, context, signal, permissionOpts)
+}
+
+export function createExecuteToolUseFn(context: ToolUseContext): ExecuteToolUseFn {
+  return async (toolUse: ToolUseBlock, signal: AbortSignal) =>
+    executeToolUse(toolUse, context, signal)
 }

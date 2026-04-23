@@ -7,7 +7,13 @@ import { QueryEngine } from './QueryEngine.js'
 import type { QueryEngineConfig } from './QueryEngine.js'
 import type { QueryEvent } from '../core/queryEvents.js'
 import type { Terminal } from '../core/queryTypes.js'
-import type { CallModelFn, RunToolFn, RawStreamEvent, ApiResponseMeta } from '../core/queryDeps.js'
+import type {
+  CallModelFn,
+  AuthorizeToolUseFn,
+  ExecuteToolUseFn,
+  RawStreamEvent,
+  ApiResponseMeta,
+} from '../core/queryDeps.js'
 import { appendMessage } from '../session/transcript.js'
 import { createUserMessage, createAssistantMessage, messageId, toolUseId } from '../core/messages.js'
 
@@ -33,8 +39,12 @@ function textCallModel(text: string): CallModelFn {
   }
 }
 
-/** Stub runTool that returns a simple result. */
-const stubRunTool: RunToolFn = async () => ({ content: 'ok', isError: false })
+/** Stub authorize/execute pair that authorizes everything and returns a static result. */
+const stubAuthorize: AuthorizeToolUseFn = async () => ({
+  outcome: 'authorized',
+  decision: { decision: 'allow', reason: 'test-stub' },
+})
+const stubExecute: ExecuteToolUseFn = async () => ({ content: 'ok', isError: false })
 
 function makeConfig(cwd: string, overrides?: Partial<QueryEngineConfig>): QueryEngineConfig {
   return {
@@ -43,7 +53,8 @@ function makeConfig(cwd: string, overrides?: Partial<QueryEngineConfig>): QueryE
     cwd,
     deps: {
       callModel: textCallModel('Hello back!'),
-      runTool: stubRunTool,
+      authorizeToolUse: stubAuthorize,
+      executeToolUse: stubExecute,
     },
     ...overrides,
   }
@@ -319,7 +330,7 @@ describe('QueryEngine', () => {
         const engine = new QueryEngine(makeConfig(cwd, {
           model: 'claude-opus-4-7',
           thinkingBudget: 4096,
-          deps: { callModel: spy, runTool: stubRunTool },
+          deps: { callModel: spy, authorizeToolUse: stubAuthorize, executeToolUse: stubExecute },
         }))
         await collectEvents(engine.submitPrompt('hi'))
         expect(captured[0]).toEqual({ thinkingBudget: 4096, interleavedThinking: undefined })
@@ -332,7 +343,7 @@ describe('QueryEngine', () => {
         const engine = new QueryEngine(makeConfig(cwd, {
           model: 'claude-opus-4-7',
           thinkingBudget: 4096,
-          deps: { callModel: spy, runTool: stubRunTool },
+          deps: { callModel: spy, authorizeToolUse: stubAuthorize, executeToolUse: stubExecute },
         }))
         await collectEvents(engine.submitPrompt('hi', { thinkingBudget: 8192 }))
         expect(captured[0]!.thinkingBudget).toBe(8192)
@@ -345,7 +356,7 @@ describe('QueryEngine', () => {
         const engine = new QueryEngine(makeConfig(cwd, {
           model: 'claude-opus-4-7',
           thinkingBudget: 4096,
-          deps: { callModel: spy, runTool: stubRunTool },
+          deps: { callModel: spy, authorizeToolUse: stubAuthorize, executeToolUse: stubExecute },
         }))
         await collectEvents(engine.submitPrompt('hi', { thinkingBudget: 0 }))
         expect(captured[0]!.thinkingBudget).toBeUndefined()

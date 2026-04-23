@@ -16,12 +16,17 @@ import type { Message } from '../core/messages.js'
 import { createUserMessage, messageId } from '../core/messages.js'
 import type { PermissionMode, AppState } from '../core/state.js'
 import { createStore, getDefaultAppState } from '../core/state.js'
-import type { AskUserFn, LogPermissionDecisionFn, PermissionOptions } from '../core/permissions/types.js'
+import type { AskUserFn, PermissionOptions } from '../core/permissions/types.js'
 import { filesystemSafetyChecks } from '../core/permissions/filesystem.js'
 import { createDefaultRegistry } from '../core/tools/registry.js'
 import { createToolUseContext } from '../core/tools/context.js'
 import type { ReadFileState } from '../core/tools/context.js'
-import { createRunToolFn } from '../core/tools/toolExecution.js'
+import {
+  createAuthorizeToolUseFn,
+  createExecuteToolUseFn,
+} from '../core/tools/toolExecution.js'
+import { createAuditWriter } from '../audit/auditLog.js'
+import type { AuditWriter } from '../audit/types.js'
 import { resolveModel } from '../core/providers/registry.js'
 import type { ProviderId, CapabilitySheet } from '../core/providers/types.js'
 import { MissingApiKeyError } from '../core/providers/types.js'
@@ -55,7 +60,6 @@ export type QueryEngineConfig = {
   readonly permissionMode?: PermissionMode
   readonly headless?: boolean
   readonly askUser?: AskUserFn
-  readonly logDecision?: LogPermissionDecisionFn
   readonly maxTurns?: number
   readonly sessionId?: string
   readonly compactModel?: string
@@ -67,6 +71,12 @@ export type QueryEngineConfig = {
   readonly thinkingBudget?: number
   /** Engine-wide default for Anthropic interleaved-thinking. */
   readonly interleavedThinking?: boolean
+  /**
+   * Audit writer for the Phase 2a audit spine. When omitted, the engine creates
+   * a default writer at `~/.ultron/audit.jsonl`. Tests should inject a writer
+   * pointed at a temp dir to avoid touching the user's real home.
+   */
+  readonly auditWriter?: AuditWriter
   /** Test-only: override assembled deps. Not part of the public SDK surface. */
   readonly deps?: Partial<QueryDeps>
 }
@@ -90,6 +100,7 @@ export class QueryEngine {
   private readonly appState: ReturnType<typeof createStore<ReturnType<typeof getDefaultAppState>>>
   private readonly readFileState: ReadFileState
   private readonly permissionOpts: PermissionOptions
+  private readonly auditWriter: AuditWriter
   private session: SessionInfo
 
   // --- Per-submission ---
@@ -125,8 +136,9 @@ export class QueryEngine {
       headless,
       safetyChecks: [...filesystemSafetyChecks],
       askUser: headless ? undefined : config.askUser,
-      logDecision: config.logDecision,
     }
+
+    this.auditWriter = config.auditWriter ?? createAuditWriter()
 
     // Session
     if (config.sessionId) {
@@ -311,6 +323,7 @@ export class QueryEngine {
         cwd: this.config.cwd,
         sessionDir: this.session.dir,
         permissionOpts: this.permissionOpts,
+        auditWriter: this.auditWriter,
         parentThinkingBudget: thinkingBudget,
         parentInterleavedThinking: interleavedThinking,
       })
@@ -324,12 +337,14 @@ export class QueryEngine {
         toolRegistry: this.toolRegistry,
         forkSubagent,
       })
-      const runTool = createRunToolFn(toolUseContext, this.permissionOpts)
+      const authorizeToolUse = createAuthorizeToolUseFn(toolUseContext, this.permissionOpts)
+      const executeToolUse = createExecuteToolUseFn(toolUseContext)
 
       // Assemble deps
       const deps: Partial<QueryDeps> = {
         callModel: this.callModel,
-        runTool,
+        authorizeToolUse,
+        executeToolUse,
         compact: createCompactFn(this.compactCallModel, uuid),
         uuid,
         getAttachments: buildGetAttachments(this.config.cwd),
@@ -351,6 +366,9 @@ export class QueryEngine {
       let result = await gen.next()
       while (!result.done) {
         const event = result.value
+
+        // Tee every event to the audit log (structured, redacted, rotated).
+        this.auditWriter.write(event)
 
         // Persist persistable messages
         const msg = getEventMessage(event)

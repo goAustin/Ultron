@@ -8,7 +8,7 @@
 import { describe, it, expect } from 'vitest'
 
 import { query } from '../../src/core/query.js'
-import { stubDeps } from '../../src/core/queryDeps.js'
+import { stubDeps, adaptRunTool } from '../../src/core/queryDeps.js'
 import { createUserMessage, messageId } from '../../src/core/messages.js'
 import type { QueryEvent } from '../../src/core/queryEvents.js'
 import type {
@@ -93,7 +93,7 @@ describe('compaction continuity', () => {
       systemPrompt: 'Test',
       deps: {
         callModel,
-        runTool: async () => ({ content: 'file content', isError: false }),
+        ...adaptRunTool(async () => ({ content: 'file content', isError: false })),
         compact,
       },
       maxTurns: 3,
@@ -102,10 +102,10 @@ describe('compaction continuity', () => {
     const events = await collectEvents(gen)
 
     expect(compactCalled).toBe(true)
-    expect(events.some((e) => e.type === 'compact')).toBe(true)
+    expect(events.some((e) => e.type === 'compaction_finished')).toBe(true)
 
-    const compactEvent = events.find((e) => e.type === 'compact')!
-    expect(compactEvent.type).toBe('compact')
+    const compactEvent = events.find((e) => e.type === 'compaction_finished')!
+    expect(compactEvent.type).toBe('compaction_finished')
   })
 
   it('reactive compaction triggers on prompt_too_long error', async () => {
@@ -145,7 +145,7 @@ describe('compaction continuity', () => {
     const events = await collectEvents(gen)
 
     expect(compactCalled).toBe(true)
-    expect(events.some((e) => e.type === 'compact')).toBe(true)
+    expect(events.some((e) => e.type === 'compaction_finished')).toBe(true)
     // Should have a successful turn after compaction
     expect(events.some((e) => e.type === 'turn')).toBe(true)
   })

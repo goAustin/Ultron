@@ -26,8 +26,12 @@ import type { ToolRegistry } from '../core/tools/registry.js'
 import { createToolRegistry } from '../core/tools/registry.js'
 import { createToolUseContext } from '../core/tools/context.js'
 import type { ReadFileState } from '../core/tools/context.js'
-import { createRunToolFn } from '../core/tools/toolExecution.js'
+import {
+  createAuthorizeToolUseFn,
+  createExecuteToolUseFn,
+} from '../core/tools/toolExecution.js'
 import type { PermissionOptions } from '../core/permissions/types.js'
+import type { AuditWriter } from '../audit/types.js'
 import { createCompactFn } from '../context/compact.js'
 import { getInitialAttachments } from '../context/attachments.js'
 import { appendMessage, getEventMessage } from '../session/transcript.js'
@@ -50,6 +54,8 @@ export type SubagentOptions = {
   readonly cwd: string
   readonly sessionDir: string
   readonly permissionOpts: PermissionOptions
+  /** Audit writer shared with the parent — every subagent event lands on the parent's audit log. */
+  readonly auditWriter: AuditWriter
   readonly allowedTools?: readonly string[]
   readonly maxTurns?: number
   readonly parentThinkingBudget?: number
@@ -116,7 +122,8 @@ export function createForkSubagent(opts: SubagentOptions): ForkSubagentFn {
         toolRegistry: childRegistry,
       })
 
-      const runTool = createRunToolFn(toolUseContext, opts.permissionOpts)
+      const authorizeToolUse = createAuthorizeToolUseFn(toolUseContext, opts.permissionOpts)
+      const executeToolUse = createExecuteToolUseFn(toolUseContext)
       const uuid = (): MessageId => messageId(randomUUID())
 
       // System prompt with subagent preamble
@@ -134,7 +141,8 @@ export function createForkSubagent(opts: SubagentOptions): ForkSubagentFn {
       // Assemble deps
       const deps: Partial<QueryDeps> = {
         callModel: opts.callModel,
-        runTool,
+        authorizeToolUse,
+        executeToolUse,
         compact: createCompactFn(opts.compactCallModel, uuid),
         uuid,
         // No getAttachments — read-only subagents don't trigger per-turn refreshes
@@ -151,12 +159,19 @@ export function createForkSubagent(opts: SubagentOptions): ForkSubagentFn {
         interleavedThinking: opts.parentInterleavedThinking,
       })
 
+      // Tag every event written from this fork with the subagent id so the
+      // parent's audit log carries origin provenance.
+      const forkWriter = opts.auditWriter.withOrigin(subagentId)
+
       // Collect events, persist transcript, extract final text
       let lastAssistantText = ''
       let result = await gen.next()
 
       while (!result.done) {
         const event = result.value
+
+        // Tee every event into the parent's shared audit log (with origin stamp).
+        forkWriter.write(event)
 
         // Persist persistable messages to subagent transcript
         const msg = getEventMessage(event)

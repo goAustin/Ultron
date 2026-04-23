@@ -15,9 +15,16 @@ import {
   messageId,
   toolUseId,
 } from './messages.js'
-import type { QueryEvent } from './queryEvents.js'
+import type { QueryEvent, CompactionTrigger } from './queryEvents.js'
 import type { QueryDeps, RawStreamEvent, RawContentBlockStart, RawContentBlockDelta } from './queryDeps.js'
 import { productionDeps } from './queryDeps.js'
+import {
+  makePermissionDecisionEvent,
+  makeToolCallStartedEvent,
+  makeToolCallFinishedEvent,
+  makeCompactionStartedEvent,
+  makeCompactionFinishedEvent,
+} from './queryEventFactories.js'
 import type { SystemPromptPart } from '../context/systemPromptParts.js'
 import type { QueryParams, LoopState, Terminal } from './queryTypes.js'
 import {
@@ -71,20 +78,17 @@ export async function* query(
     if (state.lastInputTokens === undefined && !state.hasAttemptedCompact) {
       const estimated = estimateTokens(normalized)
       if (shouldCompact(estimated)) {
-        try {
-          const messagesBefore = state.messages.length
-          const compacted = await deps.compact([...state.messages])
-          yield { type: 'compact', messagesBefore, messagesAfter: compacted.length }
+        const result = yield* runCompaction(deps, state.messages, 'pre_request')
+        if (result.success) {
           state = {
             ...state,
-            messages: compacted,
+            messages: result.compacted,
             hasAttemptedCompact: true,
             transition: 'prompt_too_long_compact',
           }
           continue // re-normalize with compacted messages
-        } catch {
-          // Heuristic may overestimate — proceed and let the API or reactive path handle it
         }
+        // Heuristic may overestimate — proceed and let the API or reactive path handle it
       }
     }
 
@@ -121,19 +125,15 @@ export async function* query(
       // Check if this is a prompt_too_long (413) error
       if (isPromptTooLongError(err)) {
         if (!state.hasAttemptedCompact) {
-          try {
-            const messagesBefore = state.messages.length
-            const compacted = await deps.compact([...state.messages])
-            yield { type: 'compact', messagesBefore, messagesAfter: compacted.length }
+          const result = yield* runCompaction(deps, state.messages, 'prompt_too_long_recovery')
+          if (result.success) {
             state = {
               ...state,
-              messages: compacted,
+              messages: result.compacted,
               hasAttemptedCompact: true,
               transition: 'prompt_too_long_compact',
             }
             continue
-          } catch {
-            // Compaction not implemented or failed
           }
         }
         return {
@@ -185,19 +185,15 @@ export async function* query(
     if (!needsFollowUp) {
       if (withheldError === 'prompt_too_long') {
         if (!state.hasAttemptedCompact) {
-          try {
-            const messagesBefore = state.messages.length
-            const compacted = await deps.compact([...state.messages])
-            yield { type: 'compact', messagesBefore, messagesAfter: compacted.length }
+          const result = yield* runCompaction(deps, state.messages, 'prompt_too_long_recovery')
+          if (result.success) {
             state = {
               ...state,
-              messages: compacted,
+              messages: result.compacted,
               hasAttemptedCompact: true,
               transition: 'prompt_too_long_compact',
             }
             continue
-          } catch {
-            // Compaction not implemented or failed
           }
         }
         return {
@@ -246,14 +242,45 @@ export async function* query(
     for (const toolUse of toolUseBlocks) {
       if (signal.aborted) break
 
-      yield { type: 'tool_use_start', id: toolUse.id, name: toolUse.name }
+      // Phase 1 — authorize (resolve + validate + permissions + askUser)
+      const auth = await deps.authorizeToolUse(toolUse, signal)
 
-      const result = await deps.runTool(toolUse, signal)
-      const resultMessage = createToolResultMessage(
-        toolUse,
-        result,
-        deps.uuid(),
-      )
+      // permission_decision is ONLY a policy event — emit it for actual
+      // permission outcomes (authorized or denied). Precondition failures
+      // (tool_not_found, validation, pre-auth abort) are NOT policy decisions;
+      // they surface as a tool_result only.
+      if (auth.outcome === 'authorized' || auth.outcome === 'denied') {
+        yield makePermissionDecisionEvent(
+          toolUse,
+          auth.decision.decision,
+          auth.decision.reason,
+          {
+            userResponse: auth.decision.userResponse,
+            ruleCreated: auth.decision.ruleCreated,
+          },
+        )
+      }
+
+      if (auth.outcome !== 'authorized') {
+        const resultMessage = createToolResultMessage(
+          toolUse,
+          auth.syntheticResult,
+          deps.uuid(),
+        )
+        toolResults.push(resultMessage)
+        yield { type: 'tool_result', message: resultMessage }
+        continue
+      }
+
+      // Phase 2 — execute (tool.call only)
+      const started = Date.now()
+      yield makeToolCallStartedEvent(toolUse)
+      const result = await deps.executeToolUse(toolUse, signal)
+      const durationMs = Date.now() - started
+
+      yield makeToolCallFinishedEvent(toolUse, result, durationMs)
+
+      const resultMessage = createToolResultMessage(toolUse, result, deps.uuid())
       toolResults.push(resultMessage)
       yield { type: 'tool_result', message: resultMessage }
     }
@@ -317,13 +344,11 @@ export async function* query(
       && shouldCompact(state.lastInputTokens)
       && !state.hasAttemptedCompact
     ) {
-      try {
-        const allMessages = [...state.messages, ...toolResults]
-        const messagesBefore = allMessages.length
-        const compacted = await deps.compact(allMessages)
-        yield { type: 'compact', messagesBefore, messagesAfter: compacted.length }
+      const allMessages = [...state.messages, ...toolResults]
+      const result = yield* runCompaction(deps, allMessages, 'post_turn')
+      if (result.success) {
         state = {
-          messages: compacted,
+          messages: result.compacted,
           maxOutputTokensRecoveryCount: 0,
           maxOutputTokensOverride: state.maxOutputTokensOverride,
           hasAttemptedCompact: false, // reset — compaction succeeded
@@ -332,9 +357,8 @@ export async function* query(
           transition: 'next_turn',
         }
         continue
-      } catch {
-        // Compaction failed — proceed without it
       }
+      // Compaction failed — proceed without it
     }
 
     // -----------------------------------------------------------------------
@@ -460,6 +484,41 @@ function extractToolResult(msg: Message): { content: string; isError: boolean } 
     }
   }
   return { content: '', isError: true }
+}
+
+// ---------------------------------------------------------------------------
+// Compaction envelope — yields start/finish events around deps.compact
+// ---------------------------------------------------------------------------
+
+type CompactionResult =
+  | { success: true; compacted: Message[] }
+  | { success: false }
+
+async function* runCompaction(
+  deps: QueryDeps,
+  messages: readonly Message[],
+  trigger: CompactionTrigger,
+): AsyncGenerator<QueryEvent, CompactionResult> {
+  const messagesBefore = messages.length
+  const started = Date.now()
+  yield makeCompactionStartedEvent(trigger, messagesBefore)
+  try {
+    const compacted = await deps.compact([...messages])
+    yield makeCompactionFinishedEvent(
+      messagesBefore,
+      compacted.length,
+      Date.now() - started,
+    )
+    return { success: true, compacted }
+  } catch (err) {
+    yield makeCompactionFinishedEvent(
+      messagesBefore,
+      messagesBefore,
+      Date.now() - started,
+      err instanceof Error ? err : new Error(String(err)),
+    )
+    return { success: false }
+  }
 }
 
 function isPromptTooLongError(err: unknown): boolean {

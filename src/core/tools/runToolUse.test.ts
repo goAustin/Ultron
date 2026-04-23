@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { runToolUse } from './runToolUse.js'
+import { runToolUse, authorizeToolUse, executeToolUse } from './runToolUse.js'
 import { buildTool } from './types.js'
 import type { Tool, ToolResult } from './types.js'
 import type { ToolUseContext } from './context.js'
@@ -263,5 +263,125 @@ describe('runToolUse', () => {
     const ctx = makeContext([tool])
     await runToolUse(makeToolUse('SignalCheck'), ctx, signal)
     expect(callFn).toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// authorize/execute split (Phase 2a)
+// ---------------------------------------------------------------------------
+
+describe('authorizeToolUse', () => {
+  it('returns authorized on auto-allow', async () => {
+    const ctx = makeContext([okTool()])
+    const auth = await authorizeToolUse(makeToolUse('TestTool'), ctx, makeSignal())
+    expect(auth.outcome).toBe('authorized')
+    if (auth.outcome === 'authorized') {
+      expect(auth.decision.decision).toBe('allow')
+    }
+  })
+
+  it('returns precondition_failed with tool_not_found synthetic for unknown tool', async () => {
+    const ctx = makeContext([])
+    const auth = await authorizeToolUse(makeToolUse('Missing'), ctx, makeSignal())
+    expect(auth.outcome).toBe('precondition_failed')
+    if (auth.outcome === 'precondition_failed') {
+      expect(auth.syntheticResult.errorKind).toBe('tool_not_found')
+    }
+  })
+
+  it('returns precondition_failed with validation_failed synthetic', async () => {
+    const tool = buildTool({
+      name: 'Strict',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+      call: async () => ({ content: 'nope', isError: false }),
+      validateInput: async () => ({ valid: false, message: 'missing field' }),
+    })
+    const ctx = makeContext([tool])
+    const auth = await authorizeToolUse(makeToolUse('Strict'), ctx, makeSignal())
+    expect(auth.outcome).toBe('precondition_failed')
+    if (auth.outcome === 'precondition_failed') {
+      expect(auth.syntheticResult.errorKind).toBe('validation_failed')
+    }
+  })
+
+  it('returns denied with permission_denied synthetic on engine deny', async () => {
+    const tool = buildTool({
+      name: 'Locked',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+      call: async () => ({ content: 'x', isError: false }),
+      checkPermissions: async () => ({ behavior: 'deny', message: 'nope' }),
+    })
+    const ctx = makeContext([tool])
+    const auth = await authorizeToolUse(makeToolUse('Locked'), ctx, makeSignal())
+    expect(auth.outcome).toBe('denied')
+    if (auth.outcome === 'denied') {
+      expect(auth.syntheticResult.errorKind).toBe('permission_denied')
+      expect(auth.decision.decision).toBe('deny')
+    }
+  })
+
+  it('returns precondition_failed with aborted synthetic when signal is already aborted', async () => {
+    const ctx = makeContext([okTool()])
+    const auth = await authorizeToolUse(makeToolUse('TestTool'), ctx, makeSignal(true))
+    expect(auth.outcome).toBe('precondition_failed')
+    if (auth.outcome === 'precondition_failed') {
+      expect(auth.syntheticResult.errorKind).toBe('aborted')
+    }
+  })
+
+  it('records allow_by_rule userResponse and ruleCreated on ask path', async () => {
+    const tool = buildTool({
+      name: 'Ask',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+      call: async () => ({ content: 'ok', isError: false }),
+      checkPermissions: async () => ({ behavior: 'ask', message: 'confirm?' }),
+    })
+    const ctx = makeContext([tool], { permissionMode: 'default' })
+    const permissionOpts: PermissionOptions = {
+      headless: false,
+      safetyChecks: [],
+      askUser: async () => 'allow_by_rule',
+    }
+    const auth = await authorizeToolUse(makeToolUse('Ask'), ctx, makeSignal(), permissionOpts)
+    expect(auth.outcome).toBe('authorized')
+    if (auth.outcome === 'authorized') {
+      expect(auth.decision.userResponse).toBe('allow_by_rule')
+      expect(auth.decision.ruleCreated?.toolName).toBe('Ask')
+    }
+  })
+})
+
+describe('executeToolUse', () => {
+  it('runs tool.call directly without checking permissions', async () => {
+    const tool = okTool()
+    const ctx = makeContext([tool])
+    const result = await executeToolUse(makeToolUse('TestTool'), ctx, makeSignal())
+    expect(result).toEqual({ content: 'ok', isError: false })
+  })
+
+  it('returns tool_not_found when the tool is not registered', async () => {
+    const ctx = makeContext([])
+    const result = await executeToolUse(makeToolUse('Ghost'), ctx, makeSignal())
+    expect(result.isError).toBe(true)
+    expect(result.errorKind).toBe('tool_not_found')
+  })
+
+  it('wraps thrown errors as execution_error', async () => {
+    const tool = buildTool({
+      name: 'Crash',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+      call: async () => { throw new Error('boom') },
+    })
+    const ctx = makeContext([tool])
+    const result = await executeToolUse(makeToolUse('Crash'), ctx, makeSignal())
+    expect(result.isError).toBe(true)
+    expect(result.errorKind).toBe('execution_error')
+  })
+
+  it('returns aborted when signal is already aborted', async () => {
+    const tool = okTool()
+    const ctx = makeContext([tool])
+    const result = await executeToolUse(makeToolUse('TestTool'), ctx, makeSignal(true))
+    expect(result.errorKind).toBe('aborted')
   })
 })

@@ -1,19 +1,178 @@
 /**
- * Single tool execution pipeline.
+ * Single tool execution pipeline — split for Phase 2a.
  *
- * resolve → abort check → validate → abort check → permissions (engine) → abort check → call
+ * `authorizeToolUse` runs resolve → validate → permissions (engine) → askUser
+ * and returns either `{outcome: 'authorized', decision}` or
+ * `{outcome: 'denied', decision, syntheticResult}`. It never runs `tool.call`.
  *
- * Plain async function. No exceptions escape — every path returns a ToolResult.
+ * `executeToolUse` runs only `tool.call` (plus error wrapping). The caller is
+ * responsible for authorizing first.
+ *
+ * `runToolUse` is kept as a compatibility wrapper: authorize → execute, with the
+ * same external semantics as before 2a (returns a single `ToolResult`).
+ *
+ * No exceptions escape any of these — every path returns a typed value.
  */
 
 import type { ToolUseBlock } from '../messages.js'
 import type { ToolResult } from './types.js'
 import type { ToolUseContext } from './context.js'
-import type { PermissionOptions, PermissionRule } from '../permissions/types.js'
+import type {
+  PermissionOptions,
+  PermissionRule,
+} from '../permissions/types.js'
+import type {
+  AuthorizeDecisionPayload,
+  AuthorizeToolOutcome,
+} from '../queryDeps.js'
 import { DEFAULT_PERMISSION_OPTIONS } from '../permissions/types.js'
-import { hasPermissionsToUseTool, formatDecisionMessage } from '../permissions/permissions.js'
-import { summarizeInput } from '../permissions/logging.js'
+import {
+  hasPermissionsToUseTool,
+  formatDecisionMessage,
+} from '../permissions/permissions.js'
 import { makeErrorResult, makeAbortResult, checkAbort } from './toolExecution.js'
+
+// ---------------------------------------------------------------------------
+// authorizeToolUse — resolve + validate + permissions + askUser
+// ---------------------------------------------------------------------------
+
+export async function authorizeToolUse(
+  toolUse: ToolUseBlock,
+  context: ToolUseContext,
+  signal: AbortSignal,
+  permissionOpts: PermissionOptions = DEFAULT_PERMISSION_OPTIONS,
+): Promise<AuthorizeToolOutcome> {
+  // 1. Check abort — NOT a policy decision; fails the precondition.
+  if (signal.aborted) {
+    return precondition(makeAbortResult())
+  }
+
+  // 2. Resolve tool — NOT a policy decision.
+  const tool = context.toolRegistry.get(toolUse.name)
+  if (!tool) {
+    return precondition(
+      makeErrorResult('tool_not_found', `Tool "${toolUse.name}" not found`),
+    )
+  }
+
+  // 3. Validate input — NOT a policy decision.
+  try {
+    const validation = await tool.validateInput(toolUse.input, context)
+    if (!validation.valid) {
+      return precondition(makeErrorResult('validation_failed', validation.message))
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return precondition(makeErrorResult('validation_failed', msg))
+  }
+
+  // 4. Check abort — still pre-permission, not a policy decision.
+  if (signal.aborted) {
+    return precondition(makeAbortResult())
+  }
+
+  // 5. Check permissions via engine — this is the actual policy decision.
+  const decision = await hasPermissionsToUseTool(tool, toolUse, context, permissionOpts)
+
+  if (decision.behavior === 'deny') {
+    const reason = formatDecisionMessage(decision)
+    return denied(
+      { decision: 'deny', reason },
+      makeErrorResult('permission_denied', reason),
+    )
+  }
+
+  if (decision.behavior === 'ask') {
+    const reason = formatDecisionMessage(decision)
+
+    if (!permissionOpts.askUser) {
+      // No prompt function — preserve permission_ask for external handling.
+      // This IS a policy-adjacent outcome: the engine asked, nobody answered,
+      // so it's recorded as a deny on the permission event stream.
+      return denied(
+        { decision: 'ask', reason },
+        makeErrorResult('permission_ask', reason),
+      )
+    }
+
+    const response = await permissionOpts.askUser(toolUse.name, toolUse.input, reason, signal)
+
+    const ruleCreated: PermissionRule | undefined =
+      response === 'allow_by_rule'
+        ? {
+            toolName: toolUse.name,
+            behavior: 'allow',
+            ...(tool.getPath?.(toolUse.input) && { path: tool.getPath(toolUse.input) }),
+            source: 'session',
+          }
+        : undefined
+
+    const payload: AuthorizeDecisionPayload = {
+      decision: 'ask',
+      reason,
+      userResponse: response,
+      ...(ruleCreated && { ruleCreated }),
+    }
+
+    if (response === 'abort') {
+      return denied(payload, makeAbortResult())
+    }
+
+    if (response === 'deny_once') {
+      return denied(
+        payload,
+        makeErrorResult('permission_denied', `User denied: ${reason}`),
+      )
+    }
+
+    if (response === 'allow_by_rule' && ruleCreated) {
+      // Persist exact-match rule to AppState for this session
+      const currentRules = context.appState.getState().permissionRules
+      context.appState.setState({ permissionRules: [...currentRules, ruleCreated] })
+    }
+
+    // allow_once or allow_by_rule — fall through to authorized
+    return { outcome: 'authorized', decision: payload }
+  }
+
+  // behavior === 'allow'
+  return {
+    outcome: 'authorized',
+    decision: { decision: 'allow', reason: formatDecisionMessage(decision) },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// executeToolUse — tool.call only (no permission check, no validation)
+// ---------------------------------------------------------------------------
+
+export async function executeToolUse(
+  toolUse: ToolUseBlock,
+  context: ToolUseContext,
+  signal: AbortSignal,
+): Promise<ToolResult> {
+  // Abort check immediately before dispatch — prevents racing into execution after cancel.
+  const aborted = checkAbort(signal)
+  if (aborted) return aborted
+
+  const tool = context.toolRegistry.get(toolUse.name)
+  if (!tool) {
+    return makeErrorResult('tool_not_found', `Tool "${toolUse.name}" not found`)
+  }
+
+  try {
+    return await tool.call(toolUse.input, context, signal)
+  } catch (err) {
+    return makeErrorResult(
+      'execution_error',
+      err instanceof Error ? err.message : String(err),
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// runToolUse — compatibility wrapper: authorize then execute
+// ---------------------------------------------------------------------------
 
 export async function runToolUse(
   toolUse: ToolUseBlock,
@@ -21,98 +180,22 @@ export async function runToolUse(
   signal: AbortSignal,
   permissionOpts: PermissionOptions = DEFAULT_PERMISSION_OPTIONS,
 ): Promise<ToolResult> {
-  // 1. Check abort
-  const aborted1 = checkAbort(signal)
-  if (aborted1) return aborted1
+  const auth = await authorizeToolUse(toolUse, context, signal, permissionOpts)
+  if (auth.outcome !== 'authorized') return auth.syntheticResult
+  return executeToolUse(toolUse, context, signal)
+}
 
-  // 2. Resolve tool
-  const tool = context.toolRegistry.get(toolUse.name)
-  if (!tool) {
-    return makeErrorResult('tool_not_found', `Tool "${toolUse.name}" not found`)
-  }
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-  // 3. Validate input
-  try {
-    const validation = await tool.validateInput(toolUse.input, context)
-    if (!validation.valid) {
-      return makeErrorResult('validation_failed', validation.message)
-    }
-  } catch (err) {
-    return makeErrorResult('validation_failed', err instanceof Error ? err.message : String(err))
-  }
+function denied(
+  decision: AuthorizeDecisionPayload,
+  syntheticResult: ToolResult,
+): AuthorizeToolOutcome {
+  return { outcome: 'denied', decision, syntheticResult }
+}
 
-  // 4. Check abort
-  const aborted2 = checkAbort(signal)
-  if (aborted2) return aborted2
-
-  // 5. Check permissions via engine
-  const decision = await hasPermissionsToUseTool(tool, toolUse, context, permissionOpts)
-  if (decision.behavior === 'deny') {
-    return makeErrorResult('permission_denied', formatDecisionMessage(decision))
-  }
-  if (decision.behavior === 'ask') {
-    if (!permissionOpts.askUser) {
-      // No prompt function — preserve permission_ask for external handling
-      return makeErrorResult('permission_ask', formatDecisionMessage(decision))
-    }
-
-    const reason = formatDecisionMessage(decision)
-    const response = await permissionOpts.askUser(toolUse.name, toolUse.input, reason, signal)
-
-    // Log the decision (if logger provided)
-    if (permissionOpts.logDecision) {
-      const ruleCreated: PermissionRule | undefined =
-        response === 'allow_by_rule'
-          ? {
-              toolName: toolUse.name,
-              behavior: 'allow',
-              ...(tool.getPath?.(toolUse.input) && { path: tool.getPath(toolUse.input) }),
-              source: 'session',
-            }
-          : undefined
-
-      await permissionOpts.logDecision({
-        timestamp: Date.now(),
-        toolName: toolUse.name,
-        inputSummary: summarizeInput(toolUse.name, toolUse.input),
-        decision: 'ask',
-        reason,
-        userResponse: response,
-        ...(ruleCreated && { ruleCreated }),
-      })
-    }
-
-    if (response === 'abort') {
-      return makeAbortResult()
-    }
-
-    if (response === 'deny_once') {
-      return makeErrorResult('permission_denied', `User denied: ${reason}`)
-    }
-
-    if (response === 'allow_by_rule') {
-      // Persist exact-match rule to AppState for this session
-      const rule: PermissionRule = {
-        toolName: toolUse.name,
-        behavior: 'allow',
-        ...(tool.getPath?.(toolUse.input) && { path: tool.getPath(toolUse.input) }),
-        source: 'session',
-      }
-      const currentRules = context.appState.getState().permissionRules
-      context.appState.setState({ permissionRules: [...currentRules, rule] })
-    }
-
-    // allow_once or allow_by_rule — fall through to execution
-  }
-
-  // 6. Check abort — critical: prevents racing into execution after cancel
-  const aborted3 = checkAbort(signal)
-  if (aborted3) return aborted3
-
-  // 7. Execute
-  try {
-    return await tool.call(toolUse.input, context, signal)
-  } catch (err) {
-    return makeErrorResult('execution_error', err instanceof Error ? err.message : String(err))
-  }
+function precondition(syntheticResult: ToolResult): AuthorizeToolOutcome {
+  return { outcome: 'precondition_failed', syntheticResult }
 }

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { partitionIntoBatches, runToolBatch, runWithConcurrencyLimit } from './toolOrchestration.js'
-import { createRunToolFn } from './toolExecution.js'
+import { createAuthorizeToolUseFn, createExecuteToolUseFn } from './toolExecution.js'
 import { buildTool } from './types.js'
 import type { Tool } from './types.js'
 import type { ToolUseContext } from './context.js'
@@ -276,25 +276,31 @@ describe('runWithConcurrencyLimit', () => {
 })
 
 // ---------------------------------------------------------------------------
-// createRunToolFn adapter
+// Authorize + execute adapters (replace Phase 1 createRunToolFn)
 // ---------------------------------------------------------------------------
 
-describe('createRunToolFn', () => {
-  it('returns a function matching RunToolFn signature', async () => {
+describe('createAuthorizeToolUseFn + createExecuteToolUseFn', () => {
+  it('authorize→execute returns the same result as the pre-split path', async () => {
     const tool = makeTool('Echo', { result: 'hello' })
     const ctx = makeContext([tool])
-    const runTool = createRunToolFn(ctx)
+    const authorize = createAuthorizeToolUseFn(ctx)
+    const execute = createExecuteToolUseFn(ctx)
 
-    const result = await runTool(makeToolUse('Echo'), makeSignal())
+    const auth = await authorize(makeToolUse('Echo'), makeSignal())
+    expect(auth.outcome).toBe('authorized')
+    const result = await execute(makeToolUse('Echo'), makeSignal())
     expect(result).toEqual({ content: 'hello', isError: false })
   })
 
-  it('returns error result for unknown tool', async () => {
+  it('returns a precondition_failed outcome for an unknown tool', async () => {
     const ctx = makeContext([])
-    const runTool = createRunToolFn(ctx)
+    const authorize = createAuthorizeToolUseFn(ctx)
 
-    const result = await runTool(makeToolUse('Missing'), makeSignal())
-    expect(result.isError).toBe(true)
-    expect(result.content).toContain('tool_not_found')
+    const auth = await authorize(makeToolUse('Missing'), makeSignal())
+    expect(auth.outcome).toBe('precondition_failed')
+    if (auth.outcome === 'precondition_failed') {
+      expect(auth.syntheticResult.isError).toBe(true)
+      expect(auth.syntheticResult.errorKind).toBe('tool_not_found')
+    }
   })
 })

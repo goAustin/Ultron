@@ -1,6 +1,8 @@
 import type { Message, ToolUseBlock, ToolResultBlock, MessageId, UserMessage } from './messages.js'
 import type { ToolExecution } from '../context/attachmentTypes.js'
 import type { SystemPromptPart } from '../context/systemPromptParts.js'
+import type { ToolResult } from './tools/types.js'
+import type { PermissionRule } from './permissions/types.js'
 import { messageId } from './messages.js'
 import { randomUUID } from 'crypto'
 
@@ -93,13 +95,57 @@ export type CallModelFn = (
 ) => AsyncGenerator<RawStreamEvent, ApiResponseMeta>
 
 /**
- * Executes a single tool call and returns the result.
- * Phase 1 provides a stub; Phase 3 plugs in the real implementation.
+ * Result of authorizing a tool call.
+ *
+ * The outcome distinguishes three cases so the caller can emit the right
+ * audit events:
+ *
+ * - `authorized`: the permission engine (or a user responding to an `ask` prompt)
+ *   said allow. The caller emits `permission_decision` and proceeds to execute.
+ * - `denied`: the permission engine said deny, or the user said deny_once/abort
+ *   in response to an `ask` prompt. The caller emits `permission_decision(deny)`
+ *   and short-circuits with `syntheticResult`.
+ * - `precondition_failed`: the call failed BEFORE reaching the permission engine
+ *   (tool not found, validation failed, or pre-authorization abort). NOT a
+ *   policy denial — the caller should NOT emit `permission_decision`, only a
+ *   `tool_result` carrying the synthetic error.
  */
-export type RunToolFn = (
+export type AuthorizeDecisionPayload = {
+  readonly decision: 'allow' | 'deny' | 'ask'
+  readonly reason: string
+  readonly userResponse?: 'allow_once' | 'deny_once' | 'allow_by_rule' | 'abort'
+  readonly ruleCreated?: PermissionRule
+}
+
+export type AuthorizeToolOutcome =
+  | { readonly outcome: 'authorized'; readonly decision: AuthorizeDecisionPayload }
+  | {
+      readonly outcome: 'denied'
+      readonly decision: AuthorizeDecisionPayload
+      readonly syntheticResult: ToolResult
+    }
+  | {
+      readonly outcome: 'precondition_failed'
+      readonly syntheticResult: ToolResult
+    }
+
+/**
+ * Authorize a tool call. Runs resolve → validate → permission engine → askUser (if needed).
+ * Does NOT execute the tool.
+ */
+export type AuthorizeToolUseFn = (
   toolUse: ToolUseBlock,
   signal: AbortSignal,
-) => Promise<{ content: string; isError: boolean }>
+) => Promise<AuthorizeToolOutcome>
+
+/**
+ * Execute a previously-authorized tool call. Performs only tool.call() + error wrapping.
+ * Does NOT re-check permissions; the caller is responsible for authorizing first.
+ */
+export type ExecuteToolUseFn = (
+  toolUse: ToolUseBlock,
+  signal: AbortSignal,
+) => Promise<ToolResult>
 
 /**
  * Compacts a message history to fit within context limits.
@@ -123,7 +169,8 @@ export type GetAttachmentsFn = (
 
 export type QueryDeps = {
   readonly callModel: CallModelFn
-  readonly runTool: RunToolFn
+  readonly authorizeToolUse: AuthorizeToolUseFn
+  readonly executeToolUse: ExecuteToolUseFn
   readonly compact: CompactFn
   readonly uuid: () => MessageId
   readonly getAttachments?: GetAttachmentsFn
@@ -137,9 +184,16 @@ const stubCallModel: CallModelFn = async function* (_messages, _systemPromptPart
   return { stopReason: 'end_turn' }
 }
 
-const stubRunTool: RunToolFn = async (_toolUse, _signal) => {
-  return { content: 'Tool execution not implemented', isError: true }
-}
+const stubAuthorize: AuthorizeToolUseFn = async (_toolUse, _signal) => ({
+  outcome: 'authorized',
+  decision: { decision: 'allow', reason: 'stub' },
+})
+
+const stubExecute: ExecuteToolUseFn = async (_toolUse, _signal) => ({
+  content: 'Tool execution not implemented',
+  isError: true,
+  errorKind: 'execution_error',
+})
 
 const stubCompact: CompactFn = async (_messages) => {
   throw new Error('Compaction not implemented')
@@ -148,7 +202,8 @@ const stubCompact: CompactFn = async (_messages) => {
 export function stubDeps(overrides?: Partial<QueryDeps>): QueryDeps {
   return {
     callModel: stubCallModel,
-    runTool: stubRunTool,
+    authorizeToolUse: stubAuthorize,
+    executeToolUse: stubExecute,
     compact: stubCompact,
     uuid: () => messageId('00000000-0000-0000-0000-000000000000'),
     ...overrides,
@@ -158,9 +213,50 @@ export function stubDeps(overrides?: Partial<QueryDeps>): QueryDeps {
 export function productionDeps(overrides?: Partial<QueryDeps>): QueryDeps {
   return {
     callModel: stubCallModel, // replaced by apiAdapter.createAnthropicCallModel()
-    runTool: stubRunTool,     // replaced by Phase 3
+    authorizeToolUse: stubAuthorize, // replaced by Phase 3
+    executeToolUse: stubExecute,     // replaced by Phase 3
     compact: stubCompact,     // replaced by Phase 10
     uuid: () => messageId(randomUUID()),
     ...overrides,
+  }
+}
+
+/**
+ * Test helper: build matching authorize/execute pair that always returns a static result.
+ * Tests that don't care about authorization can pass a ToolResult and get both halves wired.
+ */
+export function makeStaticToolDeps(result: ToolResult): Pick<QueryDeps, 'authorizeToolUse' | 'executeToolUse'> {
+  return {
+    authorizeToolUse: async () => ({
+      outcome: 'authorized',
+      decision: { decision: 'allow', reason: 'static' },
+    }),
+    executeToolUse: async () => result,
+  }
+}
+
+/**
+ * Legacy shape (pre-2a). Kept purely as a test convenience: existing integration
+ * tests written against the single `runTool` fn can adapt their stub via
+ * `adaptRunTool` below without rewriting every case.
+ */
+export type RunToolFn = (
+  toolUse: ToolUseBlock,
+  signal: AbortSignal,
+) => Promise<ToolResult>
+
+/**
+ * Test helper: wrap a legacy `RunToolFn` into the new authorize/execute pair.
+ * Authorizes everything and routes execution through the provided fn.
+ */
+export function adaptRunTool(
+  runTool: RunToolFn,
+): Pick<QueryDeps, 'authorizeToolUse' | 'executeToolUse'> {
+  return {
+    authorizeToolUse: async () => ({
+      outcome: 'authorized',
+      decision: { decision: 'allow', reason: 'test-adapter' },
+    }),
+    executeToolUse: runTool,
   }
 }

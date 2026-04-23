@@ -16,6 +16,7 @@ export type SecretMatch = {
   readonly type: string
   readonly confidence: SecretConfidence
   readonly index: number
+  readonly length: number
 }
 
 // ---------------------------------------------------------------------------
@@ -79,7 +80,7 @@ export function detectSecrets(text: string): readonly SecretMatch[] {
 
     let match: RegExpExecArray | null
     while ((match = pattern.exec(text)) !== null) {
-      matches.push({ type, confidence, index: match.index })
+      matches.push({ type, confidence, index: match.index, length: match[0].length })
     }
   }
 

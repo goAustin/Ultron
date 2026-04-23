@@ -30,9 +30,18 @@ export type PermissionResult =
   | { behavior: 'ask'; message: string }
 
 export type ToolResult = {
-  content: string
-  isError: boolean
+  readonly content: string
+  readonly isError: boolean
+  readonly errorKind?: ToolErrorKind
 }
+
+export type ToolErrorKind =
+  | 'tool_not_found'
+  | 'validation_failed'
+  | 'permission_denied'
+  | 'permission_ask'
+  | 'execution_error'
+  | 'aborted'
 
 // ---------------------------------------------------------------------------
 // Tool interface

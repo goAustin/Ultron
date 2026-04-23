@@ -57,7 +57,7 @@ export type SafetyCheck = (
 ) => PermissionDecision | null
 
 // ---------------------------------------------------------------------------
-// Approval & logging callbacks
+// Approval callbacks
 // ---------------------------------------------------------------------------
 
 /** Callback to prompt the user for a permission decision. */
@@ -68,20 +68,18 @@ export type AskUserFn = (
   signal: AbortSignal,
 ) => Promise<'allow_once' | 'deny_once' | 'allow_by_rule' | 'abort'>
 
-/** Callback to log a permission decision for audit. */
-export type LogPermissionDecisionFn = (
-  entry: import('./logging.js').PermissionLogEntry,
-) => Promise<void>
-
 // ---------------------------------------------------------------------------
 // Permission options — runtime execution flags, not stored in AppState
+//
+// Note: the Phase 1 `logDecision` callback has been retired. Every permission
+// decision now surfaces as a `permission_decision` QueryEvent through the Phase 2a
+// audit spine; structured persistence happens in `~/.ultron/audit.jsonl`.
 // ---------------------------------------------------------------------------
 
 export type PermissionOptions = {
   headless: boolean
   safetyChecks: SafetyCheck[]
   askUser?: AskUserFn
-  logDecision?: LogPermissionDecisionFn
 }
 
 export const DEFAULT_PERMISSION_OPTIONS: PermissionOptions = {

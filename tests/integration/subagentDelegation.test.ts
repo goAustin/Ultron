@@ -16,6 +16,14 @@ import { createDefaultRegistry } from '../../src/core/tools/registry.js'
 import { createStore, getDefaultAppState } from '../../src/core/state.js'
 import type { AppState } from '../../src/core/state.js'
 import type { CallModelFn, RawStreamEvent, ApiResponseMeta } from '../../src/core/queryDeps.js'
+import type { AuditWriter } from '../../src/audit/types.js'
+
+// Null writer for tests — events are thrown away.
+const nullAuditWriter: AuditWriter = {
+  write: () => {},
+  close: async () => {},
+  withOrigin: () => nullAuditWriter,
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -58,6 +66,7 @@ describe('subagent delegation', () => {
         cwd: dir,
         sessionDir: dir,
         permissionOpts: { headless: false, safetyChecks: [] },
+        auditWriter: nullAuditWriter,
       })
 
       const context = createToolUseContext({
@@ -97,6 +106,7 @@ describe('subagent delegation', () => {
         cwd: dir,
         sessionDir: dir,
         permissionOpts: { headless: false, safetyChecks: [] },
+        auditWriter: nullAuditWriter,
       })
 
       await forkSubagent('Do something')
@@ -118,6 +128,7 @@ describe('subagent delegation', () => {
         cwd: dir,
         sessionDir: dir,
         permissionOpts: { headless: false, safetyChecks: [] },
+        auditWriter: nullAuditWriter,
       })
 
       const result = await forkSubagent('Research task')
@@ -142,6 +153,7 @@ describe('subagent delegation', () => {
         cwd: dir,
         sessionDir: dir,
         permissionOpts: { headless: false, safetyChecks: [] },
+        auditWriter: nullAuditWriter,
       })
 
       const result = await forkSubagent('This should abort')

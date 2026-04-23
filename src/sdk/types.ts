@@ -12,9 +12,13 @@ export type { QueryEvent } from '../core/queryEvents.js'
 // Terminal
 export type { Terminal, TerminalReason } from '../core/queryTypes.js'
 
-// Permission callback types (for custom askUser/logDecision implementations)
-export type { AskUserFn, LogPermissionDecisionFn } from '../core/permissions/types.js'
+// Permission callback types (for custom askUser implementations)
+export type { AskUserFn } from '../core/permissions/types.js'
 export type { PermissionMode } from '../core/state.js'
+
+// Audit spine
+export type { AuditWriter, AuditWriterOptions } from '../audit/types.js'
+export { createAuditWriter } from '../audit/auditLog.js'
 
 // Engine
 export type { QueryEngineConfig } from './QueryEngine.js'

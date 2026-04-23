@@ -10,6 +10,8 @@ import type { PermissionOptions } from '../core/permissions/types.js'
 import { createStore, getDefaultAppState } from '../core/state.js'
 import type { AppState } from '../core/state.js'
 import { createDefaultRegistry } from '../core/tools/registry.js'
+import type { AuditWriter } from '../audit/types.js'
+import type { QueryEvent } from '../core/queryEvents.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -37,7 +39,18 @@ const defaultPermOpts: PermissionOptions = {
   safetyChecks: [],
 }
 
+function makeCapturingWriter(): { writer: AuditWriter; captured: Array<{ event: QueryEvent; origin?: string }> } {
+  const captured: Array<{ event: QueryEvent; origin?: string }> = []
+  const makeHandle = (origin?: string): AuditWriter => ({
+    write: (event) => { captured.push(origin === undefined ? { event } : { event, origin }) },
+    close: async () => {},
+    withOrigin: (tag) => makeHandle(tag),
+  })
+  return { writer: makeHandle(), captured }
+}
+
 function makeOpts(sessionDir: string, overrides?: Partial<SubagentOptions>): SubagentOptions {
+  const { writer } = makeCapturingWriter()
   return {
     callModel: textCallModel('Subagent result text here.'),
     compactCallModel: textCallModel('compact'),
@@ -48,6 +61,7 @@ function makeOpts(sessionDir: string, overrides?: Partial<SubagentOptions>): Sub
     cwd: sessionDir,
     sessionDir,
     permissionOpts: defaultPermOpts,
+    auditWriter: writer,
     ...overrides,
   }
 }

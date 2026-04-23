@@ -15,7 +15,6 @@ import { createInterface } from 'node:readline'
 import { QueryEngine } from './sdk/QueryEngine.js'
 import { promptForApproval } from './ui/permissionPrompt.js'
 import { promptForModel } from './ui/modelMenu.js'
-import { createPermissionLogger } from './core/permissions/logging.js'
 import type { AskUserFn } from './core/permissions/types.js'
 import { resolveModel } from './core/providers/registry.js'
 import { UnknownModelError } from './core/providers/types.js'
@@ -82,9 +81,19 @@ const engine = new QueryEngine({
   baseUrl,
   permissionMode: 'default',
   askUser,
-  logDecision: createPermissionLogger(),
   thinkingBudget: DEFAULT_THINKING_BUDGET,
 })
+
+// One-shot deprecation notice for the retired Phase 1 permissions log.
+// Does not touch the user's existing file; new decisions flow to ~/.ultron/audit.jsonl.
+import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+if (existsSync(join(homedir(), '.ultron', 'permissions.jsonl'))) {
+  process.stderr.write(
+    '[ultron] Note: permissions.jsonl is deprecated; new decisions recorded in audit.jsonl\n',
+  )
+}
 
 // ---------------------------------------------------------------------------
 // REPL
@@ -164,12 +173,28 @@ function prompt(): void {
             }
             break
           }
-          case 'compact':
-            process.stdout.write(`\n\x1b[35m[compacted: ${event.messagesBefore} → ${event.messagesAfter} messages]\x1b[0m\n`)
+          case 'compaction_finished':
+            if (event.outcome === 'ok') {
+              process.stdout.write(`\n\x1b[35m[compacted: ${event.messagesBefore} → ${event.messagesAfter} messages]\x1b[0m\n`)
+            }
             break
           case 'error':
             process.stderr.write(`\n\x1b[31m[error: ${event.error.message}]\x1b[0m\n`)
             break
+          case 'request_start':
+          case 'thinking_delta':
+          case 'turn':
+          case 'attachment':
+          case 'permission_decision':
+          case 'tool_call_started':
+          case 'tool_call_finished':
+          case 'compaction_started':
+            // Intentionally silent in the interactive CLI — these flow to the audit log.
+            break
+          default: {
+            const _exhaustive: never = event
+            void _exhaustive
+          }
         }
 
         result = await gen.next()
