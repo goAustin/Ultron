@@ -46,11 +46,19 @@ const stubAuthorize: AuthorizeToolUseFn = async () => ({
 })
 const stubExecute: ExecuteToolUseFn = async () => ({ content: 'ok', isError: false })
 
+// Null audit writer — keeps every test isolated from ~/.ultron/audit.jsonl.
+const nullAuditWriter = {
+  write: () => {},
+  close: async () => {},
+  withOrigin: () => nullAuditWriter,
+}
+
 function makeConfig(cwd: string, overrides?: Partial<QueryEngineConfig>): QueryEngineConfig {
   return {
     apiKey: 'test-key',
     model: 'claude-sonnet-4-6',
     cwd,
+    auditWriter: nullAuditWriter,
     deps: {
       callModel: textCallModel('Hello back!'),
       authorizeToolUse: stubAuthorize,
