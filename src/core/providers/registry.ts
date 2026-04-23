@@ -8,17 +8,21 @@
  * No other file needs to change.
  */
 
-import type { ProviderAdapter, ProviderId, ModelEntry } from './types.js'
+import type { ProviderAdapter, ProviderId, ModelEntry, CapabilitySheet } from './types.js'
 import { UnknownModelError } from './types.js'
 import { anthropicAdapter } from './anthropicAdapter.js'
 import { openaiAdapter } from './openaiAdapter.js'
 import { minimaxAdapter } from './minimaxAdapter.js'
+import { assertCapabilitiesPopulated } from './validateCapabilities.js'
 
 const ADAPTERS: Readonly<Record<string, ProviderAdapter>> = {
   anthropic: anthropicAdapter,
   openai: openaiAdapter,
   minimax: minimaxAdapter,
 }
+
+// Trip at import time if any registered model is missing capability metadata.
+assertCapabilitiesPopulated(Object.values(ADAPTERS))
 
 /** Returns the adapter for a provider id, or throws if the id is unknown. */
 export function getAdapter(id: ProviderId): ProviderAdapter {
@@ -46,4 +50,16 @@ export function allModels(): readonly ModelEntry[] {
 /** All registered adapters (ordered by insertion into `ADAPTERS`). */
 export function listProviders(): readonly ProviderAdapter[] {
   return Object.values(ADAPTERS)
+}
+
+/** Resolves a model id to its capability sheet. Throws `UnknownModelError` if the id isn't registered. */
+export function resolveCapabilities(modelId: string): CapabilitySheet {
+  const { entry } = resolveModel(modelId)
+  return {
+    maxContextTokens: entry.maxContextTokens,
+    maxOutputTokens: entry.maxOutputTokens,
+    supportsThinking: entry.supportsThinking,
+    supportsInterleavedThinking: entry.supportsInterleavedThinking,
+    promptCacheModel: entry.promptCacheModel,
+  }
 }

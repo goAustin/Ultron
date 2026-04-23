@@ -41,7 +41,13 @@ import type {
   ApiResponseMeta,
   RawStreamEvent,
 } from '../queryDeps.js'
+import type { SystemPromptPart } from '../../context/systemPromptParts.js'
 import type { ProviderAdapter, ModelEntry, CreateCallModelOptions } from './types.js'
+import { CONTEXT_1M, CONTEXT_200K, OUTPUT_128K, OUTPUT_64K } from './capabilityMetadata.js'
+import { warnOnce } from './warnOnce.js'
+
+const INTERLEAVED_THINKING_BETA = 'interleaved-thinking-2025-05-14'
+const THINKING_MAX_TOKENS_HEADROOM = 1024
 
 // ---------------------------------------------------------------------------
 // Internal → API conversion
@@ -90,6 +96,46 @@ export function toApiMessages(messages: readonly Message[]): MessageParam[] {
     role: msg.role,
     content: msg.content.map(contentBlockToApi),
   }))
+}
+
+// ---------------------------------------------------------------------------
+// System field construction (cache-hint aware)
+// ---------------------------------------------------------------------------
+
+/**
+ * Translate `SystemPromptPart[]` into Anthropic's `system` field.
+ *
+ * Models with `promptCacheModel === 'explicit'` receive a `TextBlockParam[]`
+ * with `cache_control: {type: 'ephemeral'}` attached to the last non-empty
+ * `'static'` part — that marks the cache breakpoint. All other models get a
+ * single joined string (byte-identical to pre-1b behavior).
+ */
+export function buildAnthropicSystemField(
+  parts: readonly SystemPromptPart[],
+  promptCacheModel: ModelEntry['promptCacheModel'],
+): string | TextBlockParam[] {
+  if (promptCacheModel !== 'explicit') {
+    return parts.map(p => p.content).join('\n\n')
+  }
+
+  const blocks: TextBlockParam[] = parts.map(p => ({
+    type: 'text',
+    text: p.content,
+  }))
+
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const part = parts[i]!
+    if (part.cacheHint === 'static' && part.content.length > 0) {
+      blocks[i] = {
+        ...blocks[i]!,
+        cache_control: { type: 'ephemeral' },
+      }
+      return blocks
+    }
+  }
+
+  // No static part found — fall back to joined string (same as non-explicit).
+  return parts.map(p => p.content).join('\n\n')
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +284,7 @@ export class StreamAccumulator {
 // ---------------------------------------------------------------------------
 
 function createAnthropicCallModel(opts: CreateCallModelOptions): CallModelFn {
-  const { apiKey, model, baseUrl, tools } = opts
+  const { apiKey, model, baseUrl, tools, capabilities } = opts
   const client = new Anthropic({ apiKey, ...(baseUrl && { baseURL: baseUrl }) })
 
   const anthropicTools: AnthropicToolDef[] | undefined = tools?.map(t => ({
@@ -249,17 +295,72 @@ function createAnthropicCallModel(opts: CreateCallModelOptions): CallModelFn {
 
   return async function* callModel(
     messages: unknown[],
-    systemPrompt: string,
+    systemPromptParts: readonly SystemPromptPart[],
     callOpts: CallModelOptions,
     signal: AbortSignal,
   ): AsyncGenerator<RawStreamEvent, ApiResponseMeta> {
-    const stream = client.messages.stream({
+    const systemField = buildAnthropicSystemField(systemPromptParts, capabilities.promptCacheModel)
+
+    // Capability-gated thinking translation. Engine-side normalization
+    // (thinkingNormalize.ts) already enforces ≥1024 for explicit-thinking
+    // providers, so the value flowing in is either undefined or valid.
+    let thinkingConfig: { type: 'enabled'; budget_tokens: number } | undefined
+    if (callOpts.thinkingBudget && callOpts.thinkingBudget > 0) {
+      if (capabilities.supportsThinking) {
+        thinkingConfig = {
+          type: 'enabled',
+          budget_tokens: callOpts.thinkingBudget,
+        }
+      } else {
+        warnOnce(
+          `thinking:${model}`,
+          `thinkingBudget set but model ${model} does not support thinking; ignoring.`,
+        )
+      }
+    }
+
+    // Interleaved thinking is the only knob that requires the beta endpoint.
+    let useBetaStream = false
+    if (callOpts.interleavedThinking) {
+      if (capabilities.supportsInterleavedThinking) {
+        useBetaStream = true
+      } else {
+        warnOnce(
+          `interleaved:${model}`,
+          `interleavedThinking set but model ${model} does not support it; ignoring.`,
+        )
+      }
+    }
+
+    // Anthropic enforces max_tokens > thinking.budget_tokens. Bump to a safe
+    // margin when thinking is enabled.
+    const baseMaxTokens = callOpts.maxOutputTokens ?? 16_384
+    const max_tokens = thinkingConfig
+      ? Math.max(baseMaxTokens, thinkingConfig.budget_tokens + THINKING_MAX_TOKENS_HEADROOM)
+      : baseMaxTokens
+
+    const commonBody = {
       model,
-      max_tokens: callOpts.maxOutputTokens ?? 16_384,
-      system: systemPrompt,
+      max_tokens,
+      system: systemField,
       messages: messages as MessageParam[],
       ...(anthropicTools?.length && { tools: anthropicTools }),
-    }, { signal })
+      ...(thinkingConfig && { thinking: thinkingConfig }),
+    }
+
+    // Branch on stream factory. Both endpoints accept the same body fields we
+    // use; only the beta endpoint accepts the `betas` header. Cast through
+    // `unknown` because the SDK's Beta* type aliases differ from the non-beta
+    // ones structurally even though the fields we send are identical.
+    const stream = useBetaStream
+      ? client.beta.messages.stream(
+          {
+            ...commonBody,
+            betas: [INTERLEAVED_THINKING_BETA],
+          } as unknown as Parameters<typeof client.beta.messages.stream>[0],
+          { signal },
+        )
+      : client.messages.stream(commonBody, { signal })
 
     let stopReason: string | null = null
     let outputTokens: number | undefined
@@ -293,9 +394,39 @@ function createAnthropicCallModel(opts: CreateCallModelOptions): CallModelFn {
 // ---------------------------------------------------------------------------
 
 const MODELS: readonly ModelEntry[] = [
-  { id: 'claude-opus-4-7', provider: 'anthropic', label: 'Claude Opus 4.7', description: 'Highest capability' },
-  { id: 'claude-sonnet-4-6', provider: 'anthropic', label: 'Claude Sonnet 4.6', description: 'Balanced' },
-  { id: 'claude-haiku-4-5-20251001', provider: 'anthropic', label: 'Claude Haiku 4.5', description: 'Fastest, cheapest' },
+  {
+    id: 'claude-opus-4-7',
+    provider: 'anthropic',
+    label: 'Claude Opus 4.7',
+    description: 'Highest capability',
+    maxContextTokens: CONTEXT_1M,
+    maxOutputTokens: OUTPUT_128K,
+    supportsThinking: true,
+    supportsInterleavedThinking: true,
+    promptCacheModel: 'explicit',
+  },
+  {
+    id: 'claude-sonnet-4-6',
+    provider: 'anthropic',
+    label: 'Claude Sonnet 4.6',
+    description: 'Balanced',
+    maxContextTokens: CONTEXT_1M,
+    maxOutputTokens: OUTPUT_64K,
+    supportsThinking: true,
+    supportsInterleavedThinking: true,
+    promptCacheModel: 'explicit',
+  },
+  {
+    id: 'claude-haiku-4-5-20251001',
+    provider: 'anthropic',
+    label: 'Claude Haiku 4.5',
+    description: 'Fastest, cheapest',
+    maxContextTokens: CONTEXT_200K,
+    maxOutputTokens: OUTPUT_64K,
+    supportsThinking: true,
+    supportsInterleavedThinking: false,
+    promptCacheModel: 'explicit',
+  },
 ]
 
 // ---------------------------------------------------------------------------

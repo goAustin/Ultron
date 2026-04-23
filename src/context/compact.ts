@@ -11,6 +11,7 @@
 import type { Message, ContentBlock, MessageId } from '../core/messages.js'
 import { createUserMessage, getToolUseBlocks } from '../core/messages.js'
 import type { CallModelFn, CompactFn } from '../core/queryDeps.js'
+import type { SystemPromptPart } from './systemPromptParts.js'
 import { StreamAccumulator } from '../core/providers/anthropicAdapter.js'
 
 // ---------------------------------------------------------------------------
@@ -197,6 +198,10 @@ const SUMMARIZATION_SYSTEM_PROMPT = `You are a conversation summarizer. Summariz
 
 The summary will replace the original messages in the conversation history, so the model reading it must have enough context to continue the work. Write in past tense. Do not include pleasantries or filler.`
 
+const SUMMARIZATION_PARTS: readonly SystemPromptPart[] = [
+  { content: SUMMARIZATION_SYSTEM_PROMPT, cacheHint: 'static' },
+]
+
 /** Call the model with the summarization prompt and collect the full response. */
 async function callForSummary(
   callModel: CallModelFn,
@@ -208,7 +213,7 @@ async function callForSummary(
 
   const stream = callModel(
     [{ role: 'user', content: [{ type: 'text', text: conversationText }] }],
-    SUMMARIZATION_SYSTEM_PROMPT,
+    SUMMARIZATION_PARTS,
     { maxOutputTokens: SUMMARIZATION_MAX_TOKENS },
     abortController.signal,
   )

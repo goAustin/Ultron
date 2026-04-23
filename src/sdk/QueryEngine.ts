@@ -23,13 +23,14 @@ import { createToolUseContext } from '../core/tools/context.js'
 import type { ReadFileState } from '../core/tools/context.js'
 import { createRunToolFn } from '../core/tools/toolExecution.js'
 import { resolveModel } from '../core/providers/registry.js'
-import type { ProviderId } from '../core/providers/types.js'
+import type { ProviderId, CapabilitySheet } from '../core/providers/types.js'
 import { MissingApiKeyError } from '../core/providers/types.js'
+import { normalizeThinkingBudget } from '../core/providers/thinkingNormalize.js'
 import type { CallModelFn } from '../core/queryDeps.js'
 import type { ApiToolDefinition } from '../core/tools/registry.js'
 import { getToolDefinitions } from '../core/tools/registry.js'
 import { createCompactFn } from '../context/compact.js'
-import { buildFullSystemPrompt } from '../context/queryContext.js'
+import { buildFullSystemPromptParts } from '../context/queryContext.js'
 import { getInitialAttachments, buildGetAttachments } from '../context/attachments.js'
 import { createSession, resumeSession } from '../session/resume.js'
 import { createForkSubagent } from '../agents/runAgent.js'
@@ -58,8 +59,21 @@ export type QueryEngineConfig = {
   readonly maxTurns?: number
   readonly sessionId?: string
   readonly compactModel?: string
+  /**
+   * Engine-wide default thinking budget (tokens). Per-submission `submitPrompt`
+   * `opts` win when set. The value is normalized once per submission against
+   * the active model's capabilities.
+   */
+  readonly thinkingBudget?: number
+  /** Engine-wide default for Anthropic interleaved-thinking. */
+  readonly interleavedThinking?: boolean
   /** Test-only: override assembled deps. Not part of the public SDK surface. */
   readonly deps?: Partial<QueryDeps>
+}
+
+export type SubmitPromptOptions = {
+  readonly thinkingBudget?: number
+  readonly interleavedThinking?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +175,7 @@ export class QueryEngine {
    * mechanism that makes cross-provider hot-swap work.
    */
   private resolveCallModel(modelId: string, toolDefs: readonly ApiToolDefinition[]): CallModelFn {
-    const { adapter } = resolveModel(modelId)
+    const { adapter, entry } = resolveModel(modelId)
     const envKey = process.env[adapter.envKeyName]
     // Use the config key only when it matches the target provider (inferred by
     // "the first resolve picked this provider"). For subsequent switches to a
@@ -170,12 +184,32 @@ export class QueryEngine {
     if (!apiKey) {
       throw new MissingApiKeyError(adapter.envKeyName)
     }
+    const capabilities: CapabilitySheet = {
+      maxContextTokens: entry.maxContextTokens,
+      maxOutputTokens: entry.maxOutputTokens,
+      supportsThinking: entry.supportsThinking,
+      supportsInterleavedThinking: entry.supportsInterleavedThinking,
+      promptCacheModel: entry.promptCacheModel,
+    }
     return adapter.createCallModel({
       apiKey,
       model: modelId,
       baseUrl: this.config.baseUrl,
       tools: toolDefs,
+      capabilities,
     })
+  }
+
+  /** Capability sheet for the currently-active model. */
+  private currentCapabilities(): CapabilitySheet {
+    const { entry } = resolveModel(this._model)
+    return {
+      maxContextTokens: entry.maxContextTokens,
+      maxOutputTokens: entry.maxOutputTokens,
+      supportsThinking: entry.supportsThinking,
+      supportsInterleavedThinking: entry.supportsInterleavedThinking,
+      promptCacheModel: entry.promptCacheModel,
+    }
   }
 
   /**
@@ -209,8 +243,15 @@ export class QueryEngine {
   /**
    * Submit a user prompt. Yields QueryEvents, returns Terminal.
    * Throws if another submission is already in progress.
+   *
+   * `opts.thinkingBudget` and `opts.interleavedThinking` override the engine
+   * config defaults for this submission only. Subagents forked during the
+   * submission inherit the resolved values.
    */
-  async *submitPrompt(prompt: string): AsyncGenerator<QueryEvent, Terminal> {
+  async *submitPrompt(
+    prompt: string,
+    opts?: SubmitPromptOptions,
+  ): AsyncGenerator<QueryEvent, Terminal> {
     if (this._running) {
       throw new Error('submitPrompt() already in progress')
     }
@@ -229,7 +270,7 @@ export class QueryEngine {
       }
 
       // System prompt
-      const systemPrompt = await buildFullSystemPrompt(this.config.cwd)
+      const systemPromptParts = await buildFullSystemPromptParts(this.config.cwd)
 
       // User message
       const uuid = () => messageId(randomUUID())
@@ -250,17 +291,28 @@ export class QueryEngine {
       // Build message array for query
       const allMessages = [...this._messages, ...initialAttachments, userMsg]
 
+      // Resolve thinking knobs once per submission (per-call opts → config
+      // defaults → undefined), normalize against the active model's
+      // capabilities, then thread the result into both the main loop and any
+      // subagent forks so the whole submission shares the same setting.
+      const rawBudget = opts?.thinkingBudget ?? this.config.thinkingBudget
+      const capSheet = this.currentCapabilities()
+      const thinkingBudget = normalizeThinkingBudget(rawBudget, this._model, capSheet)
+      const interleavedThinking = opts?.interleavedThinking ?? this.config.interleavedThinking
+
       // Per-submission subagent fork function
       const forkSubagent = createForkSubagent({
         callModel: this.callModel,
         compactCallModel: this.compactCallModel,
         parentToolRegistry: this.toolRegistry,
         parentAppState: this.appState,
-        parentSystemPrompt: systemPrompt,
+        parentSystemPromptParts: systemPromptParts,
         parentSignal: this.currentAbort.signal,
         cwd: this.config.cwd,
         sessionDir: this.session.dir,
         permissionOpts: this.permissionOpts,
+        parentThinkingBudget: thinkingBudget,
+        parentInterleavedThinking: interleavedThinking,
       })
 
       // Per-submission tool context
@@ -287,10 +339,12 @@ export class QueryEngine {
       // Run query
       const gen = query({
         messages: allMessages,
-        systemPrompt,
+        systemPromptParts,
         deps,
         signal: this.currentAbort.signal,
         maxTurns: this.config.maxTurns,
+        thinkingBudget,
+        interleavedThinking,
       })
 
       // Stream events through, persisting as we go

@@ -17,6 +17,7 @@ import { join } from 'node:path'
 import { query } from '../core/query.js'
 import type { Terminal } from '../core/queryTypes.js'
 import type { QueryDeps, CallModelFn } from '../core/queryDeps.js'
+import type { SystemPromptPart } from '../context/systemPromptParts.js'
 import type { Message, MessageId } from '../core/messages.js'
 import { createUserMessage, messageId } from '../core/messages.js'
 import type { Store, AppState } from '../core/state.js'
@@ -44,13 +45,15 @@ export type SubagentOptions = {
   readonly compactCallModel: CallModelFn
   readonly parentToolRegistry: ToolRegistry
   readonly parentAppState: Store<AppState>
-  readonly parentSystemPrompt: string
+  readonly parentSystemPromptParts: readonly SystemPromptPart[]
   readonly parentSignal: AbortSignal
   readonly cwd: string
   readonly sessionDir: string
   readonly permissionOpts: PermissionOptions
   readonly allowedTools?: readonly string[]
   readonly maxTurns?: number
+  readonly parentThinkingBudget?: number
+  readonly parentInterleavedThinking?: boolean
 }
 
 export type SubagentResult = {
@@ -117,7 +120,7 @@ export function createForkSubagent(opts: SubagentOptions): ForkSubagentFn {
       const uuid = (): MessageId => messageId(randomUUID())
 
       // System prompt with subagent preamble
-      const systemPrompt = buildSubagentSystemPrompt(opts.parentSystemPrompt)
+      const systemPromptParts = buildSubagentSystemPrompt(opts.parentSystemPromptParts)
 
       // Initial attachments — same workspace context as parent
       const initialAttachments = await getInitialAttachments(opts.cwd)
@@ -140,10 +143,12 @@ export function createForkSubagent(opts: SubagentOptions): ForkSubagentFn {
       // Run the subagent query loop
       const gen = query({
         messages,
-        systemPrompt,
+        systemPromptParts,
         deps,
         signal: abortController.signal,
         maxTurns,
+        thinkingBudget: opts.parentThinkingBudget,
+        interleavedThinking: opts.parentInterleavedThinking,
       })
 
       // Collect events, persist transcript, extract final text

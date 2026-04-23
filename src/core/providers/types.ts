@@ -17,13 +17,30 @@ export type ModelEntry = {
   readonly provider: ProviderId
   readonly label: string         // e.g. 'Claude Opus 4.7'
   readonly description: string   // e.g. 'Highest capability'
+
+  // Capability metadata — populated by every adapter; see docs/phase1a-v2-design.md.
+  readonly maxContextTokens: number
+  readonly maxOutputTokens: number
+  readonly supportsThinking: boolean
+  readonly supportsInterleavedThinking: boolean
+  readonly promptCacheModel: 'explicit' | 'implicit' | 'none'
 }
+
+export type CapabilitySheet = Pick<
+  ModelEntry,
+  | 'maxContextTokens'
+  | 'maxOutputTokens'
+  | 'supportsThinking'
+  | 'supportsInterleavedThinking'
+  | 'promptCacheModel'
+>
 
 export type CreateCallModelOptions = {
   readonly apiKey: string
   readonly model: string
   readonly baseUrl?: string
   readonly tools?: readonly ApiToolDefinition[]
+  readonly capabilities: CapabilitySheet
 }
 
 export type ProviderAdapter = {

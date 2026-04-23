@@ -1,5 +1,6 @@
 import type { Message } from './messages.js'
 import type { QueryDeps } from './queryDeps.js'
+import type { SystemPromptPart } from '../context/systemPromptParts.js'
 
 // ---------------------------------------------------------------------------
 // Query parameters — input to query()
@@ -7,11 +8,13 @@ import type { QueryDeps } from './queryDeps.js'
 
 export type QueryParams = {
   readonly messages: Message[]
-  readonly systemPrompt: string
+  readonly systemPromptParts: readonly SystemPromptPart[]
   readonly deps?: Partial<QueryDeps>
   readonly signal?: AbortSignal
   readonly maxTurns?: number                // safety limit, default 100
   readonly maxOutputTokensOverride?: number
+  readonly thinkingBudget?: number
+  readonly interleavedThinking?: boolean
 }
 
 // ---------------------------------------------------------------------------

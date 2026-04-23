@@ -293,4 +293,63 @@ describe('QueryEngine', () => {
       })
     })
   })
+
+  describe('thinking knobs', () => {
+    function captureCallModel(): { spy: CallModelFn; captured: Array<{ thinkingBudget?: number; interleavedThinking?: boolean }> } {
+      const captured: Array<{ thinkingBudget?: number; interleavedThinking?: boolean }> = []
+      const spy: CallModelFn = async function* (_msgs, _sys, opts, _signal) {
+        captured.push({
+          thinkingBudget: opts.thinkingBudget,
+          interleavedThinking: opts.interleavedThinking,
+        })
+        yield { type: 'message_start', message: { usage: { input_tokens: 1, output_tokens: 0 } } } as RawStreamEvent
+        yield { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } as RawStreamEvent
+        yield { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } } as RawStreamEvent
+        yield { type: 'content_block_stop', index: 0 } as RawStreamEvent
+        yield { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } } as RawStreamEvent
+        yield { type: 'message_stop' } as RawStreamEvent
+        return { stopReason: 'end_turn', inputTokens: 1, outputTokens: 1 } as ApiResponseMeta
+      }
+      return { spy, captured }
+    }
+
+    it('uses engine config thinkingBudget by default', async () => {
+      await withTmpDir(async (cwd) => {
+        const { spy, captured } = captureCallModel()
+        const engine = new QueryEngine(makeConfig(cwd, {
+          model: 'claude-opus-4-7',
+          thinkingBudget: 4096,
+          deps: { callModel: spy, runTool: stubRunTool },
+        }))
+        await collectEvents(engine.submitPrompt('hi'))
+        expect(captured[0]).toEqual({ thinkingBudget: 4096, interleavedThinking: undefined })
+      })
+    })
+
+    it('per-submission opts override engine config', async () => {
+      await withTmpDir(async (cwd) => {
+        const { spy, captured } = captureCallModel()
+        const engine = new QueryEngine(makeConfig(cwd, {
+          model: 'claude-opus-4-7',
+          thinkingBudget: 4096,
+          deps: { callModel: spy, runTool: stubRunTool },
+        }))
+        await collectEvents(engine.submitPrompt('hi', { thinkingBudget: 8192 }))
+        expect(captured[0]!.thinkingBudget).toBe(8192)
+      })
+    })
+
+    it('thinkingBudget=0 in opts disables thinking for that submission', async () => {
+      await withTmpDir(async (cwd) => {
+        const { spy, captured } = captureCallModel()
+        const engine = new QueryEngine(makeConfig(cwd, {
+          model: 'claude-opus-4-7',
+          thinkingBudget: 4096,
+          deps: { callModel: spy, runTool: stubRunTool },
+        }))
+        await collectEvents(engine.submitPrompt('hi', { thinkingBudget: 0 }))
+        expect(captured[0]!.thinkingBudget).toBeUndefined()
+      })
+    })
+  })
 })

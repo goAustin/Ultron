@@ -8,11 +8,22 @@
 
 import type { ProviderAdapter, ModelEntry, CreateCallModelOptions } from './types.js'
 import { createOpenAICompatibleCallModel } from './openaiAdapter.js'
+import { CONTEXT_256K, OUTPUT_16K } from './capabilityMetadata.js'
 
 const DEFAULT_BASE_URL = 'https://api.minimaxi.com/v1'
 
 const MODELS: readonly ModelEntry[] = [
-  { id: 'MiniMax-M2.7', provider: 'minimax', label: 'MiniMax M2.7', description: 'Latest' },
+  {
+    id: 'MiniMax-M2.7',
+    provider: 'minimax',
+    label: 'MiniMax M2.7',
+    description: 'Latest',
+    maxContextTokens: CONTEXT_256K,
+    maxOutputTokens: OUTPUT_16K,
+    supportsThinking: false,
+    supportsInterleavedThinking: false,
+    promptCacheModel: 'implicit',
+  },
 ]
 
 export const minimaxAdapter: ProviderAdapter = {

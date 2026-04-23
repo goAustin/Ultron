@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
@@ -43,7 +43,7 @@ function makeOpts(sessionDir: string, overrides?: Partial<SubagentOptions>): Sub
     compactCallModel: textCallModel('compact'),
     parentToolRegistry: createDefaultRegistry(),
     parentAppState: createStore<AppState>(getDefaultAppState()),
-    parentSystemPrompt: 'You are a helpful assistant.',
+    parentSystemPromptParts: [{ content: 'You are a helpful assistant.', cacheHint: 'static' }],
     parentSignal: new AbortController().signal,
     cwd: sessionDir,
     sessionDir,
@@ -168,6 +168,35 @@ describe('createForkSubagent', () => {
 
       const result = await fork('Empty response')
       expect(result.text).toContain('no text output')
+    })
+  })
+
+  it('forwards parentThinkingBudget into the subagent callModel', async () => {
+    await withTmpDir(async (dir) => {
+      const captured: Array<{ thinkingBudget?: number; interleavedThinking?: boolean }> = []
+      const spyCallModel: CallModelFn = vi.fn(async function* (_msgs, _sys, opts, _signal) {
+        captured.push({
+          thinkingBudget: opts.thinkingBudget,
+          interleavedThinking: opts.interleavedThinking,
+        })
+        yield { type: 'message_start', message: { usage: { input_tokens: 1, output_tokens: 0 } } } as RawStreamEvent
+        yield { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } as RawStreamEvent
+        yield { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } } as RawStreamEvent
+        yield { type: 'content_block_stop', index: 0 } as RawStreamEvent
+        yield { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } } as RawStreamEvent
+        yield { type: 'message_stop' } as RawStreamEvent
+        return { stopReason: 'end_turn', inputTokens: 1, outputTokens: 1 } as ApiResponseMeta
+      })
+
+      const fork = createForkSubagent(makeOpts(dir, {
+        callModel: spyCallModel,
+        parentThinkingBudget: 4096,
+        parentInterleavedThinking: true,
+      }))
+      await fork('do work')
+
+      expect(captured.length).toBeGreaterThanOrEqual(1)
+      expect(captured[0]).toEqual({ thinkingBudget: 4096, interleavedThinking: true })
     })
   })
 })
