@@ -21,8 +21,22 @@ import type {
   ApiResponseMeta,
   RawStreamEvent,
 } from '../queryDeps.js'
+import type { SystemPromptPart } from '../../context/systemPromptParts.js'
 import type { ApiToolDefinition } from '../tools/registry.js'
 import type { ProviderAdapter, ModelEntry, CreateCallModelOptions } from './types.js'
+import { CONTEXT_1M, CONTEXT_400K, OUTPUT_128K } from './capabilityMetadata.js'
+import { warnOnce } from './warnOnce.js'
+
+// Bucketed mapping from generic thinkingBudget (tokens) → reasoning_effort.
+// Boundaries are < (strict), so 4096 → 'medium' and 16_384 → 'high'.
+const REASONING_LOW_MAX = 4096
+const REASONING_MEDIUM_MAX = 16_384
+
+export function bucketReasoningEffort(budget: number): 'low' | 'medium' | 'high' {
+  if (budget < REASONING_LOW_MAX) return 'low'
+  if (budget < REASONING_MEDIUM_MAX) return 'medium'
+  return 'high'
+}
 
 // ---------------------------------------------------------------------------
 // Anthropic MessageParam → OpenAI ChatCompletionMessageParam conversion
@@ -41,14 +55,19 @@ type AnthropicMessage = {
   content: AnthropicBlock[]
 }
 
+export function joinSystemPromptParts(parts: readonly SystemPromptPart[]): string {
+  return parts.map(p => p.content).join('\n\n')
+}
+
 function anthropicToOpenAI(
   messages: unknown[],
-  systemPrompt: string,
+  systemPromptParts: readonly SystemPromptPart[],
 ): ChatCompletionMessageParam[] {
   const result: ChatCompletionMessageParam[] = []
 
-  if (systemPrompt) {
-    result.push({ role: 'system', content: systemPrompt })
+  const systemContent = joinSystemPromptParts(systemPromptParts)
+  if (systemContent) {
+    result.push({ role: 'system', content: systemContent })
   }
 
   for (const raw of messages) {
@@ -236,7 +255,7 @@ function* convertChunkToEvents(
  * if omitted, points at `api.openai.com`.
  */
 export function createOpenAICompatibleCallModel(opts: CreateCallModelOptions): CallModelFn {
-  const { apiKey, model, baseUrl, tools } = opts
+  const { apiKey, model, baseUrl, tools, capabilities } = opts
   const client = new OpenAI({
     apiKey,
     baseURL: baseUrl ?? 'https://api.openai.com/v1',
@@ -246,17 +265,40 @@ export function createOpenAICompatibleCallModel(opts: CreateCallModelOptions): C
 
   return async function* callModel(
     messages: unknown[],
-    systemPrompt: string,
+    systemPromptParts: readonly SystemPromptPart[],
     callOpts: CallModelOptions,
     signal: AbortSignal,
   ): AsyncGenerator<RawStreamEvent, ApiResponseMeta> {
-    const openaiMessages = anthropicToOpenAI(messages, systemPrompt)
+    const openaiMessages = anthropicToOpenAI(messages, systemPromptParts)
+
+    // Capability-gated thinking → reasoning_effort translation.
+    let reasoningEffort: 'low' | 'medium' | 'high' | undefined
+    if (callOpts.thinkingBudget && callOpts.thinkingBudget > 0) {
+      if (capabilities.supportsThinking) {
+        reasoningEffort = bucketReasoningEffort(callOpts.thinkingBudget)
+      } else {
+        warnOnce(
+          `thinking:${model}`,
+          `thinkingBudget set but model ${model} does not support thinking; ignoring.`,
+        )
+      }
+    }
+
+    // Interleaved thinking is an Anthropic-only beta today; warn and drop on
+    // any OpenAI-shaped endpoint.
+    if (callOpts.interleavedThinking && !capabilities.supportsInterleavedThinking) {
+      warnOnce(
+        `interleaved:${model}`,
+        `interleavedThinking set but model ${model} does not support it; ignoring.`,
+      )
+    }
 
     const stream = await client.chat.completions.create({
       model,
       max_completion_tokens: callOpts.maxOutputTokens ?? 4096,
       messages: openaiMessages,
       ...(openaiTools && { tools: openaiTools }),
+      ...(reasoningEffort && { reasoning_effort: reasoningEffort }),
       stream: true,
       stream_options: { include_usage: true },
     }, { signal })
@@ -308,9 +350,39 @@ export function createOpenAICompatibleCallModel(opts: CreateCallModelOptions): C
 // ---------------------------------------------------------------------------
 
 const MODELS: readonly ModelEntry[] = [
-  { id: 'gpt-5.4', provider: 'openai', label: 'GPT-5.4', description: 'Highest capability' },
-  { id: 'gpt-5.4-mini', provider: 'openai', label: 'GPT-5.4 Mini', description: 'Balanced' },
-  { id: 'gpt-5.4-nano', provider: 'openai', label: 'GPT-5.4 Nano', description: 'Fastest, cheapest' },
+  {
+    id: 'gpt-5.4',
+    provider: 'openai',
+    label: 'GPT-5.4',
+    description: 'Highest capability',
+    maxContextTokens: CONTEXT_1M,
+    maxOutputTokens: OUTPUT_128K,
+    supportsThinking: true,
+    supportsInterleavedThinking: false,
+    promptCacheModel: 'implicit',
+  },
+  {
+    id: 'gpt-5.4-mini',
+    provider: 'openai',
+    label: 'GPT-5.4 Mini',
+    description: 'Balanced',
+    maxContextTokens: CONTEXT_400K,
+    maxOutputTokens: OUTPUT_128K,
+    supportsThinking: true,
+    supportsInterleavedThinking: false,
+    promptCacheModel: 'implicit',
+  },
+  {
+    id: 'gpt-5.4-nano',
+    provider: 'openai',
+    label: 'GPT-5.4 Nano',
+    description: 'Fastest, cheapest',
+    maxContextTokens: CONTEXT_400K,
+    maxOutputTokens: OUTPUT_128K,
+    supportsThinking: true,
+    supportsInterleavedThinking: false,
+    promptCacheModel: 'implicit',
+  },
 ]
 
 // ---------------------------------------------------------------------------

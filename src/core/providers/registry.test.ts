@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 
-import { allModels, getAdapter, listProviders, resolveModel } from './registry.js'
+import { allModels, getAdapter, listProviders, resolveCapabilities, resolveModel } from './registry.js'
 import { UnknownModelError } from './types.js'
 
 describe('provider registry', () => {
@@ -64,5 +64,46 @@ describe('provider registry', () => {
       expect(m.label).toBeTruthy()
       expect(typeof m.description).toBe('string')
     }
+  })
+
+  it('every model in allModels has all capability fields populated', () => {
+    for (const m of allModels()) {
+      expect(typeof m.maxContextTokens).toBe('number')
+      expect(m.maxContextTokens).toBeGreaterThan(0)
+      expect(typeof m.maxOutputTokens).toBe('number')
+      expect(m.maxOutputTokens).toBeGreaterThan(0)
+      expect(typeof m.supportsThinking).toBe('boolean')
+      expect(typeof m.supportsInterleavedThinking).toBe('boolean')
+      expect(['explicit', 'implicit', 'none']).toContain(m.promptCacheModel)
+    }
+  })
+
+  it('resolveCapabilities returns the expected sheet for claude-opus-4-7', () => {
+    expect(resolveCapabilities('claude-opus-4-7')).toEqual({
+      maxContextTokens: 1_000_000,
+      maxOutputTokens: 128_000,
+      supportsThinking: true,
+      supportsInterleavedThinking: true,
+      promptCacheModel: 'explicit',
+    })
+  })
+
+  it('resolveCapabilities returns implicit caching for gpt-5.4-mini', () => {
+    const sheet = resolveCapabilities('gpt-5.4-mini')
+    expect(sheet.maxContextTokens).toBe(400_000)
+    expect(sheet.supportsThinking).toBe(true)
+    expect(sheet.supportsInterleavedThinking).toBe(false)
+    expect(sheet.promptCacheModel).toBe('implicit')
+  })
+
+  it('resolveCapabilities marks MiniMax-M2.7 as non-thinking with implicit caching', () => {
+    const sheet = resolveCapabilities('MiniMax-M2.7')
+    expect(sheet.supportsThinking).toBe(false)
+    expect(sheet.supportsInterleavedThinking).toBe(false)
+    expect(sheet.promptCacheModel).toBe('implicit')
+  })
+
+  it('resolveCapabilities throws UnknownModelError for unregistered ids', () => {
+    expect(() => resolveCapabilities('not-a-real-model')).toThrow(UnknownModelError)
   })
 })

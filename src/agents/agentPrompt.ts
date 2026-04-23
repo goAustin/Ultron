@@ -1,6 +1,8 @@
 /**
- * Subagent system prompt — prepends a preamble to the parent's system prompt.
+ * Subagent system prompt — prepends a preamble part to the parent's parts.
  */
+
+import type { SystemPromptPart } from '../context/systemPromptParts.js'
 
 const SUBAGENT_PREAMBLE = `You are a subagent — a focused assistant delegated a specific task by the primary assistant. Follow these guidelines:
 
@@ -10,10 +12,17 @@ const SUBAGENT_PREAMBLE = `You are a subagent — a focused assistant delegated 
 - You have access to read-only tools (file reading, search). Use them as needed to complete your task.
 `
 
+const SUBAGENT_PREAMBLE_PART: SystemPromptPart = {
+  content: SUBAGENT_PREAMBLE,
+  cacheHint: 'static',
+}
+
 /**
- * Build the system prompt for a subagent by prepending the subagent preamble
- * to the parent's static system prompt.
+ * Build the subagent's system prompt parts by prepending the subagent
+ * preamble as a static part ahead of the parent's parts.
  */
-export function buildSubagentSystemPrompt(parentSystemPrompt: string): string {
-  return SUBAGENT_PREAMBLE + '\n' + parentSystemPrompt
+export function buildSubagentSystemPrompt(
+  parent: readonly SystemPromptPart[],
+): readonly SystemPromptPart[] {
+  return [SUBAGENT_PREAMBLE_PART, ...parent]
 }

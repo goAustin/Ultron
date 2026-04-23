@@ -1,18 +1,12 @@
 /**
  * Static system prompt for Ultron.
  *
- * Returns an array of section strings with a boundary marker separating
- * static (cacheable) content from dynamic (per-session) content.
- * The boundary marker is filtered out when joining into a plain string;
- * future cache_control support will split on it.
+ * Returns an array of static section strings. Callers (see `./cacheHints.ts`)
+ * wrap each section into a `SystemPromptPart` with `cacheHint: 'static'` and
+ * append volatile parts (date, env info) afterward. The static → volatile
+ * transition in the parts list is the structural cut point that earlier
+ * versions encoded as a magic boundary string.
  */
-
-// ---------------------------------------------------------------------------
-// Boundary marker
-// ---------------------------------------------------------------------------
-
-export const SYSTEM_PROMPT_DYNAMIC_BOUNDARY =
-  '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__'
 
 // ---------------------------------------------------------------------------
 // Static sections
@@ -118,9 +112,8 @@ If you can say it in one sentence, don't use three.`
 
 /**
  * Returns the static system prompt as an array of section strings.
- * The array includes SYSTEM_PROMPT_DYNAMIC_BOUNDARY as a sentinel element
- * separating static (cacheable) sections from the dynamic sections that
- * callers will append.
+ * Each section is intended to become one `SystemPromptPart` with
+ * `cacheHint: 'static'` (see `./cacheHints.ts`).
  */
 export function buildSystemPrompt(): string[] {
   return [
@@ -131,6 +124,5 @@ export function buildSystemPrompt(): string[] {
     usingToolsSection(),
     toneSection(),
     efficiencySection(),
-    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
   ]
 }

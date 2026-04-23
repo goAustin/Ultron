@@ -1,28 +1,17 @@
 import { describe, it, expect } from 'vitest'
-import { buildSystemPrompt, SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from './systemPrompt.js'
+import { buildSystemPrompt } from './systemPrompt.js'
 
 describe('buildSystemPrompt', () => {
   const sections = buildSystemPrompt()
-  const joined = sections
-    .filter((s) => s !== SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-    .join('\n\n')
+  const joined = sections.join('\n\n')
 
   it('returns a non-empty string array', () => {
     expect(Array.isArray(sections)).toBe(true)
     expect(sections.length).toBeGreaterThan(0)
     for (const s of sections) {
       expect(typeof s).toBe('string')
+      expect(s.length).toBeGreaterThan(0)
     }
-  })
-
-  it('contains the boundary marker', () => {
-    expect(sections).toContain(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-  })
-
-  it('boundary marker is the last element (static only)', () => {
-    expect(sections.at(-1)).toBe(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-    // Not the first
-    expect(sections[0]).not.toBe(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
   })
 
   it('mentions Ultron', () => {

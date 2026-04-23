@@ -4,7 +4,7 @@ import { execFileSync } from 'child_process'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
-import { buildFullSystemPrompt, SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from './queryContext.js'
+import { buildFullSystemPromptParts } from './queryContext.js'
 import { clearUserContextCache } from './userContext.js'
 import { clearSystemContextCache } from './systemContext.js'
 
@@ -35,57 +35,77 @@ afterEach(() => {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('buildFullSystemPrompt', () => {
-  it('returns a string', async () => {
+describe('buildFullSystemPromptParts', () => {
+  it('returns an array of parts', async () => {
     await withTmpDir(async (dir) => {
-      const result = await buildFullSystemPrompt(dir)
-      expect(typeof result).toBe('string')
+      const parts = await buildFullSystemPromptParts(dir)
+      expect(Array.isArray(parts)).toBe(true)
+      expect(parts.length).toBeGreaterThan(0)
     })
   })
 
-  it('contains Ultron from static prompt', async () => {
+  it('contains at least one static part with non-empty content', async () => {
     await withTmpDir(async (dir) => {
-      const result = await buildFullSystemPrompt(dir)
-      expect(result).toContain('Ultron')
+      const parts = await buildFullSystemPromptParts(dir)
+      const staticParts = parts.filter(p => p.cacheHint === 'static' && p.content.length > 0)
+      expect(staticParts.length).toBeGreaterThan(0)
     })
   })
 
-  it('contains a date matching YYYY-MM-DD', async () => {
+  it('static parts precede all volatile parts (static-then-volatile invariant)', async () => {
     await withTmpDir(async (dir) => {
-      const result = await buildFullSystemPrompt(dir)
-      expect(result).toMatch(/Today's date is \d{4}-\d{2}-\d{2}/)
+      const parts = await buildFullSystemPromptParts(dir)
+      let seenVolatile = false
+      for (const p of parts) {
+        if (p.cacheHint === 'volatile') seenVolatile = true
+        if (seenVolatile && p.cacheHint === 'static') {
+          throw new Error('Static part appeared after volatile part')
+        }
+      }
     })
   })
 
-  it('contains working directory from env info', async () => {
+  it('joined content contains Ultron from static prompt', async () => {
     await withTmpDir(async (dir) => {
-      const result = await buildFullSystemPrompt(dir)
-      expect(result).toContain(`Working directory: ${dir}`)
+      const parts = await buildFullSystemPromptParts(dir)
+      const joined = parts.map(p => p.content).join('\n\n')
+      expect(joined).toContain('Ultron')
     })
   })
 
-  it('does not contain boundary marker', async () => {
+  it('joined content contains a date matching YYYY-MM-DD', async () => {
     await withTmpDir(async (dir) => {
-      const result = await buildFullSystemPrompt(dir)
-      expect(result).not.toContain(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+      const parts = await buildFullSystemPromptParts(dir)
+      const joined = parts.map(p => p.content).join('\n\n')
+      expect(joined).toMatch(/Today's date is \d{4}-\d{2}-\d{2}/)
+    })
+  })
+
+  it('joined content contains working directory from env info', async () => {
+    await withTmpDir(async (dir) => {
+      const parts = await buildFullSystemPromptParts(dir)
+      const joined = parts.map(p => p.content).join('\n\n')
+      expect(joined).toContain(`Working directory: ${dir}`)
     })
   })
 
   it('does not include Project Instructions (moved to attachments)', async () => {
     await withTmpDir(async (dir) => {
       writeFileSync(join(dir, 'CLAUDE.md'), 'My project rules')
-      const result = await buildFullSystemPrompt(dir)
-      expect(result).not.toContain('# Project Instructions')
-      expect(result).not.toContain('My project rules')
+      const parts = await buildFullSystemPromptParts(dir)
+      const joined = parts.map(p => p.content).join('\n\n')
+      expect(joined).not.toContain('# Project Instructions')
+      expect(joined).not.toContain('My project rules')
     })
   })
 
   it('does not include Git Status (moved to attachments)', async () => {
     await withTmpDir(async (dir) => {
       initGitRepo(dir)
-      const result = await buildFullSystemPrompt(dir)
-      expect(result).not.toContain('# Git Status')
-      expect(result).not.toContain('Current branch:')
+      const parts = await buildFullSystemPromptParts(dir)
+      const joined = parts.map(p => p.content).join('\n\n')
+      expect(joined).not.toContain('# Git Status')
+      expect(joined).not.toContain('Current branch:')
     })
   })
 })

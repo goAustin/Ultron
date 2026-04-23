@@ -25,7 +25,15 @@ import { readUserConfig, writeUserConfig } from './config/userConfig.js'
 // Config
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MODEL = 'claude-sonnet-4-6'
+const DEFAULT_MODEL = 'claude-opus-4-7'
+// Named constant for future phases (error recovery, rate-limit degradation) —
+// not wired in Phase 1a.
+export const FAST_FALLBACK_MODEL = 'claude-sonnet-4-6'
+
+// Applies whenever the resolved model has supportsThinking: true. Models
+// without it drop the knob with a one-time warn (see warnOnce.ts). No
+// `/thinking` CLI toggle in Phase 1c — surface is engine config only.
+const DEFAULT_THINKING_BUDGET = 4096
 
 const baseUrl = process.argv.includes('--base-url')
   ? process.argv[process.argv.indexOf('--base-url') + 1]!
@@ -75,6 +83,7 @@ const engine = new QueryEngine({
   permissionMode: 'default',
   askUser,
   logDecision: createPermissionLogger(),
+  thinkingBudget: DEFAULT_THINKING_BUDGET,
 })
 
 // ---------------------------------------------------------------------------

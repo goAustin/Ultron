@@ -18,6 +18,7 @@ import {
 import type { QueryEvent } from './queryEvents.js'
 import type { QueryDeps, RawStreamEvent, RawContentBlockStart, RawContentBlockDelta } from './queryDeps.js'
 import { productionDeps } from './queryDeps.js'
+import type { SystemPromptPart } from '../context/systemPromptParts.js'
 import type { QueryParams, LoopState, Terminal } from './queryTypes.js'
 import {
   DEFAULT_MAX_TURNS,
@@ -107,9 +108,11 @@ export async function* query(
       const streamResult = yield* streamModelResponse(
         deps,
         apiMessages,
-        params.systemPrompt,
+        params.systemPromptParts,
         state,
         signal,
+        params.thinkingBudget,
+        params.interleavedThinking,
       )
       assistantMessage = streamResult.message
       withheldError = streamResult.withheldError
@@ -362,16 +365,22 @@ type StreamModelResult = {
 async function* streamModelResponse(
   deps: QueryDeps,
   apiMessages: unknown[],
-  systemPrompt: string,
+  systemPromptParts: readonly SystemPromptPart[],
   state: LoopState,
   signal: AbortSignal,
+  thinkingBudget: number | undefined,
+  interleavedThinking: boolean | undefined,
 ): AsyncGenerator<QueryEvent, StreamModelResult> {
   const accumulator = new StreamAccumulator()
 
   const stream = deps.callModel(
     apiMessages,
-    systemPrompt,
-    { maxOutputTokens: state.maxOutputTokensOverride },
+    systemPromptParts,
+    {
+      maxOutputTokens: state.maxOutputTokensOverride,
+      thinkingBudget,
+      interleavedThinking,
+    },
     signal,
   )
 

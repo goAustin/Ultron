@@ -3,7 +3,7 @@
  *
  * Cached by cwd so multiple calls with the same directory return the same result.
  * The current date is NOT included here — it is computed fresh on each call
- * to buildFullSystemPrompt() to avoid stale dates across midnight.
+ * to buildSystemPromptParts() to avoid stale dates across midnight.
  */
 
 import { readFile } from 'node:fs/promises'

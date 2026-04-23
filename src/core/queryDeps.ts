@@ -1,5 +1,6 @@
 import type { Message, ToolUseBlock, ToolResultBlock, MessageId, UserMessage } from './messages.js'
 import type { ToolExecution } from '../context/attachmentTypes.js'
+import type { SystemPromptPart } from '../context/systemPromptParts.js'
 import { messageId } from './messages.js'
 import { randomUUID } from 'crypto'
 
@@ -72,6 +73,8 @@ export type ApiResponseMeta = {
 
 export type CallModelOptions = {
   readonly maxOutputTokens?: number
+  readonly thinkingBudget?: number      // tokens; 0 / undefined = no thinking
+  readonly interleavedThinking?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +87,7 @@ export type CallModelOptions = {
  */
 export type CallModelFn = (
   messages: unknown[], // Anthropic API message params (typed in apiAdapter)
-  systemPrompt: string,
+  systemPromptParts: readonly SystemPromptPart[],
   options: CallModelOptions,
   signal: AbortSignal,
 ) => AsyncGenerator<RawStreamEvent, ApiResponseMeta>
@@ -130,7 +133,7 @@ export type QueryDeps = {
 // Stub implementations (for Phase 1 and testing)
 // ---------------------------------------------------------------------------
 
-const stubCallModel: CallModelFn = async function* (_messages, _systemPrompt, _options, _signal) {
+const stubCallModel: CallModelFn = async function* (_messages, _systemPromptParts, _options, _signal) {
   return { stopReason: 'end_turn' }
 }
 
