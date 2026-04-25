@@ -19,6 +19,9 @@ import type { AskUserFn } from './core/permissions/types.js'
 import { resolveModel } from './core/providers/registry.js'
 import { UnknownModelError } from './core/providers/types.js'
 import { readUserConfig, writeUserConfig } from './config/userConfig.js'
+import { handleMemoryCommand } from './cli/memoryCommand.js'
+import { handleSkillCommand } from './cli/skillsCommand.js'
+import { handleWebCommand } from './cli/webCommand.js'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -75,6 +78,9 @@ const askUser: AskUserFn = async (toolName, input, reason, signal) => {
 // Engine
 // ---------------------------------------------------------------------------
 
+// Phase 6b: dedup'd one-shot notice renderer. Audit gets every emission via
+// the engine; the CLI only renders the first per session per event type.
+const seenNotifyTypes = new Set<string>()
 const engine = new QueryEngine({
   model,
   cwd,
@@ -82,6 +88,17 @@ const engine = new QueryEngine({
   permissionMode: 'default',
   askUser,
   thinkingBudget: DEFAULT_THINKING_BUDGET,
+  onNotify: (event) => {
+    if (seenNotifyTypes.has(event.type)) return
+    seenNotifyTypes.add(event.type)
+    if (event.type === 'web_backend_resolved' && event.backend === 'duckduckgo') {
+      process.stderr.write(
+        '\n[WebSearch] Using DuckDuckGo (no API key set). For higher quality results,\n' +
+          'set BRAVE_SEARCH_API_KEY (free tier: brave.com/search/api) or TAVILY_API_KEY\n' +
+          '(free tier: tavily.com), then restart Ultron.\n\n',
+      )
+    }
+  },
 })
 
 // One-shot deprecation notice for the retired Phase 1 permissions log.
@@ -115,11 +132,85 @@ function prompt(): void {
     if (trimmed === '/quit' || trimmed === '/exit') {
       console.log('Goodbye!')
       rl.close()
+      await engine.dispose()
       process.exit(0)
     }
 
     if (trimmed === '/session') {
       console.log(`Session: ${engine.sessionId}`)
+      prompt()
+      return
+    }
+
+    if (trimmed === '/mcp status') {
+      const statuses = engine.getMcpStatus()
+      if (statuses.length === 0) {
+        console.log('[mcp] no servers configured')
+      } else {
+        const pad = (s: string, n: number): string =>
+          s.length >= n ? s : s + ' '.repeat(n - s.length)
+        for (const s of statuses) {
+          const stateColor =
+            s.state === 'ready'      ? '\x1b[32m' :
+            s.state === 'connecting' ? '\x1b[36m' :
+            s.state === 'failed'     ? '\x1b[31m' :
+                                       '\x1b[2m'
+          const err = s.lastError ?? '(none)'
+          const retry =
+            s.nextRetryAt !== null
+              ? ` retryIn=${Math.max(0, s.nextRetryAt - Date.now())}ms`
+              : ''
+          console.log(
+            `[mcp] ${pad(s.server, 12)} ${stateColor}${pad(s.state, 10)}\x1b[0m tools=${s.toolCount} attempts=${s.reconnectAttempts}${retry}   lastError=${err}`,
+          )
+        }
+      }
+      prompt()
+      return
+    }
+
+    if (trimmed === '/mcp reload') {
+      try {
+        const result = await engine.reloadMcp()
+        console.log(
+          `[mcp] reload complete: connected=${result.connected.length} failed=${result.failed.length} removed=${result.removed.length} disabled=${result.disabled.length} unchanged=${result.unchanged.length} backoff=${result.backoff.length} toolsChanged=${result.toolDefinitionsChanged}`,
+        )
+        for (const row of result.backoff) {
+          const retryMs = row.nextRetryAt === null ? 0 : Math.max(0, row.nextRetryAt - Date.now())
+          console.log(`[mcp] ${row.server} still in backoff; retry in ${Math.ceil(retryMs / 1000)}s`)
+        }
+        for (const failure of result.failed) {
+          console.log(`[mcp] ${failure.server} failed: ${failure.error.message}`)
+        }
+      } catch (err) {
+        process.stderr.write(`[mcp] reload failed: ${err instanceof Error ? err.message : String(err)}\n`)
+      }
+      prompt()
+      return
+    }
+
+    if (trimmed === '/mcp list-tools' || trimmed.startsWith('/mcp list-tools ')) {
+      const server = trimmed === '/mcp list-tools'
+        ? undefined
+        : trimmed.slice('/mcp list-tools '.length).trim()
+      const tools = engine.listMcpTools(server || undefined)
+      if (tools.length === 0) {
+        console.log(server ? `[mcp] no tools for server "${server}"` : '[mcp] no MCP tools registered')
+      } else {
+        const byServer = new Map<string, typeof tools>()
+        for (const tool of tools) {
+          byServer.set(tool.server, [...(byServer.get(tool.server) ?? []), tool])
+        }
+        const pad = (s: string, n: number): string =>
+          s.length >= n ? s : s + ' '.repeat(n - s.length)
+        for (const [serverName, rows] of byServer) {
+          console.log(`[mcp] ${serverName} ${rows[0]?.state ?? 'unknown'}`)
+          for (const tool of rows) {
+            const oneLineDescription = tool.description.replace(/\s+/g, ' ').slice(0, 100)
+            console.log(`  ${pad(tool.name, 36)} ${oneLineDescription}`)
+          }
+        }
+      }
       prompt()
       return
     }
@@ -140,6 +231,68 @@ function prompt(): void {
         }
       } catch (err) {
         process.stderr.write(`\n\x1b[31m[model switch failed: ${err instanceof Error ? err.message : String(err)}]\x1b[0m\n`)
+      } finally {
+        rl = createInterface({ input: process.stdin, output: process.stdout })
+      }
+      prompt()
+      return
+    }
+
+    if (trimmed === '/memory' || trimmed.startsWith('/memory ')) {
+      // Close readline so sub-helpers (editor, confirm) own stdin briefly.
+      rl.close()
+      try {
+        await handleMemoryCommand(trimmed, engine, {
+          stdout: process.stdout,
+          stderr: process.stderr,
+        })
+      } catch (err) {
+        process.stderr.write(
+          `\n\x1b[31m[memory: ${err instanceof Error ? err.message : String(err)}]\x1b[0m\n`,
+        )
+      } finally {
+        rl = createInterface({ input: process.stdin, output: process.stdout })
+      }
+      prompt()
+      return
+    }
+
+    if (trimmed === '/skill' || trimmed.startsWith('/skill ')) {
+      // Close readline so sub-helpers (confirmYesNo) own stdin briefly.
+      rl.close()
+      try {
+        await handleSkillCommand(trimmed, engine, {
+          stdout: process.stdout,
+          stderr: process.stderr,
+        })
+      } catch (err) {
+        process.stderr.write(
+          `\n\x1b[31m[skill: ${err instanceof Error ? err.message : String(err)}]\x1b[0m\n`,
+        )
+      } finally {
+        rl = createInterface({ input: process.stdin, output: process.stdout })
+      }
+      prompt()
+      return
+    }
+
+    if (trimmed === '/web' || trimmed.startsWith('/web ')) {
+      // Close readline so sub-helpers (confirmYesNo / promptText) own stdin.
+      rl.close()
+      try {
+        await handleWebCommand(
+          trimmed,
+          {
+            appState: engine.appStateStore,
+            auditWriter: engine.auditWriter,
+            emitNotify: (event) => engine.emitNotify(event),
+          },
+          { stdout: process.stdout, stderr: process.stderr },
+        )
+      } catch (err) {
+        process.stderr.write(
+          `\n\x1b[31m[web: ${err instanceof Error ? err.message : String(err)}]\x1b[0m\n`,
+        )
       } finally {
         rl = createInterface({ input: process.stdin, output: process.stdout })
       }
@@ -188,7 +341,17 @@ function prompt(): void {
           case 'permission_decision':
           case 'tool_call_started':
           case 'tool_call_finished':
+          case 'tool_progress':
+          case 'hook_started':
+          case 'hook_finished':
           case 'compaction_started':
+          case 'memory_entry_written':
+          case 'memory_entry_deleted':
+          case 'skill_written':
+          case 'skill_deleted':
+          case 'skill_activated':
+          case 'skill_deactivated':
+          case 'web_backend_resolved':
             // Intentionally silent in the interactive CLI — these flow to the audit log.
             break
           default: {
@@ -225,5 +388,28 @@ function prompt(): void {
 // ---------------------------------------------------------------------------
 
 console.log(`\x1b[1mUltron v0.1.0\x1b[0m — model: ${model} (${adapter.displayName})${baseUrl ? `, via: ${baseUrl}` : ''}, cwd: ${cwd}`)
-console.log('Type /quit to exit, /session to see session ID, /model to switch models.\n')
+console.log('Type /quit to exit, /session, /model, /memory, /skill, /web, /mcp status, /mcp reload, /mcp list-tools.\n')
+
+// Pre-warm MCP so any config errors surface before the first prompt and any
+// server failures are reported up-front.
+engine.init().catch((err) => {
+  process.stderr.write(
+    `[mcp] bootstrap failed: ${err instanceof Error ? err.message : String(err)}\n`,
+  )
+})
+
+let shuttingDown = false
+const gracefulExit = async (code: number): Promise<void> => {
+  if (shuttingDown) return
+  shuttingDown = true
+  try {
+    await engine.dispose()
+  } catch {
+    // best-effort
+  }
+  process.exit(code)
+}
+process.on('SIGINT', () => void gracefulExit(130))
+process.on('SIGTERM', () => void gracefulExit(143))
+
 prompt()

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { mkdtempSync, rmSync, readFileSync } from 'fs'
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
@@ -16,6 +16,7 @@ import type {
 } from '../core/queryDeps.js'
 import { appendMessage } from '../session/transcript.js'
 import { createUserMessage, createAssistantMessage, messageId, toolUseId } from '../core/messages.js'
+import type { McpManager, McpReloadResult, McpRegisteredToolInfo } from '../core/mcp/index.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -51,6 +52,37 @@ const nullAuditWriter = {
   write: () => {},
   close: async () => {},
   withOrigin: () => nullAuditWriter,
+}
+
+function fakeMcpManager(overrides?: Partial<McpManager>): McpManager {
+  const reloadResult: McpReloadResult = {
+    connected: [],
+    failed: [],
+    removed: [],
+    disabled: [],
+    unchanged: [],
+    backoff: [],
+    toolDefinitionsChanged: false,
+  }
+  return {
+    async bootstrap() {
+      return { connected: [], failed: [] }
+    },
+    async reload() {
+      return reloadResult
+    },
+    async callTool() {
+      return { kind: 'transport_error', message: 'not implemented' }
+    },
+    listTools() {
+      return []
+    },
+    async shutdown() {},
+    status() {
+      return []
+    },
+    ...overrides,
+  }
 }
 
 function makeConfig(cwd: string, overrides?: Partial<QueryEngineConfig>): QueryEngineConfig {
@@ -254,6 +286,30 @@ describe('QueryEngine', () => {
     })
   })
 
+  describe('memory exposure (Phase 4c)', () => {
+    it('memoryBaseDir returns the configured path when memory is enabled', async () => {
+      await withTmpDir(async (cwd) => {
+        const memDir = join(cwd, 'memhome')
+        const engine = new QueryEngine(makeConfig(cwd, { memoryBaseDir: memDir }))
+        expect(engine.memoryBaseDir).toBe(memDir)
+      })
+    })
+
+    it('memoryBaseDir returns null when disableMemory is true', async () => {
+      await withTmpDir(async (cwd) => {
+        const engine = new QueryEngine(makeConfig(cwd, { disableMemory: true }))
+        expect(engine.memoryBaseDir).toBeNull()
+      })
+    })
+
+    it('auditWriter getter returns the configured writer instance', async () => {
+      await withTmpDir(async (cwd) => {
+        const engine = new QueryEngine(makeConfig(cwd))
+        expect(engine.auditWriter).toBe(nullAuditWriter)
+      })
+    })
+  })
+
   it('throws MissingApiKeyError when neither config.apiKey nor the env var is set', async () => {
     await withTmpDir(async (cwd) => {
       const savedAnthropic = process.env.ANTHROPIC_API_KEY
@@ -370,5 +426,716 @@ describe('QueryEngine', () => {
         expect(captured[0]!.thinkingBudget).toBeUndefined()
       })
     })
+  })
+
+  describe('MCP reload (Phase 3c)', () => {
+    it('refuses to reload while a submission is running', async () => {
+      await withTmpDir(async (cwd) => {
+        const engine = new QueryEngine(makeConfig(cwd, {
+          mcpManager: fakeMcpManager(),
+        }))
+
+        const gen = engine.submitPrompt('hi')
+        await gen.next()
+        await expect(engine.reloadMcp()).rejects.toThrow(/submission is in progress/)
+
+        let r = await gen.next()
+        while (!r.done) r = await gen.next()
+      })
+    })
+
+    it('rebuilds callModel when reload reports tool definition changes', async () => {
+      await withTmpDir(async (cwd) => {
+        const engine = new QueryEngine(makeConfig(cwd, {
+          mcpManager: fakeMcpManager({
+            async reload() {
+              return {
+                connected: ['fake'],
+                failed: [],
+                removed: [],
+                disabled: [],
+                unchanged: [],
+                backoff: [],
+                toolDefinitionsChanged: true,
+              }
+            },
+          }),
+        }))
+
+        const before = (engine as unknown as { callModel: CallModelFn }).callModel
+        const result = await engine.reloadMcp()
+        const after = (engine as unknown as { callModel: CallModelFn }).callModel
+
+        expect(result.toolDefinitionsChanged).toBe(true)
+        expect(after).not.toBe(before)
+      })
+    })
+
+    it('does not rebuild callModel when reload reports no tool definition changes', async () => {
+      await withTmpDir(async (cwd) => {
+        const engine = new QueryEngine(makeConfig(cwd, {
+          mcpManager: fakeMcpManager(),
+        }))
+
+        const before = (engine as unknown as { callModel: CallModelFn }).callModel
+        const result = await engine.reloadMcp()
+        const after = (engine as unknown as { callModel: CallModelFn }).callModel
+
+        expect(result.toolDefinitionsChanged).toBe(false)
+        expect(after).toBe(before)
+      })
+    })
+
+    it('listMcpTools delegates to the manager', async () => {
+      await withTmpDir(async (cwd) => {
+        const tools: McpRegisteredToolInfo[] = [
+          { server: 'fake', name: 'mcp__fake__echo', description: 'Echo', state: 'ready' },
+        ]
+        const engine = new QueryEngine(makeConfig(cwd, {
+          mcpManager: fakeMcpManager({
+            listTools(serverName?: string) {
+              return serverName === 'fake' ? tools : []
+            },
+          }),
+        }))
+
+        expect(engine.listMcpTools('fake')).toEqual(tools)
+      })
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Phase 5b — skill activation
+  // -------------------------------------------------------------------------
+
+  describe('skill activation', () => {
+    function writeSkillMd(
+      baseDir: string,
+      id: string,
+      frontmatter: Record<string, string>,
+      body: string,
+    ): void {
+      const dir = join(baseDir, 'skills', id)
+      mkdirSync(dir, { recursive: true })
+      const lines = ['---']
+      for (const [k, v] of Object.entries(frontmatter)) lines.push(`${k}: ${v}`)
+      lines.push('---', '', body)
+      writeFileSync(join(dir, 'SKILL.md'), lines.join('\n'))
+    }
+
+    function collectingAuditWriter(): {
+      events: QueryEvent[]
+      writer: typeof nullAuditWriter
+    } {
+      const events: QueryEvent[] = []
+      const writer: typeof nullAuditWriter = {
+        write: ((e: QueryEvent) => {
+          events.push(e)
+        }) as typeof nullAuditWriter.write,
+        close: async () => {},
+        withOrigin: () => writer,
+      }
+      return { events, writer }
+    }
+
+    function captureCallModel(): {
+      lastTools: unknown
+      lastSystemParts: unknown
+      callModel: CallModelFn
+    } {
+      const ref = { lastTools: undefined as unknown, lastSystemParts: undefined as unknown }
+      const callModel: CallModelFn = async function* (_msgs, sys, _opts, _signal) {
+        ref.lastSystemParts = sys
+        // The test stubs callModel via deps.callModel which doesn't get the
+        // tools array directly — the engine bakes it into the closure. We
+        // can't observe `tools` through this seam; the integration test
+        // covers send-side filtering. Here we only check system parts.
+        yield { type: 'message_start', message: { usage: { input_tokens: 5, output_tokens: 0 } } } as RawStreamEvent
+        yield { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } as RawStreamEvent
+        yield { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } } as RawStreamEvent
+        yield { type: 'content_block_stop', index: 0 } as RawStreamEvent
+        yield { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } } as RawStreamEvent
+        yield { type: 'message_stop' } as RawStreamEvent
+        return { stopReason: 'end_turn', inputTokens: 5, outputTokens: 1 } as ApiResponseMeta
+      }
+      return {
+        get lastTools() { return ref.lastTools },
+        get lastSystemParts() { return ref.lastSystemParts },
+        callModel,
+      }
+    }
+
+    it('throws when skill not found (no audit event)', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          const audit = collectingAuditWriter()
+          const engine = new QueryEngine(
+            makeConfig(cwd, {
+              memoryBaseDir: baseDir,
+              auditWriter: audit.writer,
+              disableMcp: true,
+            }),
+          )
+          await expect(engine.activateSkill('missing')).rejects.toThrow(/not found/)
+          expect(audit.events).toEqual([])
+        })
+      })
+    })
+
+    it('throws when memory is disabled', async () => {
+      await withTmpDir(async (cwd) => {
+        const engine = new QueryEngine(
+          makeConfig(cwd, { disableMemory: true, disableMcp: true }),
+        )
+        await expect(engine.activateSkill('any')).rejects.toThrow(
+          /Skills are disabled/,
+        )
+      })
+    })
+
+    it('throws when a skill is already active', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(baseDir, 'one', { name: 'one', description: 'd' }, 'body')
+          writeSkillMd(baseDir, 'two', { name: 'two', description: 'd' }, 'body')
+          const engine = new QueryEngine(
+            makeConfig(cwd, { memoryBaseDir: baseDir, disableMcp: true }),
+          )
+          await engine.activateSkill('one')
+          await expect(engine.activateSkill('two')).rejects.toThrow(
+            /already active/,
+          )
+        })
+      })
+    })
+
+    it('refuses on high-confidence secret + emits secret_refused audit', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(
+            baseDir,
+            'leaky',
+            { name: 'leaky', description: 'd' },
+            'use AKIAABCDEFGHIJKLMNOP for s3 access',
+          )
+          const audit = collectingAuditWriter()
+          const engine = new QueryEngine(
+            makeConfig(cwd, {
+              memoryBaseDir: baseDir,
+              auditWriter: audit.writer,
+              disableMcp: true,
+            }),
+          )
+          await expect(engine.activateSkill('leaky')).rejects.toThrow(
+            /high-confidence credentials/,
+          )
+          expect(engine.activeSkill).toBeNull()
+          const refusal = audit.events.find(
+            (e) => e.type === 'skill_deactivated',
+          )
+          expect(refusal).toBeTruthy()
+          expect((refusal as { reason: string }).reason).toBe('secret_refused')
+          expect(
+            audit.events.find((e) => e.type === 'skill_activated'),
+          ).toBeUndefined()
+        })
+      })
+    })
+
+    it('low-confidence without scanHandler refuses', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(
+            baseDir,
+            'lowsec',
+            { name: 'lowsec', description: 'd' },
+            'config: api_key = "abcdef1234567890"',
+          )
+          const audit = collectingAuditWriter()
+          const engine = new QueryEngine(
+            makeConfig(cwd, {
+              memoryBaseDir: baseDir,
+              auditWriter: audit.writer,
+              disableMcp: true,
+            }),
+          )
+          await expect(engine.activateSkill('lowsec')).rejects.toThrow(
+            /credential-like/,
+          )
+          expect(engine.activeSkill).toBeNull()
+          expect(
+            audit.events.find((e) => e.type === 'skill_deactivated'),
+          ).toBeTruthy()
+        })
+      })
+    })
+
+    it('low-confidence with handler returning false refuses', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(
+            baseDir,
+            'lowsec',
+            { name: 'lowsec', description: 'd' },
+            'config: api_key = "abcdef1234567890"',
+          )
+          const engine = new QueryEngine(
+            makeConfig(cwd, { memoryBaseDir: baseDir, disableMcp: true }),
+          )
+          await expect(
+            engine.activateSkill('lowsec', {}, async () => false),
+          ).rejects.toThrow(/refused by user/)
+          expect(engine.activeSkill).toBeNull()
+        })
+      })
+    })
+
+    it('low-confidence with handler returning true succeeds', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(
+            baseDir,
+            'lowsec',
+            { name: 'lowsec', description: 'd' },
+            'config: api_key = "abcdef1234567890"',
+          )
+          const audit = collectingAuditWriter()
+          const engine = new QueryEngine(
+            makeConfig(cwd, {
+              memoryBaseDir: baseDir,
+              auditWriter: audit.writer,
+              disableMcp: true,
+            }),
+          )
+          await engine.activateSkill('lowsec', {}, async () => true)
+          expect(engine.activeSkill?.id).toBe('lowsec')
+          expect(
+            audit.events.find((e) => e.type === 'skill_activated'),
+          ).toBeTruthy()
+        })
+      })
+    })
+
+    it('activate sets state, emits skill_activated, and respects turns', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(
+            baseDir,
+            'sk',
+            { name: 'sk', description: 'd' },
+            'instructions',
+          )
+          const audit = collectingAuditWriter()
+          const engine = new QueryEngine(
+            makeConfig(cwd, {
+              memoryBaseDir: baseDir,
+              auditWriter: audit.writer,
+              disableMcp: true,
+            }),
+          )
+          await engine.activateSkill('sk', { turns: 3, args: '<x>' })
+          expect(engine.activeSkill?.id).toBe('sk')
+          expect(engine.activeSkill?.body).toBe('instructions')
+          expect(engine.activeSkill?.args).toBe('<x>')
+          expect(engine.isSkillActive).toBe(true)
+          const ev = audit.events.find((e) => e.type === 'skill_activated') as
+            | { turns: number; hasArgs: boolean; hasAllowedTools: boolean }
+            | undefined
+          expect(ev?.turns).toBe(3)
+          expect(ev?.hasArgs).toBe(true)
+          expect(ev?.hasAllowedTools).toBe(false)
+        })
+      })
+    })
+
+    it('rejects turns < 1', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(
+            baseDir,
+            'sk',
+            { name: 'sk', description: 'd' },
+            'body',
+          )
+          const engine = new QueryEngine(
+            makeConfig(cwd, { memoryBaseDir: baseDir, disableMcp: true }),
+          )
+          await expect(
+            engine.activateSkill('sk', { turns: 0 }),
+          ).rejects.toThrow(/positive integer/)
+        })
+      })
+    })
+
+    it('submitPrompt injects skill body into system prompt parts', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(
+            baseDir,
+            'sk',
+            { name: 'review', description: 'd' },
+            'BODY-MARKER',
+          )
+          const captured = captureCallModel()
+          const engine = new QueryEngine(
+            makeConfig(cwd, {
+              memoryBaseDir: baseDir,
+              disableMcp: true,
+              deps: {
+                callModel: captured.callModel,
+                authorizeToolUse: stubAuthorize,
+                executeToolUse: stubExecute,
+              },
+            }),
+          )
+          await engine.activateSkill('sk')
+          await collectEvents(engine.submitPrompt('hello'))
+          const parts = captured.lastSystemParts as ReadonlyArray<{
+            content: string
+            cacheHint: string
+          }>
+          const skillPart = parts.find(
+            (p) => p.cacheHint === 'org' && p.content.includes('BODY-MARKER'),
+          )
+          expect(skillPart).toBeDefined()
+        })
+      })
+    })
+
+    it('successful turn decrements remainingTurns; reaches 0 → turns_exhausted', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(baseDir, 'sk', { name: 'sk', description: 'd' }, 'body')
+          const audit = collectingAuditWriter()
+          const engine = new QueryEngine(
+            makeConfig(cwd, {
+              memoryBaseDir: baseDir,
+              auditWriter: audit.writer,
+              disableMcp: true,
+            }),
+          )
+          await engine.activateSkill('sk', { turns: 1 })
+          await collectEvents(engine.submitPrompt('go'))
+          expect(engine.activeSkill).toBeNull()
+          const deact = audit.events.find(
+            (e) => e.type === 'skill_deactivated',
+          ) as { reason: string } | undefined
+          expect(deact?.reason).toBe('turns_exhausted')
+        })
+      })
+    })
+
+    it('multi-turn: stays active until counter exhausts', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(baseDir, 'sk', { name: 'sk', description: 'd' }, 'body')
+          const engine = new QueryEngine(
+            makeConfig(cwd, { memoryBaseDir: baseDir, disableMcp: true }),
+          )
+          await engine.activateSkill('sk', { turns: 3 })
+          expect(engine.isSkillActive).toBe(true)
+          await collectEvents(engine.submitPrompt('t1'))
+          expect(engine.isSkillActive).toBe(true)
+          await collectEvents(engine.submitPrompt('t2'))
+          expect(engine.isSkillActive).toBe(true)
+          await collectEvents(engine.submitPrompt('t3'))
+          expect(engine.isSkillActive).toBe(false)
+        })
+      })
+    })
+
+    it('user deactivation clears state and emits user_deactivated', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(baseDir, 'sk', { name: 'sk', description: 'd' }, 'body')
+          const audit = collectingAuditWriter()
+          const engine = new QueryEngine(
+            makeConfig(cwd, {
+              memoryBaseDir: baseDir,
+              auditWriter: audit.writer,
+              disableMcp: true,
+            }),
+          )
+          await engine.activateSkill('sk', { turns: 5 })
+          engine.deactivateSkill('user_deactivated')
+          expect(engine.activeSkill).toBeNull()
+          const deact = audit.events.find(
+            (e) => e.type === 'skill_deactivated',
+          ) as { reason: string } | undefined
+          expect(deact?.reason).toBe('user_deactivated')
+        })
+      })
+    })
+
+    it('deactivateSkill while inactive is a no-op (no event)', async () => {
+      await withTmpDir(async (cwd) => {
+        const audit = collectingAuditWriter()
+        const engine = new QueryEngine(
+          makeConfig(cwd, {
+            auditWriter: audit.writer,
+            disableMcp: true,
+          }),
+        )
+        engine.deactivateSkill('user_deactivated')
+        expect(audit.events).toEqual([])
+      })
+    })
+
+    it('aborted terminal preserves the activation window', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(baseDir, 'sk', { name: 'sk', description: 'd' }, 'body')
+          // Abort via the engine's own currentAbort signal — query() will
+          // observe and return a clean Terminal with reason='aborted'.
+          const abortAwareCallModel: CallModelFn = async function* (
+            _m,
+            _s,
+            _o,
+            signal,
+          ) {
+            // Wait for the parent abort to fire so query() returns a clean
+            // 'aborted' terminal rather than throwing.
+            await new Promise<void>((resolve) => {
+              if (signal.aborted) resolve()
+              else signal.addEventListener('abort', () => resolve(), { once: true })
+            })
+            yield {
+              type: 'message_start',
+              message: { usage: { input_tokens: 5, output_tokens: 0 } },
+            } as RawStreamEvent
+            return { stopReason: 'end_turn' } as ApiResponseMeta
+          }
+          const engine = new QueryEngine(
+            makeConfig(cwd, {
+              memoryBaseDir: baseDir,
+              disableMcp: true,
+              deps: {
+                callModel: abortAwareCallModel,
+                authorizeToolUse: stubAuthorize,
+                executeToolUse: stubExecute,
+              },
+            }),
+          )
+          await engine.activateSkill('sk', { turns: 5 })
+          const gen = engine.submitPrompt('go')
+          // Kick off the generator, then abort.
+          const firstTick = gen.next()
+          engine.abort()
+          await firstTick
+          // Drain until done.
+          while (!(await gen.next()).done) { /* drain */ }
+          // Activation window is preserved across abort.
+          expect(engine.isSkillActive).toBe(true)
+        })
+      })
+    })
+
+    it('error terminal auto-deactivates with reason=error', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(baseDir, 'sk', { name: 'sk', description: 'd' }, 'body')
+          // callModel that throws a non-abort error to surface a Terminal
+          // with reason='error' through the loop's error handling.
+          const throwingCallModel: CallModelFn = async function* (
+            _m,
+            _s,
+            _o,
+            _sig,
+          ) {
+            throw new Error('boom')
+            // Unreachable — forces TypeScript to treat this as a generator.
+            yield { type: 'message_stop' } as RawStreamEvent
+          }
+          const audit = collectingAuditWriter()
+          const engine = new QueryEngine(
+            makeConfig(cwd, {
+              memoryBaseDir: baseDir,
+              auditWriter: audit.writer,
+              disableMcp: true,
+              deps: {
+                callModel: throwingCallModel,
+                authorizeToolUse: stubAuthorize,
+                executeToolUse: stubExecute,
+              },
+            }),
+          )
+          await engine.activateSkill('sk', { turns: 5 })
+          try {
+            await collectEvents(engine.submitPrompt('go'))
+          } catch {
+            // submitPrompt may rethrow — that's fine; the catch handler
+            // deactivated before rethrowing.
+          }
+          expect(engine.isSkillActive).toBe(false)
+          const deact = audit.events.find(
+            (e) => e.type === 'skill_deactivated',
+          ) as { reason: string } | undefined
+          expect(deact?.reason).toBe('error')
+        })
+      })
+    })
+
+    it('pre-query throw also deactivates with reason=error', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(baseDir, 'sk', { name: 'sk', description: 'd' }, 'body')
+          // Make hookConfigPath point at a malformed file so loadHooks
+          // throws inside submitPrompt's body before the query loop runs.
+          const hookPath = join(baseDir, 'hooks-bad.json')
+          writeFileSync(hookPath, '{ this is not json')
+          const audit = collectingAuditWriter()
+          const engine = new QueryEngine(
+            makeConfig(cwd, {
+              memoryBaseDir: baseDir,
+              auditWriter: audit.writer,
+              disableMcp: true,
+              hookConfigPath: hookPath,
+            }),
+          )
+          await engine.activateSkill('sk', { turns: 5 })
+          await expect(
+            collectEvents(engine.submitPrompt('go')),
+          ).rejects.toThrow()
+          expect(engine.isSkillActive).toBe(false)
+          const deact = audit.events.find(
+            (e) => e.type === 'skill_deactivated',
+          ) as { reason: string } | undefined
+          expect(deact?.reason).toBe('error')
+        })
+      })
+    })
+
+    it('deactivateSkill while a submission is running throws', async () => {
+      // Toggle `_running` directly via a private cast — driving a real
+      // submission that parks deterministically is brittle in vitest, and
+      // the guard itself is a one-liner mirror of setModel's well-tested
+      // guard. We only need to assert the branch fires.
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(baseDir, 'sk', { name: 'sk', description: 'd' }, 'body')
+          const engine = new QueryEngine(
+            makeConfig(cwd, { memoryBaseDir: baseDir, disableMcp: true }),
+          )
+          await engine.activateSkill('sk', { turns: 5 })
+          ;(engine as unknown as { _running: boolean })._running = true
+          try {
+            expect(() => engine.deactivateSkill('user_deactivated')).toThrow(
+              /submission is in progress/,
+            )
+          } finally {
+            ;(engine as unknown as { _running: boolean })._running = false
+          }
+        })
+      })
+    })
+
+    it('deactivateSkill on disposed engine throws', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(baseDir, 'sk', { name: 'sk', description: 'd' }, 'body')
+          const engine = new QueryEngine(
+            makeConfig(cwd, { memoryBaseDir: baseDir, disableMcp: true }),
+          )
+          await engine.activateSkill('sk')
+          await engine.dispose()
+          expect(() => engine.deactivateSkill('user_deactivated')).toThrow(
+            /disposed/,
+          )
+        })
+      })
+    })
+
+    it('activated skill with allowedTools sets up scoped allowlist', async () => {
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(
+            baseDir,
+            'sk',
+            {
+              name: 'sk',
+              description: 'd',
+              'allowed-tools': '["FileRead", "Grep"]',
+            },
+            'body',
+          )
+          const engine = new QueryEngine(
+            makeConfig(cwd, { memoryBaseDir: baseDir, disableMcp: true }),
+          )
+          await engine.activateSkill('sk')
+          expect(engine.activeSkill?.allowedTools).toEqual(['FileRead', 'Grep'])
+        })
+      })
+    })
+
+    it('send-side: _activeCallModel is built only when allowedTools is set', async () => {
+      // Capture the args resolveCallModel sees so we can assert that the
+      // activation-filtered call model is constructed against the filtered
+      // tool defs — not the unfiltered registry.
+      await withTmpDir(async (cwd) => {
+        await withTmpDir(async (baseDir) => {
+          writeSkillMd(
+            baseDir,
+            'scoped',
+            {
+              name: 'scoped',
+              description: 'd',
+              'allowed-tools': '["FileRead", "Grep"]',
+            },
+            'body',
+          )
+          writeSkillMd(
+            baseDir,
+            'unscoped',
+            { name: 'unscoped', description: 'd' },
+            'body',
+          )
+          const engine = new QueryEngine(
+            makeConfig(cwd, { memoryBaseDir: baseDir, disableMcp: true }),
+          )
+
+          type WithPrivates = {
+            _activeCallModel: unknown
+            callModel: unknown
+            resolveCallModel: (
+              this: unknown,
+              modelId: string,
+              defs: ReadonlyArray<{ name: string }>,
+            ) => unknown
+          }
+          const priv = engine as unknown as WithPrivates
+
+          const seenDefs: Array<ReadonlyArray<{ name: string }>> = []
+          const orig = priv.resolveCallModel.bind(engine) as typeof priv.resolveCallModel
+          priv.resolveCallModel = function (
+            this: unknown,
+            modelId: string,
+            defs: ReadonlyArray<{ name: string }>,
+          ) {
+            seenDefs.push(defs)
+            return orig.call(engine, modelId, defs)
+          }
+
+          // Skill WITH allowed-tools → _activeCallModel built from the filter.
+          await engine.activateSkill('scoped')
+          expect(priv._activeCallModel).not.toBeNull()
+          expect(priv._activeCallModel).not.toBe(priv.callModel)
+          // The most recent resolveCallModel call carries the FILTERED defs.
+          const last = seenDefs[seenDefs.length - 1]
+          expect(last?.map((d) => d.name).sort()).toEqual(['FileRead', 'Grep'])
+
+          engine.deactivateSkill('user_deactivated')
+          expect(priv._activeCallModel).toBeNull()
+
+          // Skill WITHOUT allowed-tools → _activeCallModel stays null.
+          await engine.activateSkill('unscoped')
+          expect(priv._activeCallModel).toBeNull()
+        })
+      })
+    })
+
+    // The `_running` guard on activateSkill mirrors setModel's pattern,
+    // which is already covered by the setModel suite. Asserting the guard
+    // here would require a stuck-callModel scaffold that's hard to drive
+    // deterministically in vitest.
   })
 })

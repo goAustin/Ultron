@@ -21,13 +21,29 @@ function makeToolUse(name: string, input: Record<string, unknown> = {}): ToolUse
   return { type: 'tool_use', id: toolUseId(`tu-${++tuCounter}`), name, input }
 }
 
-function simpleTool(name: string, opts: { path?: string } = {}): Tool {
+function simpleTool(name: string, opts: { path?: string; domain?: string } = {}): Tool {
   return buildTool({
     name,
     inputSchema: { type: 'object', properties: {}, required: [] },
     call: async () => ({ content: 'ok', isError: false }),
     ...(opts.path !== undefined ? { getPath: () => opts.path! } : {}),
+    ...(opts.domain !== undefined ? { getDomain: () => opts.domain! } : {}),
   })
+}
+
+// MCP-sourced simple tool for wildcard tests — the registry rejects `mcp__`
+// names without source:'mcp'.
+function simpleMcpTool(name: string): Tool {
+  return {
+    name,
+    description: 'mcp test tool',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    source: 'mcp',
+    isMutating: true,
+    async validateInput() { return { valid: true } },
+    async checkPermissions() { return { behavior: 'allow' } },
+    async call() { return { content: 'ok', isError: false } },
+  }
 }
 
 function makeContext(
@@ -430,6 +446,180 @@ describe('rule matching', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Wildcard rules (Phase 3b)
+// ---------------------------------------------------------------------------
+
+describe('wildcard rules', () => {
+  it('suffix-* rule matches MCP namespace', async () => {
+    const tool = simpleMcpTool('mcp__fake__echo')
+    const rules: PermissionRule[] = [
+      { toolName: 'mcp__fake__*', behavior: 'allow', source: 'userSettings' },
+    ]
+    const ctx = makeContext([tool], { permissionRules: rules })
+    const decision = await hasPermissionsToUseTool(tool, makeToolUse('mcp__fake__echo'), ctx, opts())
+    expect(decision.behavior).toBe('allow')
+    expect(decision.reason).toEqual({ type: 'rule', rule: rules[0] })
+  })
+
+  it('suffix-* rule does not match unrelated tool', async () => {
+    const tool = simpleTool('Bash')
+    const rules: PermissionRule[] = [
+      { toolName: 'mcp__fake__*', behavior: 'allow', source: 'userSettings' },
+    ]
+    const ctx = makeContext([tool], { permissionRules: rules })
+    const decision = await hasPermissionsToUseTool(tool, makeToolUse('Bash'), ctx, opts())
+    // falls through to fallback ask
+    expect(decision.behavior).toBe('ask')
+    expect(decision.reason).toEqual({ type: 'fallback' })
+  })
+
+  it('prefix strictness: mcp__fake__* does not match mcp__fake2__foo', async () => {
+    const tool = simpleMcpTool('mcp__fake2__foo')
+    const rules: PermissionRule[] = [
+      { toolName: 'mcp__fake__*', behavior: 'allow', source: 'userSettings' },
+    ]
+    const ctx = makeContext([tool], { permissionRules: rules })
+    const decision = await hasPermissionsToUseTool(tool, makeToolUse('mcp__fake2__foo'), ctx, opts())
+    expect(decision.behavior).toBe('ask')
+  })
+
+  it('mcp__* matches any MCP tool', async () => {
+    const toolA = simpleMcpTool('mcp__a__x')
+    const toolB = simpleMcpTool('mcp__b__y')
+    const rules: PermissionRule[] = [
+      { toolName: 'mcp__*', behavior: 'allow', source: 'userSettings' },
+    ]
+    const ctxA = makeContext([toolA], { permissionRules: rules })
+    const decisionA = await hasPermissionsToUseTool(toolA, makeToolUse('mcp__a__x'), ctxA, opts())
+    expect(decisionA.behavior).toBe('allow')
+
+    const ctxB = makeContext([toolB], { permissionRules: rules })
+    const decisionB = await hasPermissionsToUseTool(toolB, makeToolUse('mcp__b__y'), ctxB, opts())
+    expect(decisionB.behavior).toBe('allow')
+  })
+
+  it('non-MCP wildcard: File* matches FileRead and FileWrite', async () => {
+    const toolR = simpleTool('FileRead')
+    const toolW = simpleTool('FileWrite')
+    const rules: PermissionRule[] = [
+      { toolName: 'File*', behavior: 'allow', source: 'userSettings' },
+    ]
+    const ctxR = makeContext([toolR], { permissionRules: rules })
+    const decisionR = await hasPermissionsToUseTool(toolR, makeToolUse('FileRead'), ctxR, opts())
+    expect(decisionR.behavior).toBe('allow')
+
+    const ctxW = makeContext([toolW], { permissionRules: rules })
+    const decisionW = await hasPermissionsToUseTool(toolW, makeToolUse('FileWrite'), ctxW, opts())
+    expect(decisionW.behavior).toBe('allow')
+  })
+
+  it('bare * fails closed — matches nothing', async () => {
+    const tool = simpleMcpTool('mcp__fake__echo')
+    const rules: PermissionRule[] = [
+      { toolName: '*', behavior: 'allow', source: 'userSettings' },
+    ]
+    const ctx = makeContext([tool], { permissionRules: rules })
+    const decision = await hasPermissionsToUseTool(tool, makeToolUse('mcp__fake__echo'), ctx, opts())
+    expect(decision.behavior).toBe('ask')
+    expect(decision.reason).toEqual({ type: 'fallback' })
+  })
+
+  it('deny wildcard beats allow wildcard', async () => {
+    const tool = simpleMcpTool('mcp__fake__echo')
+    const rules: PermissionRule[] = [
+      { toolName: 'mcp__*', behavior: 'allow', source: 'userSettings' },
+      { toolName: 'mcp__fake__*', behavior: 'deny', source: 'userSettings' },
+    ]
+    const ctx = makeContext([tool], { permissionRules: rules })
+    const decision = await hasPermissionsToUseTool(tool, makeToolUse('mcp__fake__echo'), ctx, opts())
+    expect(decision.behavior).toBe('deny')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Domain rules (Phase 6a)
+// ---------------------------------------------------------------------------
+
+describe('domain rules', () => {
+  it('exact-host rule matches when getDomain returns that host', async () => {
+    const tool = simpleTool('WebFetch', { domain: 'github.com' })
+    const rules: PermissionRule[] = [
+      { toolName: 'WebFetch', behavior: 'allow', domain: 'github.com', source: 'session' },
+    ]
+    const ctx = makeContext([tool], { permissionRules: rules })
+    const decision = await hasPermissionsToUseTool(tool, makeToolUse('WebFetch'), ctx, opts())
+    expect(decision.behavior).toBe('allow')
+    expect(decision.reason).toEqual({ type: 'rule', rule: rules[0] })
+  })
+
+  it('exact-host rule does not match a different host', async () => {
+    const tool = simpleTool('WebFetch', { domain: 'gist.github.com' })
+    const rules: PermissionRule[] = [
+      { toolName: 'WebFetch', behavior: 'allow', domain: 'github.com', source: 'session' },
+    ]
+    const ctx = makeContext([tool], { permissionRules: rules })
+    const decision = await hasPermissionsToUseTool(tool, makeToolUse('WebFetch'), ctx, opts())
+    expect(decision.behavior).toBe('ask') // falls through
+  })
+
+  it('*.suffix rule matches a subdomain', async () => {
+    const tool = simpleTool('WebFetch', { domain: 'gist.github.com' })
+    const rules: PermissionRule[] = [
+      { toolName: 'WebFetch', behavior: 'allow', domain: '*.github.com', source: 'session' },
+    ]
+    const ctx = makeContext([tool], { permissionRules: rules })
+    const decision = await hasPermissionsToUseTool(tool, makeToolUse('WebFetch'), ctx, opts())
+    expect(decision.behavior).toBe('allow')
+  })
+
+  it('*.suffix rule does not match the apex', async () => {
+    const tool = simpleTool('WebFetch', { domain: 'github.com' })
+    const rules: PermissionRule[] = [
+      { toolName: 'WebFetch', behavior: 'allow', domain: '*.github.com', source: 'session' },
+    ]
+    const ctx = makeContext([tool], { permissionRules: rules })
+    const decision = await hasPermissionsToUseTool(tool, makeToolUse('WebFetch'), ctx, opts())
+    expect(decision.behavior).toBe('ask')
+  })
+
+  it('domain rule does not match a tool that does not expose getDomain', async () => {
+    const tool = simpleTool('FileRead', { path: '/foo' }) // no getDomain
+    const rules: PermissionRule[] = [
+      { toolName: 'FileRead', behavior: 'allow', domain: 'github.com', source: 'session' },
+    ]
+    const ctx = makeContext([tool], { permissionRules: rules })
+    const decision = await hasPermissionsToUseTool(tool, makeToolUse('FileRead'), ctx, opts())
+    expect(decision.behavior).toBe('ask') // domain match fails, falls through
+  })
+
+  it('rule with both path and domain requires both to match', async () => {
+    const tool = simpleTool('Hybrid', { path: '/foo', domain: 'github.com' })
+    const rulesBoth: PermissionRule[] = [
+      { toolName: 'Hybrid', behavior: 'allow', path: '/foo', domain: 'github.com', source: 'session' },
+    ]
+    const ctxBoth = makeContext([tool], { permissionRules: rulesBoth })
+    const decisionBoth = await hasPermissionsToUseTool(tool, makeToolUse('Hybrid'), ctxBoth, opts())
+    expect(decisionBoth.behavior).toBe('allow')
+
+    const wrongHost = simpleTool('Hybrid', { path: '/foo', domain: 'evil.com' })
+    const ctxWrong = makeContext([wrongHost], { permissionRules: rulesBoth })
+    const decisionWrong = await hasPermissionsToUseTool(wrongHost, makeToolUse('Hybrid'), ctxWrong, opts())
+    expect(decisionWrong.behavior).toBe('ask')
+  })
+
+  it('domain deny wins over domain allow for the same host', async () => {
+    const tool = simpleTool('WebFetch', { domain: 'github.com' })
+    const rules: PermissionRule[] = [
+      { toolName: 'WebFetch', behavior: 'allow', domain: 'github.com', source: 'session' },
+      { toolName: 'WebFetch', behavior: 'deny', domain: 'github.com', source: 'userSettings' },
+    ]
+    const ctx = makeContext([tool], { permissionRules: rules })
+    const decision = await hasPermissionsToUseTool(tool, makeToolUse('WebFetch'), ctx, opts())
+    expect(decision.behavior).toBe('deny')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Decision priority ordering
 // ---------------------------------------------------------------------------
 
@@ -490,6 +680,109 @@ describe('structured reasons', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Step 1.5: Skill scope (Phase 5b)
+// ---------------------------------------------------------------------------
+
+describe('skill scope (scopedToolAllowlist)', () => {
+  it('tool in allowlist falls through cascade (no deny here)', async () => {
+    const tool = simpleTool('FileRead')
+    const ctx = makeContext([tool], { permissionMode: 'bypassPermissions' })
+    const decision = await hasPermissionsToUseTool(
+      tool, makeToolUse('FileRead'), ctx,
+      opts({ scopedToolAllowlist: ['FileRead', 'Grep'] }),
+    )
+    // Falls through to mode bypass → allow.
+    expect(decision.behavior).toBe('allow')
+    expect(decision.reason).toEqual({ type: 'mode', mode: 'bypassPermissions' })
+  })
+
+  it('tool NOT in allowlist denies with skillScope reason', async () => {
+    const tool = simpleTool('Bash')
+    const ctx = makeContext([tool])
+    const decision = await hasPermissionsToUseTool(
+      tool, makeToolUse('Bash'), ctx,
+      opts({ scopedToolAllowlist: ['FileRead', 'Grep'] }),
+    )
+    expect(decision.behavior).toBe('deny')
+    expect(decision.reason).toEqual({
+      type: 'skillScope',
+      toolName: 'Bash',
+      allowed: ['FileRead', 'Grep'],
+    })
+  })
+
+  it('empty allowlist denies every tool', async () => {
+    const tool = simpleTool('FileRead')
+    const ctx = makeContext([tool])
+    const decision = await hasPermissionsToUseTool(
+      tool, makeToolUse('FileRead'), ctx,
+      opts({ scopedToolAllowlist: [] }),
+    )
+    expect(decision.behavior).toBe('deny')
+    expect(decision.reason).toEqual({
+      type: 'skillScope',
+      toolName: 'FileRead',
+      allowed: [],
+    })
+  })
+
+  it('undefined allowlist is a no-op (default cascade applies)', async () => {
+    const tool = simpleTool('Bash')
+    const ctx = makeContext([tool], { permissionMode: 'bypassPermissions' })
+    const decision = await hasPermissionsToUseTool(
+      tool, makeToolUse('Bash'), ctx,
+      opts({ scopedToolAllowlist: undefined }),
+    )
+    // No skill scope → bypass mode allows.
+    expect(decision.behavior).toBe('allow')
+    expect(decision.reason).toEqual({ type: 'mode', mode: 'bypassPermissions' })
+  })
+
+  it('explicit user deny rule beats skill scope (defense in depth)', async () => {
+    const tool = simpleTool('FileRead')
+    const rules: PermissionRule[] = [
+      { toolName: 'FileRead', behavior: 'deny', source: 'userSettings' },
+    ]
+    const ctx = makeContext([tool], { permissionRules: rules })
+    const decision = await hasPermissionsToUseTool(
+      tool, makeToolUse('FileRead'), ctx,
+      opts({ scopedToolAllowlist: ['FileRead'] }),
+    )
+    // Step 1 (explicit deny) wins over step 1.5 (skill scope allows it).
+    expect(decision.behavior).toBe('deny')
+    expect(decision.reason.type).toBe('rule')
+  })
+
+  it('skill scope beats bypassPermissions mode', async () => {
+    const tool = simpleTool('Bash')
+    const ctx = makeContext([tool], { permissionMode: 'bypassPermissions' })
+    const decision = await hasPermissionsToUseTool(
+      tool, makeToolUse('Bash'), ctx,
+      opts({ scopedToolAllowlist: ['FileRead'] }),
+    )
+    // Step 1.5 fires before step 5 (mode bypass).
+    expect(decision.behavior).toBe('deny')
+    expect(decision.reason).toEqual({
+      type: 'skillScope',
+      toolName: 'Bash',
+      allowed: ['FileRead'],
+    })
+  })
+
+  it('headless escalation does NOT apply to skillScope deny', async () => {
+    const tool = simpleTool('Bash')
+    const ctx = makeContext([tool])
+    const decision = await hasPermissionsToUseTool(
+      tool, makeToolUse('Bash'), ctx,
+      opts({ headless: true, scopedToolAllowlist: ['FileRead'] }),
+    )
+    // Already a deny, not an ask — pass through unchanged.
+    expect(decision.behavior).toBe('deny')
+    expect(decision.reason.type).toBe('skillScope')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // formatDecisionMessage
 // ---------------------------------------------------------------------------
 
@@ -512,11 +805,38 @@ describe('formatDecisionMessage', () => {
     expect(msg).toContain('headless')
   })
 
+  it('formats skillScope', () => {
+    const msg = formatDecisionMessage({
+      behavior: 'deny',
+      reason: { type: 'skillScope', toolName: 'Bash', allowed: ['FileRead', 'Grep'] },
+    })
+    expect(msg).toContain("active skill's allowed-tools")
+    expect(msg).toContain('FileRead, Grep')
+  })
+
   it('formats fallback', () => {
     const msg = formatDecisionMessage({
       behavior: 'ask',
       reason: { type: 'fallback' },
     })
     expect(msg).toContain('approval')
+  })
+
+  it('formats rule with domain only', () => {
+    const msg = formatDecisionMessage({
+      behavior: 'allow',
+      reason: { type: 'rule', rule: { toolName: 'WebFetch', behavior: 'allow', domain: 'github.com', source: 'session' } },
+    })
+    expect(msg).toContain('WebFetch')
+    expect(msg).toContain('github.com')
+  })
+
+  it('formats rule with both path and domain', () => {
+    const msg = formatDecisionMessage({
+      behavior: 'allow',
+      reason: { type: 'rule', rule: { toolName: 'Hybrid', behavior: 'allow', path: '/foo', domain: 'github.com', source: 'session' } },
+    })
+    expect(msg).toContain('/foo')
+    expect(msg).toContain('github.com')
   })
 })

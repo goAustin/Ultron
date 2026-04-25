@@ -67,6 +67,12 @@ describe('enforceBaseDirectoryPermissions', () => {
 
       const sessionsStat = statSync(join(baseDir, 'sessions'))
       expect(sessionsStat.mode & 0o777).toBe(0o700)
+
+      const memoryStat = statSync(join(baseDir, 'memory'))
+      expect(memoryStat.mode & 0o777).toBe(0o700)
+
+      const skillsStat = statSync(join(baseDir, 'skills'))
+      expect(skillsStat.mode & 0o777).toBe(0o700)
     })
   })
 
@@ -80,6 +86,12 @@ describe('enforceBaseDirectoryPermissions', () => {
 
       const sessionsStat = statSync(join(baseDir, 'sessions'))
       expect(sessionsStat.isDirectory()).toBe(true)
+
+      const memoryStat = statSync(join(baseDir, 'memory'))
+      expect(memoryStat.isDirectory()).toBe(true)
+
+      const skillsStat = statSync(join(baseDir, 'skills'))
+      expect(skillsStat.isDirectory()).toBe(true)
     })
   })
 

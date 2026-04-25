@@ -225,6 +225,7 @@ export const workingDirectorySafetyCheck: SafetyCheck = (tool, input, context) =
 }
 
 import { secretContentSafetyCheck } from '../../memory/contentSafety.js'
+import { memorySecretSafetyCheck } from '../../memory/memorySecretCheck.js'
 
 /**
  * All safety checks, in order. Plug into permissionOpts.safetyChecks.
@@ -233,4 +234,5 @@ export const filesystemSafetyChecks: readonly SafetyCheck[] = [
   dangerousPathSafetyCheck,
   workingDirectorySafetyCheck,
   secretContentSafetyCheck,
+  memorySecretSafetyCheck,
 ]

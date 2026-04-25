@@ -44,9 +44,9 @@ async function drain(gen: AsyncIterable<unknown>): Promise<void> {
 
 describe('buildAnthropicSystemField', () => {
   const parts: SystemPromptPart[] = [
-    { content: 'preamble 1', cacheHint: 'static' },
-    { content: 'preamble 2', cacheHint: 'static' },
-    { content: 'preamble 3', cacheHint: 'static' },
+    { content: 'preamble 1', cacheHint: 'global' },
+    { content: 'preamble 2', cacheHint: 'global' },
+    { content: 'preamble 3', cacheHint: 'global' },
     { content: 'current date', cacheHint: 'volatile' },
     { content: 'env info', cacheHint: 'volatile' },
   ]
@@ -62,7 +62,7 @@ describe('buildAnthropicSystemField', () => {
     }
   })
 
-  it('attaches cache_control to exactly one block (the last static part)', () => {
+  it('attaches cache_control to exactly one block (the last global part) when no org parts present', () => {
     const field = buildAnthropicSystemField(parts, 'explicit') as Array<{
       type: string
       text: string
@@ -70,12 +70,79 @@ describe('buildAnthropicSystemField', () => {
     }>
     const withControl = field.filter(b => b.cache_control !== undefined)
     expect(withControl.length).toBe(1)
-    // Last static part is at index 2 ('preamble 3')
+    // Last global part is at index 2 ('preamble 3')
     expect(field[2]!.cache_control).toEqual({ type: 'ephemeral' })
     expect(field[2]!.text).toBe('preamble 3')
     // Volatile parts never carry cache_control
     expect(field[3]!.cache_control).toBeUndefined()
     expect(field[4]!.cache_control).toBeUndefined()
+  })
+
+  it('attaches two cache_control breakpoints (last global + last org) when both present', () => {
+    const mixed: SystemPromptPart[] = [
+      { content: 'preamble 1', cacheHint: 'global' },
+      { content: 'preamble 2', cacheHint: 'global' },
+      { content: 'memory block', cacheHint: 'org' },
+      { content: 'date', cacheHint: 'volatile' },
+      { content: 'env', cacheHint: 'volatile' },
+    ]
+    const field = buildAnthropicSystemField(mixed, 'explicit') as Array<{
+      type: string
+      text: string
+      cache_control?: { type: string }
+    }>
+    const withControl = field.filter(b => b.cache_control !== undefined)
+    expect(withControl.length).toBe(2)
+    // Last global is index 1; last org is index 2.
+    expect(field[1]!.cache_control).toEqual({ type: 'ephemeral' })
+    expect(field[2]!.cache_control).toEqual({ type: 'ephemeral' })
+    expect(field[0]!.cache_control).toBeUndefined()
+    expect(field[3]!.cache_control).toBeUndefined()
+    expect(field[4]!.cache_control).toBeUndefined()
+  })
+
+  it('marks only the last org part when multiple org parts are present', () => {
+    const twoOrg: SystemPromptPart[] = [
+      { content: 'preamble', cacheHint: 'global' },
+      { content: 'memory', cacheHint: 'org' },
+      { content: 'skills', cacheHint: 'org' },
+      { content: 'date', cacheHint: 'volatile' },
+    ]
+    const field = buildAnthropicSystemField(twoOrg, 'explicit') as Array<{
+      cache_control?: { type: string }
+    }>
+    expect(field[0]!.cache_control).toEqual({ type: 'ephemeral' })
+    expect(field[1]!.cache_control).toBeUndefined()
+    expect(field[2]!.cache_control).toEqual({ type: 'ephemeral' })
+    expect(field[3]!.cache_control).toBeUndefined()
+  })
+
+  it('marks org part even when no global parts present (org-only fallback)', () => {
+    const orgOnly: SystemPromptPart[] = [
+      { content: 'memory', cacheHint: 'org' },
+      { content: 'date', cacheHint: 'volatile' },
+    ]
+    const field = buildAnthropicSystemField(orgOnly, 'explicit') as Array<{
+      cache_control?: { type: string }
+    }>
+    expect(field[0]!.cache_control).toEqual({ type: 'ephemeral' })
+    expect(field[1]!.cache_control).toBeUndefined()
+  })
+
+  it('skips empty org parts when selecting the second breakpoint', () => {
+    const emptyOrg: SystemPromptPart[] = [
+      { content: 'preamble', cacheHint: 'global' },
+      { content: 'real memory', cacheHint: 'org' },
+      { content: '', cacheHint: 'org' },
+      { content: 'date', cacheHint: 'volatile' },
+    ]
+    const field = buildAnthropicSystemField(emptyOrg, 'explicit') as Array<{
+      cache_control?: { type: string }
+    }>
+    expect(field[0]!.cache_control).toEqual({ type: 'ephemeral' })
+    expect(field[1]!.cache_control).toEqual({ type: 'ephemeral' })
+    expect(field[2]!.cache_control).toBeUndefined()
+    expect(field[3]!.cache_control).toBeUndefined()
   })
 
   it('returns a joined string for implicit prompt cache models', () => {
@@ -90,7 +157,7 @@ describe('buildAnthropicSystemField', () => {
     expect(field).toBe(parts.map(p => p.content).join('\n\n'))
   })
 
-  it('falls back to joined string when no static part exists', () => {
+  it('falls back to joined string when no global or org part exists', () => {
     const allVolatile: SystemPromptPart[] = [
       { content: 'a', cacheHint: 'volatile' },
       { content: 'b', cacheHint: 'volatile' },
@@ -100,10 +167,10 @@ describe('buildAnthropicSystemField', () => {
     expect(field).toBe('a\n\nb')
   })
 
-  it('skips empty static parts when selecting the cache breakpoint', () => {
+  it('skips empty global parts when selecting the cache breakpoint', () => {
     const withEmptyLast: SystemPromptPart[] = [
-      { content: 'real static', cacheHint: 'static' },
-      { content: '', cacheHint: 'static' },
+      { content: 'real global', cacheHint: 'global' },
+      { content: '', cacheHint: 'global' },
       { content: 'volatile', cacheHint: 'volatile' },
     ]
     const field = buildAnthropicSystemField(withEmptyLast, 'explicit') as Array<{
@@ -138,7 +205,7 @@ describe('anthropicAdapter.createCallModel — thinking + interleaved', () => {
     await drain({
       [Symbol.asyncIterator]: () => callModel(
         [],
-        [{ content: 'preamble', cacheHint: 'static' }],
+        [{ content: 'preamble', cacheHint: 'global' }],
         { thinkingBudget: 4096 },
         new AbortController().signal,
       ),
@@ -160,7 +227,7 @@ describe('anthropicAdapter.createCallModel — thinking + interleaved', () => {
     await drain({
       [Symbol.asyncIterator]: () => callModel(
         [],
-        [{ content: 'preamble', cacheHint: 'static' }],
+        [{ content: 'preamble', cacheHint: 'global' }],
         { thinkingBudget: 4096, interleavedThinking: true },
         new AbortController().signal,
       ),
@@ -181,7 +248,7 @@ describe('anthropicAdapter.createCallModel — thinking + interleaved', () => {
     const run = () => drain({
       [Symbol.asyncIterator]: () => callModel(
         [],
-        [{ content: 'preamble', cacheHint: 'static' }],
+        [{ content: 'preamble', cacheHint: 'global' }],
         { thinkingBudget: 4096, interleavedThinking: true },
         new AbortController().signal,
       ),
@@ -208,7 +275,7 @@ describe('anthropicAdapter.createCallModel — thinking + interleaved', () => {
     await drain({
       [Symbol.asyncIterator]: () => callModel(
         [],
-        [{ content: 'preamble', cacheHint: 'static' }],
+        [{ content: 'preamble', cacheHint: 'global' }],
         {},
         new AbortController().signal,
       ),

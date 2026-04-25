@@ -42,6 +42,9 @@ export type ToolErrorKind =
   | 'permission_ask'
   | 'execution_error'
   | 'aborted'
+  | 'hook_blocked'
+
+export type ToolSource = 'builtin' | 'mcp' | 'custom'
 
 // ---------------------------------------------------------------------------
 // Tool interface
@@ -83,6 +86,22 @@ export interface Tool {
    * Not all tools have a meaningful path (e.g., Bash).
    */
   getPath?(input: Record<string, unknown>): string
+
+  /**
+   * Best-effort host this tool operates against, for domain-scoped permission
+   * rules. Parallel to getPath. Returns undefined when the input doesn't
+   * carry a URL (or the URL is malformed). Pure / declarative — no I/O.
+   */
+  getDomain?(input: Record<string, unknown>): string | undefined
+
+  /**
+   * Where this tool came from. Undefined is treated as 'builtin' on read so
+   * literal-object tools (e.g., AgentTool) don't need to declare it.
+   */
+  readonly source?: ToolSource
+
+  /** For MCP tools, the server name this tool came from. */
+  readonly namespace?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +118,9 @@ export type ToolSpec = {
   isMutating?: boolean
   isConcurrencySafe?: Tool['isConcurrencySafe']
   getPath?: Tool['getPath']
+  getDomain?: Tool['getDomain']
+  source?: ToolSource
+  namespace?: string
 }
 
 export function buildTool(spec: ToolSpec): Tool {
@@ -111,9 +133,13 @@ export function buildTool(spec: ToolSpec): Tool {
     checkPermissions: spec.checkPermissions ?? (async () => ({ behavior: 'allow' as const })),
     call: spec.call,
 
+    source: spec.source ?? 'builtin',
+
     ...(spec.isMutating !== undefined && { isMutating: spec.isMutating }),
     ...(spec.isConcurrencySafe && { isConcurrencySafe: spec.isConcurrencySafe }),
     ...(spec.getPath && { getPath: spec.getPath }),
+    ...(spec.getDomain && { getDomain: spec.getDomain }),
+    ...(spec.namespace !== undefined && { namespace: spec.namespace }),
   }
   return tool
 }

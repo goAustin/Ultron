@@ -33,6 +33,7 @@ import {
   ESCALATED_MAX_OUTPUT_TOKENS,
 } from './queryTypes.js'
 import { normalizeMessages } from './normalizeMessages.js'
+import { streamToolUse } from './tools/streamToolUse.js'
 import { toApiMessages, StreamAccumulator } from './providers/anthropicAdapter.js'
 import { estimateTokens } from '../context/tokenEstimator.js'
 import { shouldCompact } from '../context/tokenBudget.js'
@@ -238,6 +239,10 @@ export async function* query(
     // 9. Execute tools
     // -----------------------------------------------------------------------
     const toolResults: Message[] = []
+    // Parallel to toolResults: the tool_use that actually reached tool.call,
+    // reflecting any PreToolUse hook input mutation. Load-bearing for the
+    // attachment stage below, which zips tool_use × result pairs.
+    const effectiveToolUses: ToolUseBlock[] = []
 
     for (const toolUse of toolUseBlocks) {
       if (signal.aborted) break
@@ -268,20 +273,50 @@ export async function* query(
           deps.uuid(),
         )
         toolResults.push(resultMessage)
+        effectiveToolUses.push(toolUse)
         yield { type: 'tool_result', message: resultMessage }
         continue
       }
 
-      // Phase 2 — execute (tool.call only)
+      // Phase 1.5 — PreToolUse hooks (2b)
+      const preOutcome = yield* deps.runPreToolUseHooks(toolUse, signal)
+
+      if (preOutcome.kind === 'block') {
+        const resultMessage = createToolResultMessage(
+          toolUse,
+          preOutcome.syntheticResult,
+          deps.uuid(),
+        )
+        toolResults.push(resultMessage)
+        effectiveToolUses.push(toolUse)
+        yield { type: 'tool_result', message: resultMessage }
+        continue
+      }
+
+      const effectiveToolUse: ToolUseBlock =
+        preOutcome.updatedInput !== undefined
+          ? { ...toolUse, input: preOutcome.updatedInput }
+          : toolUse
+
+      // Phase 2 — execute. executeToolUse re-validates input (2b contract);
+      // permissions are NOT re-checked after hook mutation.
+      // streamToolUse (Phase 3d) bridges any tool-emitted progress callbacks
+      // into tool_progress QueryEvents; the awaited ToolResult is returned
+      // unchanged, so message-history insertion below is unaffected.
       const started = Date.now()
-      yield makeToolCallStartedEvent(toolUse)
-      const result = await deps.executeToolUse(toolUse, signal)
+      yield makeToolCallStartedEvent(effectiveToolUse)
+      let result = yield* streamToolUse(effectiveToolUse, signal, deps.executeToolUse)
       const durationMs = Date.now() - started
 
-      yield makeToolCallFinishedEvent(toolUse, result, durationMs)
+      // Phase 2.5 — PostToolUse hooks (2b). Only content mutation; cannot block.
+      const postOutcome = yield* deps.runPostToolUseHooks(effectiveToolUse, result, signal)
+      result = postOutcome.result
 
-      const resultMessage = createToolResultMessage(toolUse, result, deps.uuid())
+      yield makeToolCallFinishedEvent(effectiveToolUse, result, durationMs)
+
+      const resultMessage = createToolResultMessage(effectiveToolUse, result, deps.uuid())
       toolResults.push(resultMessage)
+      effectiveToolUses.push(effectiveToolUse)
       yield { type: 'tool_result', message: resultMessage }
     }
 
@@ -315,7 +350,10 @@ export async function* query(
     // 10.5. Inject attachments
     // -----------------------------------------------------------------------
     if (deps.getAttachments) {
-      const executions: ToolExecution[] = toolUseBlocks.map((toolUse, i) => ({
+      // Zip on effectiveToolUses (post-PreToolUse-hook-mutation) so the
+      // attachment stage sees what the tool *actually* executed, not what the
+      // model originally proposed. Indexed identically to toolResults.
+      const executions: ToolExecution[] = effectiveToolUses.map((toolUse, i) => ({
         toolUse,
         result: extractToolResult(toolResults[i]!),
       }))

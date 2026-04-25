@@ -1,22 +1,26 @@
 /**
- * Single tool execution pipeline — split for Phase 2a.
+ * Single tool execution pipeline — split for Phase 2a, contract widened in 2b.
  *
  * `authorizeToolUse` runs resolve → validate → permissions (engine) → askUser
  * and returns either `{outcome: 'authorized', decision}` or
  * `{outcome: 'denied', decision, syntheticResult}`. It never runs `tool.call`.
  *
- * `executeToolUse` runs only `tool.call` (plus error wrapping). The caller is
- * responsible for authorizing first.
+ * `executeToolUse` runs tool.call after an input re-validation pass. The
+ * re-validation is a deliberate 2b change to the original "call only" contract:
+ * PreToolUse hooks can mutate tool_input between authorization and execution,
+ * and un-validated mutated input would surprise tool implementations in hard-
+ * to-debug ways. Validation is cheap and idempotent for unchanged input.
+ * Permissions are NOT re-checked — the caller still owns authorization.
  *
- * `runToolUse` is kept as a compatibility wrapper: authorize → execute, with the
- * same external semantics as before 2a (returns a single `ToolResult`).
+ * `runToolUse` is kept as a compatibility wrapper: authorize → execute, with
+ * the same external semantics as before 2a (returns a single `ToolResult`).
  *
  * No exceptions escape any of these — every path returns a typed value.
  */
 
 import type { ToolUseBlock } from '../messages.js'
-import type { ToolResult } from './types.js'
-import type { ToolUseContext } from './context.js'
+import type { Tool, ToolResult } from './types.js'
+import type { ToolUseContext, ToolProgressInput } from './context.js'
 import type {
   PermissionOptions,
   PermissionRule,
@@ -30,6 +34,7 @@ import {
   hasPermissionsToUseTool,
   formatDecisionMessage,
 } from '../permissions/permissions.js'
+import { isValidDomainPattern } from '../../web/domainPolicy.js'
 import { makeErrorResult, makeAbortResult, checkAbort } from './toolExecution.js'
 
 // ---------------------------------------------------------------------------
@@ -99,12 +104,7 @@ export async function authorizeToolUse(
 
     const ruleCreated: PermissionRule | undefined =
       response === 'allow_by_rule'
-        ? {
-            toolName: toolUse.name,
-            behavior: 'allow',
-            ...(tool.getPath?.(toolUse.input) && { path: tool.getPath(toolUse.input) }),
-            source: 'session',
-          }
+        ? buildAllowByRule(toolUse.name, tool, toolUse.input)
         : undefined
 
     const payload: AuthorizeDecisionPayload = {
@@ -143,13 +143,52 @@ export async function authorizeToolUse(
 }
 
 // ---------------------------------------------------------------------------
-// executeToolUse — tool.call only (no permission check, no validation)
+// buildAllowByRule — construct a session-scoped allow rule for `allow_by_rule`
+//
+// Defensive escape: when a tool advertises domain scope (`getDomain` defined)
+// but the resolution returns nothing or fails the pattern check, refuse to
+// construct an over-broad tool-name-only rule. Returning undefined here means
+// the user's `allow_by_rule` answer is recorded but no rule lands in AppState
+// — semantically equivalent to `allow_once` for that turn, with the user
+// response preserved on the audit envelope.
+// ---------------------------------------------------------------------------
+
+function buildAllowByRule(
+  toolName: string,
+  tool: Tool,
+  input: Record<string, unknown>,
+): PermissionRule | undefined {
+  const path = tool.getPath?.(input)
+  const rawDomain = tool.getDomain?.(input)
+  const domain = rawDomain !== undefined && isValidDomainPattern(rawDomain)
+    ? rawDomain
+    : undefined
+
+  // Domain-bearing tool with no usable scope: refuse to construct an
+  // over-broad rule. (If the tool also exposes a path that resolved, fall
+  // through to a path-scoped rule — that's still a narrow scope.)
+  if (tool.getDomain !== undefined && domain === undefined && path === undefined) {
+    return undefined
+  }
+
+  return {
+    toolName,
+    behavior: 'allow',
+    ...(path !== undefined && { path }),
+    ...(domain !== undefined && { domain }),
+    source: 'session',
+  }
+}
+
+// ---------------------------------------------------------------------------
+// executeToolUse — re-validate input, then tool.call
 // ---------------------------------------------------------------------------
 
 export async function executeToolUse(
   toolUse: ToolUseBlock,
   context: ToolUseContext,
   signal: AbortSignal,
+  onProgress?: (progress: ToolProgressInput) => void,
 ): Promise<ToolResult> {
   // Abort check immediately before dispatch — prevents racing into execution after cancel.
   const aborted = checkAbort(signal)
@@ -160,8 +199,30 @@ export async function executeToolUse(
     return makeErrorResult('tool_not_found', `Tool "${toolUse.name}" not found`)
   }
 
+  // Phase 3d: per-call context that carries the progress sink (if any). The
+  // shared context stays immutable; concurrent tool calls in a future
+  // parallel-execution model wouldn't race on this field.
+  const callContext: ToolUseContext = onProgress
+    ? { ...context, onProgress }
+    : context
+
+  // Phase 2b: re-validate before tool.call. Protects tool implementations
+  // from PreToolUse-hook-mutated input that no longer matches the schema.
+  // Cheap; idempotent on unchanged input.
   try {
-    return await tool.call(toolUse.input, context, signal)
+    const validation = await tool.validateInput(toolUse.input, callContext)
+    if (!validation.valid) {
+      return makeErrorResult('validation_failed', validation.message)
+    }
+  } catch (err) {
+    return makeErrorResult(
+      'validation_failed',
+      err instanceof Error ? err.message : String(err),
+    )
+  }
+
+  try {
+    return await tool.call(toolUse.input, callContext, signal)
   } catch (err) {
     return makeErrorResult(
       'execution_error',

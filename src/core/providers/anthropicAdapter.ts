@@ -106,9 +106,19 @@ export function toApiMessages(messages: readonly Message[]): MessageParam[] {
  * Translate `SystemPromptPart[]` into Anthropic's `system` field.
  *
  * Models with `promptCacheModel === 'explicit'` receive a `TextBlockParam[]`
- * with `cache_control: {type: 'ephemeral'}` attached to the last non-empty
- * `'static'` part — that marks the cache breakpoint. All other models get a
- * single joined string (byte-identical to pre-1b behavior).
+ * with up to two `cache_control: {type: 'ephemeral'}` breakpoints:
+ *
+ *   Pass 1 — last non-empty `'global'` part (Ultron preamble boundary).
+ *   Pass 2 — last non-empty `'org'` part (memory / skills boundary).
+ *
+ * The two scans are independent and can't collide (`'global'` and `'org'`
+ * are disjoint on the type). The split lets memory mutations invalidate
+ * only the org-segment cache while leaving the preamble cache intact.
+ *
+ * If neither pass marks a part (all-volatile or empty input), fall back to
+ * a single joined string — byte-identical to non-explicit behavior.
+ *
+ * Anthropic allows up to 4 `cache_control` breakpoints; we use 2.
  */
 export function buildAnthropicSystemField(
   parts: readonly SystemPromptPart[],
@@ -123,19 +133,32 @@ export function buildAnthropicSystemField(
     text: p.content,
   }))
 
+  let marked = false
+
+  // Pass 1 — last non-empty 'global' part gets a cache breakpoint.
   for (let i = parts.length - 1; i >= 0; i--) {
     const part = parts[i]!
-    if (part.cacheHint === 'static' && part.content.length > 0) {
-      blocks[i] = {
-        ...blocks[i]!,
-        cache_control: { type: 'ephemeral' },
-      }
-      return blocks
+    if (part.cacheHint === 'global' && part.content.length > 0) {
+      blocks[i] = { ...blocks[i]!, cache_control: { type: 'ephemeral' } }
+      marked = true
+      break
     }
   }
 
-  // No static part found — fall back to joined string (same as non-explicit).
-  return parts.map(p => p.content).join('\n\n')
+  // Pass 2 — last non-empty 'org' part gets a second cache breakpoint.
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const part = parts[i]!
+    if (part.cacheHint === 'org' && part.content.length > 0) {
+      blocks[i] = { ...blocks[i]!, cache_control: { type: 'ephemeral' } }
+      marked = true
+      break
+    }
+  }
+
+  // No breakpoint candidate — fall back to joined string (same as non-explicit).
+  if (!marked) return parts.map(p => p.content).join('\n\n')
+
+  return blocks
 }
 
 // ---------------------------------------------------------------------------

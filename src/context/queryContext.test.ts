@@ -44,22 +44,22 @@ describe('buildFullSystemPromptParts', () => {
     })
   })
 
-  it('contains at least one static part with non-empty content', async () => {
+  it('contains at least one global part with non-empty content', async () => {
     await withTmpDir(async (dir) => {
       const parts = await buildFullSystemPromptParts(dir)
-      const staticParts = parts.filter(p => p.cacheHint === 'static' && p.content.length > 0)
-      expect(staticParts.length).toBeGreaterThan(0)
+      const globalParts = parts.filter(p => p.cacheHint === 'global' && p.content.length > 0)
+      expect(globalParts.length).toBeGreaterThan(0)
     })
   })
 
-  it('static parts precede all volatile parts (static-then-volatile invariant)', async () => {
+  it('global parts precede all volatile parts (global-then-volatile invariant)', async () => {
     await withTmpDir(async (dir) => {
       const parts = await buildFullSystemPromptParts(dir)
       let seenVolatile = false
       for (const p of parts) {
         if (p.cacheHint === 'volatile') seenVolatile = true
-        if (seenVolatile && p.cacheHint === 'static') {
-          throw new Error('Static part appeared after volatile part')
+        if (seenVolatile && p.cacheHint === 'global') {
+          throw new Error('Global part appeared after volatile part')
         }
       }
     })

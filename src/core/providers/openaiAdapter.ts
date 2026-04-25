@@ -14,6 +14,12 @@ import type {
   ChatCompletionTool,
   ChatCompletionChunk,
 } from 'openai/resources/chat/completions.js'
+import type {
+  ResponseCreateParamsStreaming,
+  ResponseInput,
+  ResponseStreamEvent,
+  Tool as ResponseTool,
+} from 'openai/resources/responses/responses.js'
 
 import type {
   CallModelFn,
@@ -130,6 +136,59 @@ function anthropicToOpenAI(
   return result
 }
 
+function anthropicToResponsesInput(messages: unknown[]): ResponseInput {
+  const result: ResponseInput = []
+
+  for (const raw of messages) {
+    const msg = raw as AnthropicMessage
+
+    if (msg.role === 'user') {
+      const textParts: string[] = []
+
+      for (const block of msg.content) {
+        if (block.type === 'text') {
+          textParts.push(block.text)
+        } else if (block.type === 'tool_result') {
+          result.push({
+            type: 'function_call_output',
+            call_id: block.tool_use_id,
+            output: block.content ?? '',
+          })
+        }
+      }
+
+      if (textParts.length > 0) {
+        result.push({ role: 'user', content: textParts.join('\n') })
+      }
+    } else if (msg.role === 'assistant') {
+      let textContent = ''
+
+      for (const block of msg.content) {
+        if (block.type === 'text') {
+          textContent += block.text
+        }
+      }
+
+      if (textContent) {
+        result.push({ role: 'assistant', content: textContent })
+      }
+
+      for (const block of msg.content) {
+        if (block.type === 'tool_use') {
+          result.push({
+            type: 'function_call',
+            call_id: block.id,
+            name: block.name,
+            arguments: JSON.stringify(block.input ?? {}),
+          })
+        }
+      }
+    }
+  }
+
+  return result
+}
+
 // ---------------------------------------------------------------------------
 // Tool definition conversion
 // ---------------------------------------------------------------------------
@@ -145,6 +204,16 @@ function toOpenAITools(tools: readonly ApiToolDefinition[]): ChatCompletionTool[
   }))
 }
 
+function toResponsesTools(tools: readonly ApiToolDefinition[]): ResponseTool[] {
+  return tools.map(t => ({
+    type: 'function',
+    name: t.name,
+    description: t.description,
+    parameters: t.input_schema as Record<string, unknown>,
+    strict: null,
+  }))
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI stream → RawStreamEvent conversion
 // ---------------------------------------------------------------------------
@@ -156,6 +225,24 @@ type StreamState = {
   stopReason: string | null
   inputTokens: number | undefined
   outputTokens: number | undefined
+}
+
+type ResponsesStreamState = {
+  blockIndex: number
+  textBlockStarted: boolean
+  functionCallBlockIndex: Map<number, number>
+  closedFunctionCallBlocks: Set<number>
+  stopReason: string | null
+  inputTokens: number | undefined
+  outputTokens: number | undefined
+}
+
+function closeResponsesTextBlock(state: ResponsesStreamState): RawStreamEvent | null {
+  if (!state.textBlockStarted) return null
+  const event: RawStreamEvent = { type: 'content_block_stop', index: state.blockIndex }
+  state.blockIndex++
+  state.textBlockStarted = false
+  return event
 }
 
 function* convertChunkToEvents(
@@ -244,6 +331,123 @@ function* convertChunkToEvents(
   }
 }
 
+function* convertResponseEventToEvents(
+  event: ResponseStreamEvent,
+  state: ResponsesStreamState,
+): Generator<RawStreamEvent> {
+  switch (event.type) {
+    case 'response.output_text.delta': {
+      if (!state.textBlockStarted) {
+        yield {
+          type: 'content_block_start',
+          index: state.blockIndex,
+          content_block: { type: 'text', text: '' },
+        }
+        state.textBlockStarted = true
+      }
+      yield {
+        type: 'content_block_delta',
+        index: state.blockIndex,
+        delta: { type: 'text_delta', text: event.delta },
+      }
+      return
+    }
+
+    case 'response.content_part.done': {
+      if (event.part.type === 'output_text') {
+        const stop = closeResponsesTextBlock(state)
+        if (stop) yield stop
+      }
+      return
+    }
+
+    case 'response.output_item.added': {
+      if (event.item.type !== 'function_call') return
+
+      const stop = closeResponsesTextBlock(state)
+      if (stop) yield stop
+
+      state.functionCallBlockIndex.set(event.output_index, state.blockIndex)
+      yield {
+        type: 'content_block_start',
+        index: state.blockIndex,
+        content_block: {
+          type: 'tool_use',
+          id: event.item.call_id,
+          name: event.item.name,
+          input: '',
+        },
+      }
+
+      if (event.item.arguments) {
+        yield {
+          type: 'content_block_delta',
+          index: state.blockIndex,
+          delta: { type: 'input_json_delta', partial_json: event.item.arguments },
+        }
+      }
+
+      state.blockIndex++
+      return
+    }
+
+    case 'response.function_call_arguments.delta': {
+      const blockIdx = state.functionCallBlockIndex.get(event.output_index)
+      if (blockIdx === undefined) return
+      yield {
+        type: 'content_block_delta',
+        index: blockIdx,
+        delta: { type: 'input_json_delta', partial_json: event.delta },
+      }
+      return
+    }
+
+    case 'response.output_item.done': {
+      if (event.item.type !== 'function_call') return
+      const blockIdx = state.functionCallBlockIndex.get(event.output_index)
+      if (blockIdx === undefined || state.closedFunctionCallBlocks.has(blockIdx)) return
+      state.closedFunctionCallBlocks.add(blockIdx)
+      yield { type: 'content_block_stop', index: blockIdx }
+      return
+    }
+
+    case 'response.completed': {
+      state.inputTokens = event.response.usage?.input_tokens
+      state.outputTokens = event.response.usage?.output_tokens
+      const stop = closeResponsesTextBlock(state)
+      if (stop) yield stop
+
+      for (const [, blockIdx] of state.functionCallBlockIndex) {
+        if (state.closedFunctionCallBlocks.has(blockIdx)) continue
+        state.closedFunctionCallBlocks.add(blockIdx)
+        yield { type: 'content_block_stop', index: blockIdx }
+      }
+
+      state.stopReason = event.response.output.some(item => item.type === 'function_call')
+        ? 'tool_use'
+        : 'end_turn'
+      return
+    }
+
+    case 'response.incomplete': {
+      state.inputTokens = event.response.usage?.input_tokens
+      state.outputTokens = event.response.usage?.output_tokens
+      state.stopReason = event.response.incomplete_details?.reason === 'max_output_tokens'
+        ? 'max_tokens'
+        : 'end_turn'
+      return
+    }
+
+    case 'response.failed': {
+      const message = event.response.error?.message ?? 'OpenAI Responses request failed'
+      throw new Error(message)
+    }
+
+    case 'error':
+      throw new Error(event.message)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI-compatible callModel factory (shared across OpenAI + any compatible
 // endpoint — Minimax, OpenRouter, Together, etc.)
@@ -262,6 +466,8 @@ export function createOpenAICompatibleCallModel(opts: CreateCallModelOptions): C
   })
 
   const openaiTools = tools?.length ? toOpenAITools(tools) : undefined
+  const responsesTools = tools?.length ? toResponsesTools(tools) : undefined
+  const useResponsesApi = baseUrl === undefined
 
   return async function* callModel(
     messages: unknown[],
@@ -269,8 +475,6 @@ export function createOpenAICompatibleCallModel(opts: CreateCallModelOptions): C
     callOpts: CallModelOptions,
     signal: AbortSignal,
   ): AsyncGenerator<RawStreamEvent, ApiResponseMeta> {
-    const openaiMessages = anthropicToOpenAI(messages, systemPromptParts)
-
     // Capability-gated thinking → reasoning_effort translation.
     let reasoningEffort: 'low' | 'medium' | 'high' | undefined
     if (callOpts.thinkingBudget && callOpts.thinkingBudget > 0) {
@@ -293,6 +497,59 @@ export function createOpenAICompatibleCallModel(opts: CreateCallModelOptions): C
       )
     }
 
+    if (useResponsesApi) {
+      const request: ResponseCreateParamsStreaming = {
+        model,
+        max_output_tokens: callOpts.maxOutputTokens ?? 4096,
+        instructions: joinSystemPromptParts(systemPromptParts) || null,
+        input: anthropicToResponsesInput(messages),
+        ...(responsesTools && { tools: responsesTools }),
+        ...(reasoningEffort && { reasoning: { effort: reasoningEffort } }),
+        store: false,
+        stream: true,
+        stream_options: { include_obfuscation: false },
+      }
+
+      const stream = await client.responses.create(request, { signal })
+
+      const state: ResponsesStreamState = {
+        blockIndex: 0,
+        textBlockStarted: false,
+        functionCallBlockIndex: new Map(),
+        closedFunctionCallBlocks: new Set(),
+        stopReason: null,
+        inputTokens: undefined,
+        outputTokens: undefined,
+      }
+
+      yield {
+        type: 'message_start',
+        message: { usage: undefined },
+      } as RawStreamEvent
+
+      for await (const event of stream) {
+        for (const rawEvent of convertResponseEventToEvents(event, state)) {
+          yield rawEvent
+        }
+      }
+
+      yield {
+        type: 'message_delta',
+        delta: { stop_reason: state.stopReason ?? 'end_turn' },
+        usage: state.outputTokens !== undefined ? { output_tokens: state.outputTokens } : undefined,
+      } as RawStreamEvent
+
+      yield { type: 'message_stop' } as RawStreamEvent
+
+      return {
+        stopReason: state.stopReason ?? 'end_turn',
+        model,
+        inputTokens: state.inputTokens,
+        outputTokens: state.outputTokens,
+      }
+    }
+
+    const openaiMessages = anthropicToOpenAI(messages, systemPromptParts)
     const stream = await client.chat.completions.create({
       model,
       max_completion_tokens: callOpts.maxOutputTokens ?? 4096,

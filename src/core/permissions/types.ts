@@ -21,6 +21,7 @@ export type PermissionRule = {
   toolName: string
   behavior: PermissionRuleBehavior
   path?: string                   // exact match, not a glob
+  domain?: string                 // exact host or `*.suffix` (Phase 6a)
   source: PermissionRuleSource
 }
 
@@ -35,6 +36,7 @@ export type PermissionDecisionReason =
   | { type: 'toolCheck'; message: string }
   | { type: 'toolCheck' }
   | { type: 'headlessEscalation'; original: PermissionDecisionReason }
+  | { type: 'skillScope'; toolName: string; allowed: readonly string[] }
   | { type: 'fallback' }
 
 export type PermissionDecision = {
@@ -80,6 +82,14 @@ export type PermissionOptions = {
   headless: boolean
   safetyChecks: SafetyCheck[]
   askUser?: AskUserFn
+  /**
+   * Phase 5b: when present, the cascade denies any tool not in the list.
+   * Runs AFTER explicit deny rules (user explicit deny still wins) and
+   * BEFORE explicit ask / mode resolution (skill scope wins over
+   * `bypassPermissions`). Skill activation populates this for the duration
+   * of the activation window.
+   */
+  scopedToolAllowlist?: readonly string[]
 }
 
 export const DEFAULT_PERMISSION_OPTIONS: PermissionOptions = {

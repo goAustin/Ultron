@@ -61,6 +61,6 @@ export function createAuthorizeToolUseFn(
 }
 
 export function createExecuteToolUseFn(context: ToolUseContext): ExecuteToolUseFn {
-  return async (toolUse: ToolUseBlock, signal: AbortSignal) =>
-    executeToolUse(toolUse, context, signal)
+  return async (toolUse, signal, onProgress) =>
+    executeToolUse(toolUse, context, signal, onProgress)
 }

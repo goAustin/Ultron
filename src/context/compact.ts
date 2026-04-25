@@ -199,7 +199,7 @@ const SUMMARIZATION_SYSTEM_PROMPT = `You are a conversation summarizer. Summariz
 The summary will replace the original messages in the conversation history, so the model reading it must have enough context to continue the work. Write in past tense. Do not include pleasantries or filler.`
 
 const SUMMARIZATION_PARTS: readonly SystemPromptPart[] = [
-  { content: SUMMARIZATION_SYSTEM_PROMPT, cacheHint: 'static' },
+  { content: SUMMARIZATION_SYSTEM_PROMPT, cacheHint: 'global' },
 ]
 
 /** Call the model with the summarization prompt and collect the full response. */

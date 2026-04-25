@@ -10,6 +10,9 @@ import { FileEditTool } from '../../tools/FileEditTool.js'
 import { GlobTool } from '../../tools/GlobTool.js'
 import { GrepTool } from '../../tools/GrepTool.js'
 import { BashTool } from '../../tools/BashTool.js'
+import { WebFetchTool } from '../../tools/WebFetchTool.js'
+import { WebSearchTool } from '../../tools/WebSearchTool.js'
+import { CodeSandboxTool } from '../../tools/CodeSandboxTool.js'
 import { AgentTool } from '../../agents/agentTool.js'
 
 // ---------------------------------------------------------------------------
@@ -18,15 +21,19 @@ import { AgentTool } from '../../agents/agentTool.js'
 
 export interface ToolRegistry {
   register(tool: Tool): void
+  unregister(name: string): boolean
   get(name: string): Tool | undefined
   has(name: string): boolean
   getAll(): readonly Tool[]
+  getByNamespace(namespace: string | undefined): readonly Tool[]
   readonly size: number
 }
 
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
+
+export const MCP_TOOL_PREFIX = 'mcp__'
 
 export function createToolRegistry(): ToolRegistry {
   const tools = new Map<string, Tool>()
@@ -36,7 +43,17 @@ export function createToolRegistry(): ToolRegistry {
       if (tools.has(tool.name)) {
         throw new Error(`Tool "${tool.name}" is already registered`)
       }
+      const source = tool.source ?? 'builtin'
+      if (tool.name.startsWith(MCP_TOOL_PREFIX) && source !== 'mcp') {
+        throw new Error(
+          `Tool "${tool.name}" uses reserved prefix "${MCP_TOOL_PREFIX}" but source is "${source}"`,
+        )
+      }
       tools.set(tool.name, tool)
+    },
+
+    unregister(name: string): boolean {
+      return tools.delete(name)
     },
 
     get(name: string): Tool | undefined {
@@ -49,6 +66,14 @@ export function createToolRegistry(): ToolRegistry {
 
     getAll(): readonly Tool[] {
       return Object.freeze([...tools.values()])
+    },
+
+    getByNamespace(namespace: string | undefined): readonly Tool[] {
+      const out: Tool[] = []
+      for (const tool of tools.values()) {
+        if (tool.namespace === namespace) out.push(tool)
+      }
+      return Object.freeze(out)
     },
 
     get size(): number {
@@ -87,6 +112,9 @@ export function createDefaultRegistry(): ToolRegistry {
   registry.register(GlobTool)
   registry.register(GrepTool)
   registry.register(BashTool)
+  registry.register(WebFetchTool)
+  registry.register(WebSearchTool)
+  registry.register(CodeSandboxTool)
   registry.register(AgentTool)
   return registry
 }

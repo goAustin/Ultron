@@ -6,6 +6,9 @@ import { tmpdir } from 'os'
 import { buildSystemPromptParts } from './cacheHints.js'
 import { clearSystemContextCache } from './systemContext.js'
 import { clearUserContextCache } from './userContext.js'
+import { createAuditWriter } from '../audit/auditLog.js'
+import { writeEntry } from '../memory/store.js'
+import type { MemoryEntry } from '../memory/entry.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -33,11 +36,11 @@ describe('buildSystemPromptParts', () => {
     })
   })
 
-  it('emits at least one static part with non-empty content', async () => {
+  it('emits at least one global part with non-empty content', async () => {
     await withTmpDir(async (dir) => {
       const parts = await buildSystemPromptParts(dir)
-      const staticParts = parts.filter(p => p.cacheHint === 'static' && p.content.length > 0)
-      expect(staticParts.length).toBeGreaterThan(0)
+      const globalParts = parts.filter(p => p.cacheHint === 'global' && p.content.length > 0)
+      expect(globalParts.length).toBeGreaterThan(0)
     })
   })
 
@@ -50,14 +53,14 @@ describe('buildSystemPromptParts', () => {
     })
   })
 
-  it('all static parts come before all volatile parts', async () => {
+  it('all global parts come before all volatile parts', async () => {
     await withTmpDir(async (dir) => {
       const parts = await buildSystemPromptParts(dir)
       let seenVolatile = false
       for (const p of parts) {
         if (p.cacheHint === 'volatile') seenVolatile = true
         if (seenVolatile) {
-          expect(p.cacheHint).not.toBe('static')
+          expect(p.cacheHint).not.toBe('global')
         }
       }
     })
@@ -81,13 +84,69 @@ describe('buildSystemPromptParts', () => {
     })
   })
 
-  it('produces stable static parts across two calls for the same cwd', async () => {
+  it('produces stable global parts across two calls for the same cwd', async () => {
     await withTmpDir(async (dir) => {
       const a = await buildSystemPromptParts(dir)
       const b = await buildSystemPromptParts(dir)
-      const staticA = a.filter(p => p.cacheHint === 'static').map(p => p.content)
-      const staticB = b.filter(p => p.cacheHint === 'static').map(p => p.content)
-      expect(staticA).toEqual(staticB)
+      const globalA = a.filter(p => p.cacheHint === 'global').map(p => p.content)
+      const globalB = b.filter(p => p.cacheHint === 'global').map(p => p.content)
+      expect(globalA).toEqual(globalB)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Phase 4d — memory injection
+  // -------------------------------------------------------------------------
+
+  it('emits no org parts when memoryBaseDir is omitted', async () => {
+    await withTmpDir(async (dir) => {
+      const parts = await buildSystemPromptParts(dir)
+      const orgParts = parts.filter(p => p.cacheHint === 'org')
+      expect(orgParts.length).toBe(0)
+    })
+  })
+
+  it('emits no org parts when memoryBaseDir points at an empty store', async () => {
+    await withTmpDir(async (dir) => {
+      await withTmpDir(async (memBase) => {
+        const parts = await buildSystemPromptParts(dir, { memoryBaseDir: memBase })
+        const orgParts = parts.filter(p => p.cacheHint === 'org')
+        expect(orgParts.length).toBe(0)
+      })
+    })
+  })
+
+  it('emits exactly one org part between global and volatile when memory has entries', async () => {
+    await withTmpDir(async (dir) => {
+      await withTmpDir(async (memBase) => {
+        await withTmpDir(async (auditDir) => {
+          const writer = createAuditWriter({ dir: auditDir })
+          const entry: MemoryEntry = {
+            schemaVersion: 1,
+            id: 'pref',
+            type: 'user',
+            name: 'Tabs preference',
+            description: 'prefers tabs',
+            content: 'user prefers tabs over spaces',
+            createdAt: 1_700_000_000_000,
+            updatedAt: 1_700_000_000_000,
+          }
+          await writeEntry(memBase, entry, writer)
+          await writer.close()
+
+          const parts = await buildSystemPromptParts(dir, { memoryBaseDir: memBase })
+          const orgParts = parts.filter(p => p.cacheHint === 'org')
+          expect(orgParts.length).toBe(1)
+          expect(orgParts[0]!.content).toContain('Tabs preference')
+
+          // Ordering: every global precedes the org, which precedes every volatile.
+          const idxOfFirstOrg = parts.findIndex(p => p.cacheHint === 'org')
+          const idxOfLastGlobal = parts.map(p => p.cacheHint).lastIndexOf('global')
+          const idxOfFirstVol = parts.findIndex(p => p.cacheHint === 'volatile')
+          expect(idxOfLastGlobal).toBeLessThan(idxOfFirstOrg)
+          expect(idxOfFirstOrg).toBeLessThan(idxOfFirstVol)
+        })
+      })
     })
   })
 })

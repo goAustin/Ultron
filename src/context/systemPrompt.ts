@@ -1,11 +1,13 @@
 /**
  * Static system prompt for Ultron.
  *
- * Returns an array of static section strings. Callers (see `./cacheHints.ts`)
- * wrap each section into a `SystemPromptPart` with `cacheHint: 'static'` and
- * append volatile parts (date, env info) afterward. The static → volatile
- * transition in the parts list is the structural cut point that earlier
- * versions encoded as a magic boundary string.
+ * Returns an array of section strings. Callers (see `./cacheHints.ts`)
+ * wrap each section into a `SystemPromptPart` with `cacheHint: 'global'`
+ * (the preamble is byte-identical across all Ultron installs) and
+ * append `'org'` (memory) and `'volatile'` (date, env) parts afterward.
+ * The global → org → volatile transition in the parts list is the
+ * structural cut point that earlier versions encoded as a magic
+ * boundary string.
  */
 
 // ---------------------------------------------------------------------------
@@ -111,9 +113,9 @@ If you can say it in one sentence, don't use three.`
 // ---------------------------------------------------------------------------
 
 /**
- * Returns the static system prompt as an array of section strings.
+ * Returns the system prompt as an array of section strings.
  * Each section is intended to become one `SystemPromptPart` with
- * `cacheHint: 'static'` (see `./cacheHints.ts`).
+ * `cacheHint: 'global'` (see `./cacheHints.ts`).
  */
 export function buildSystemPrompt(): string[] {
   return [

@@ -1,6 +1,6 @@
 /**
- * Local memory guard — transcript size checking and base directory
- * permission enforcement for ~/.ultron/.
+ * Local guard for ~/.ultron/ — transcript size checking and base directory
+ * permission enforcement for sessions, memory, and skills.
  */
 
 import { statSync } from 'node:fs'
@@ -41,13 +41,18 @@ export function checkTranscriptSize(
 
 /**
  * Enforce owner-only permissions (0o700) on the base Ultron directories.
- * Targets baseDir (~/.ultron/) and baseDir/sessions/.
- * Best-effort — warns to stderr on failure, never throws.
+ * Targets baseDir (~/.ultron/), baseDir/sessions/, baseDir/memory/, and
+ * baseDir/skills/. Best-effort — warns to stderr on failure, never throws.
  */
 export async function enforceBaseDirectoryPermissions(
   baseDir: string,
 ): Promise<void> {
-  const dirs = [baseDir, join(baseDir, 'sessions')]
+  const dirs = [
+    baseDir,
+    join(baseDir, 'sessions'),
+    join(baseDir, 'memory'),
+    join(baseDir, 'skills'),
+  ]
 
   for (const dir of dirs) {
     try {

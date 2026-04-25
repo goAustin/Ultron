@@ -16,7 +16,12 @@ import { join } from 'node:path'
 
 import { query } from '../core/query.js'
 import type { Terminal } from '../core/queryTypes.js'
-import type { QueryDeps, CallModelFn } from '../core/queryDeps.js'
+import type {
+  QueryDeps,
+  CallModelFn,
+  RunPreToolUseHooksFn,
+  RunPostToolUseHooksFn,
+} from '../core/queryDeps.js'
 import type { SystemPromptPart } from '../context/systemPromptParts.js'
 import type { Message, MessageId } from '../core/messages.js'
 import { createUserMessage, messageId } from '../core/messages.js'
@@ -56,6 +61,10 @@ export type SubagentOptions = {
   readonly permissionOpts: PermissionOptions
   /** Audit writer shared with the parent — every subagent event lands on the parent's audit log. */
   readonly auditWriter: AuditWriter
+  /** PreToolUse hook runner — inherited from the parent QueryEngine (2b). */
+  readonly runPreToolUseHooks: RunPreToolUseHooksFn
+  /** PostToolUse hook runner — inherited from the parent QueryEngine (2b). */
+  readonly runPostToolUseHooks: RunPostToolUseHooksFn
   readonly allowedTools?: readonly string[]
   readonly maxTurns?: number
   readonly parentThinkingBudget?: number
@@ -72,7 +81,7 @@ export type SubagentResult = {
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_ALLOWED_TOOLS = ['FileRead', 'Glob', 'Grep'] as const
+export const DEFAULT_ALLOWED_TOOLS = ['FileRead', 'Glob', 'Grep'] as const
 const DEFAULT_MAX_TURNS = 30
 const AGENT_TOOL_NAME = 'Agent'
 
@@ -143,6 +152,8 @@ export function createForkSubagent(opts: SubagentOptions): ForkSubagentFn {
         callModel: opts.callModel,
         authorizeToolUse,
         executeToolUse,
+        runPreToolUseHooks: opts.runPreToolUseHooks,
+        runPostToolUseHooks: opts.runPostToolUseHooks,
         compact: createCompactFn(opts.compactCallModel, uuid),
         uuid,
         // No getAttachments — read-only subagents don't trigger per-turn refreshes

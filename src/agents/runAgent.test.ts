@@ -5,7 +5,13 @@ import { tmpdir } from 'os'
 
 import { createForkSubagent } from './runAgent.js'
 import type { SubagentOptions } from './runAgent.js'
-import type { CallModelFn, RawStreamEvent, ApiResponseMeta } from '../core/queryDeps.js'
+import type {
+  CallModelFn,
+  RawStreamEvent,
+  ApiResponseMeta,
+  RunPreToolUseHooksFn,
+  RunPostToolUseHooksFn,
+} from '../core/queryDeps.js'
 import type { PermissionOptions } from '../core/permissions/types.js'
 import { createStore, getDefaultAppState } from '../core/state.js'
 import type { AppState } from '../core/state.js'
@@ -49,6 +55,14 @@ function makeCapturingWriter(): { writer: AuditWriter; captured: Array<{ event: 
   return { writer: makeHandle(), captured }
 }
 
+const noopPreHooks: RunPreToolUseHooksFn = async function* () {
+  return { kind: 'continue' }
+}
+
+const noopPostHooks: RunPostToolUseHooksFn = async function* (_tu, result) {
+  return { result }
+}
+
 function makeOpts(sessionDir: string, overrides?: Partial<SubagentOptions>): SubagentOptions {
   const { writer } = makeCapturingWriter()
   return {
@@ -56,12 +70,14 @@ function makeOpts(sessionDir: string, overrides?: Partial<SubagentOptions>): Sub
     compactCallModel: textCallModel('compact'),
     parentToolRegistry: createDefaultRegistry(),
     parentAppState: createStore<AppState>(getDefaultAppState()),
-    parentSystemPromptParts: [{ content: 'You are a helpful assistant.', cacheHint: 'static' }],
+    parentSystemPromptParts: [{ content: 'You are a helpful assistant.', cacheHint: 'global' }],
     parentSignal: new AbortController().signal,
     cwd: sessionDir,
     sessionDir,
     permissionOpts: defaultPermOpts,
     auditWriter: writer,
+    runPreToolUseHooks: noopPreHooks,
+    runPostToolUseHooks: noopPostHooks,
     ...overrides,
   }
 }

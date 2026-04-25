@@ -349,10 +349,128 @@ describe('authorizeToolUse', () => {
       expect(auth.decision.ruleCreated?.toolName).toBe('Ask')
     }
   })
+
+  describe('allow_by_rule scope construction (Phase 6a)', () => {
+    function askingTool(specOverrides: {
+      name: string
+      getPath?: (input: Record<string, unknown>) => string
+      getDomain?: (input: Record<string, unknown>) => string | undefined
+    }) {
+      return buildTool({
+        ...specOverrides,
+        inputSchema: { type: 'object', properties: {}, required: [] },
+        call: async () => ({ content: 'ok', isError: false }),
+        checkPermissions: async () => ({ behavior: 'ask', message: 'confirm?' }),
+      })
+    }
+
+    const allowByRuleOpts: PermissionOptions = {
+      headless: false,
+      safetyChecks: [],
+      askUser: async () => 'allow_by_rule',
+    }
+
+    it('rule includes path when getPath defined', async () => {
+      const tool = askingTool({ name: 'PathOnly', getPath: () => '/p' })
+      const ctx = makeContext([tool])
+      const auth = await authorizeToolUse(makeToolUse('PathOnly'), ctx, makeSignal(), allowByRuleOpts)
+      if (auth.outcome === 'authorized') {
+        expect(auth.decision.ruleCreated).toEqual({
+          toolName: 'PathOnly',
+          behavior: 'allow',
+          path: '/p',
+          source: 'session',
+        })
+      }
+    })
+
+    it('rule includes domain when getDomain defined', async () => {
+      const tool = askingTool({ name: 'DomOnly', getDomain: () => 'github.com' })
+      const ctx = makeContext([tool])
+      const auth = await authorizeToolUse(makeToolUse('DomOnly'), ctx, makeSignal(), allowByRuleOpts)
+      if (auth.outcome === 'authorized') {
+        expect(auth.decision.ruleCreated).toEqual({
+          toolName: 'DomOnly',
+          behavior: 'allow',
+          domain: 'github.com',
+          source: 'session',
+        })
+      }
+    })
+
+    it('rule includes both path and domain when both defined', async () => {
+      const tool = askingTool({ name: 'Both', getPath: () => '/p', getDomain: () => 'github.com' })
+      const ctx = makeContext([tool])
+      const auth = await authorizeToolUse(makeToolUse('Both'), ctx, makeSignal(), allowByRuleOpts)
+      if (auth.outcome === 'authorized') {
+        expect(auth.decision.ruleCreated).toEqual({
+          toolName: 'Both',
+          behavior: 'allow',
+          path: '/p',
+          domain: 'github.com',
+          source: 'session',
+        })
+      }
+    })
+
+    it('rule is tool-name only when neither getPath nor getDomain defined', async () => {
+      const tool = askingTool({ name: 'Bare' })
+      const ctx = makeContext([tool])
+      const auth = await authorizeToolUse(makeToolUse('Bare'), ctx, makeSignal(), allowByRuleOpts)
+      if (auth.outcome === 'authorized') {
+        expect(auth.decision.ruleCreated).toEqual({
+          toolName: 'Bare',
+          behavior: 'allow',
+          source: 'session',
+        })
+      }
+    })
+
+    it('refuses to construct rule when domain-bearing tool returns undefined and no path', async () => {
+      const tool = askingTool({ name: 'NoDomain', getDomain: () => undefined })
+      const ctx = makeContext([tool])
+      const auth = await authorizeToolUse(makeToolUse('NoDomain'), ctx, makeSignal(), allowByRuleOpts)
+      if (auth.outcome === 'authorized') {
+        expect(auth.decision.ruleCreated).toBeUndefined()
+        // user response still recorded for audit
+        expect(auth.decision.userResponse).toBe('allow_by_rule')
+      }
+      // and no rule was added to AppState
+      expect(ctx.appState.getState().permissionRules).toEqual([])
+    })
+
+    it('refuses to construct rule when getDomain returns invalid pattern and no path', async () => {
+      const tool = askingTool({ name: 'BadDomain', getDomain: () => 'not a host' })
+      const ctx = makeContext([tool])
+      const auth = await authorizeToolUse(makeToolUse('BadDomain'), ctx, makeSignal(), allowByRuleOpts)
+      if (auth.outcome === 'authorized') {
+        expect(auth.decision.ruleCreated).toBeUndefined()
+      }
+      expect(ctx.appState.getState().permissionRules).toEqual([])
+    })
+
+    it('falls back to path-scoped rule when getDomain returns undefined but getPath does not', async () => {
+      const tool = askingTool({
+        name: 'PathBackup',
+        getPath: () => '/p',
+        getDomain: () => undefined,
+      })
+      const ctx = makeContext([tool])
+      const auth = await authorizeToolUse(makeToolUse('PathBackup'), ctx, makeSignal(), allowByRuleOpts)
+      if (auth.outcome === 'authorized') {
+        expect(auth.decision.ruleCreated).toEqual({
+          toolName: 'PathBackup',
+          behavior: 'allow',
+          path: '/p',
+          source: 'session',
+        })
+      }
+    })
+  })
 })
 
 describe('executeToolUse', () => {
-  it('runs tool.call directly without checking permissions', async () => {
+  it('runs tool.call without checking permissions (caller authorizes)', async () => {
     const tool = okTool()
     const ctx = makeContext([tool])
     const result = await executeToolUse(makeToolUse('TestTool'), ctx, makeSignal())
@@ -383,5 +501,33 @@ describe('executeToolUse', () => {
     const ctx = makeContext([tool])
     const result = await executeToolUse(makeToolUse('TestTool'), ctx, makeSignal(true))
     expect(result.errorKind).toBe('aborted')
+  })
+
+  it('re-validates input (2b contract): returns validation_failed on rejection', async () => {
+    const call = vi.fn().mockResolvedValue({ content: 'should not run', isError: false })
+    const tool = buildTool({
+      name: 'ValidateOnly',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+      validateInput: async () => ({ valid: false, message: 'bad input' }),
+      call,
+    })
+    const ctx = makeContext([tool])
+    const result = await executeToolUse(makeToolUse('ValidateOnly'), ctx, makeSignal())
+    expect(result.isError).toBe(true)
+    expect(result.errorKind).toBe('validation_failed')
+    expect(call).not.toHaveBeenCalled()
+  })
+
+  it('re-validates input (2b contract): catches thrown validator errors', async () => {
+    const tool = buildTool({
+      name: 'ValidatorBoom',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+      validateInput: async () => { throw new Error('validator crashed') },
+      call: async () => ({ content: 'unreachable', isError: false }),
+    })
+    const ctx = makeContext([tool])
+    const result = await executeToolUse(makeToolUse('ValidatorBoom'), ctx, makeSignal())
+    expect(result.isError).toBe(true)
+    expect(result.errorKind).toBe('validation_failed')
   })
 })

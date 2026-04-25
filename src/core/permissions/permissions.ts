@@ -22,6 +22,7 @@ import type {
   PermissionDecision,
   PermissionOptions,
 } from './types.js'
+import { matchDomain } from '../../web/domainPolicy.js'
 
 // ---------------------------------------------------------------------------
 // Main entry point
@@ -58,12 +59,32 @@ async function runCascade(
 ): Promise<PermissionDecision> {
   const rules = context.appState.getState().permissionRules
   const toolPath = tool.getPath?.(toolUse.input)
-  const matching = findMatchingRules(rules, toolUse.name, toolPath)
+  const toolHost = tool.getDomain?.(toolUse.input)
+  const matching = findMatchingRules(rules, toolUse.name, toolPath, toolHost)
 
-  // 1. Explicit deny rules
+  // 1. Explicit deny rules — user explicit deny ALWAYS wins, even over
+  //    skill scope (step 1.5) and mode bypass (step 5).
   const denyRule = matching.find((r) => r.behavior === 'deny')
   if (denyRule) {
     return { behavior: 'deny', reason: { type: 'rule', rule: denyRule } }
+  }
+
+  // 1.5. Skill scope (Phase 5b) — when an activation is in flight with a
+  //      narrowed tool list, any tool outside the list denies here. Runs
+  //      AFTER explicit deny (user always wins) and BEFORE explicit ask /
+  //      mode bypass (skill scope wins over `bypassPermissions`).
+  if (
+    opts.scopedToolAllowlist !== undefined &&
+    !opts.scopedToolAllowlist.includes(toolUse.name)
+  ) {
+    return {
+      behavior: 'deny',
+      reason: {
+        type: 'skillScope',
+        toolName: toolUse.name,
+        allowed: opts.scopedToolAllowlist,
+      },
+    }
   }
 
   // 2. Explicit ask rules
@@ -127,19 +148,35 @@ async function runCascade(
 // Rule matching
 // ---------------------------------------------------------------------------
 
-function findMatchingRules(
+export function findMatchingRules(
   rules: readonly PermissionRule[],
   toolName: string,
   toolPath: string | undefined,
+  toolHost: string | undefined,
 ): PermissionRule[] {
   return rules.filter((rule) => {
-    if (rule.toolName !== toolName) return false
+    if (!matchesToolName(rule.toolName, toolName)) return false
     // Rule with a path only matches if tool resolved to that exact path
     if (rule.path !== undefined) {
-      return toolPath !== undefined && rule.path === toolPath
+      if (toolPath === undefined || rule.path !== toolPath) return false
+    }
+    // Rule with a domain only matches if tool resolved to a host that
+    // satisfies the pattern (exact or `*.suffix`).
+    if (rule.domain !== undefined) {
+      if (toolHost === undefined || !matchDomain(rule.domain, toolHost)) return false
     }
     return true
   })
+}
+
+// Suffix-`*` wildcard: `mcp__github__*` matches any name starting with
+// `mcp__github__`. Bare `*` fails closed — safer than allow-all. Literal
+// names fall back to exact equality.
+function matchesToolName(ruleToolName: string, toolName: string): boolean {
+  if (!ruleToolName.endsWith('*')) return ruleToolName === toolName
+  const prefix = ruleToolName.slice(0, -1)
+  if (prefix.length === 0) return false
+  return toolName.startsWith(prefix)
 }
 
 // ---------------------------------------------------------------------------
@@ -149,8 +186,13 @@ function findMatchingRules(
 export function formatDecisionMessage(decision: PermissionDecision): string {
   const reason = decision.reason
   switch (reason.type) {
-    case 'rule':
-      return `${reason.rule.behavior} by ${reason.rule.source} rule for ${reason.rule.toolName}${reason.rule.path ? ` (${reason.rule.path})` : ''}`
+    case 'rule': {
+      const scope = [
+        reason.rule.path ? reason.rule.path : undefined,
+        reason.rule.domain ? reason.rule.domain : undefined,
+      ].filter((s): s is string => s !== undefined).join(', ')
+      return `${reason.rule.behavior} by ${reason.rule.source} rule for ${reason.rule.toolName}${scope ? ` (${scope})` : ''}`
+    }
     case 'safetyCheck':
       return reason.message
     case 'mode':
@@ -159,6 +201,8 @@ export function formatDecisionMessage(decision: PermissionDecision): string {
       return 'message' in reason ? reason.message : 'tool check'
     case 'headlessEscalation':
       return `denied in headless mode (original: ${formatDecisionMessage({ behavior: 'ask', reason: reason.original })})`
+    case 'skillScope':
+      return `tool not in active skill's allowed-tools (allowed: ${reason.allowed.join(', ')})`
     case 'fallback':
       return 'no matching rule; requires approval'
   }

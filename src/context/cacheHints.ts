@@ -1,22 +1,49 @@
 /**
  * System-prompt parts builder.
  *
- * Composes the ordered `SystemPromptPart[]` that flows through the agent loop.
- * Static Ultron preamble sections come first (one part per section so a single
- * section's change doesn't invalidate caching of the rest); volatile date +
- * env info come last.
+ * Composes the ordered `SystemPromptPart[]` that flows through the agent loop:
  *
- * Memory/skills injection (phases 4d/5b) will insert static parts between the
- * preamble and the dynamic tail — the seam is documented below. No empty part
- * is emitted; an empty part would make a bad Anthropic `cache_control` target.
+ *   1. `'global'`  — Ultron preamble sections (one part per section so a
+ *                    single section's change doesn't invalidate the rest).
+ *   2. `'org'`     — memory injection (Phase 4d) and, eventually, skills
+ *                    (Phase 5b). One injection part per source today.
+ *   3. `'volatile'`— current date + env info.
+ *
+ * No empty part is emitted; an empty part would make a bad Anthropic
+ * `cache_control` target.
  */
 
 import type { SystemPromptPart } from './systemPromptParts.js'
 import { buildSystemPrompt } from './systemPrompt.js'
 import { getSystemContext } from './systemContext.js'
+import { buildMemoryInjectionParts } from './memoryInjection.js'
+import { buildSkillInjectionParts } from './skillInjection.js'
+import { MEMORY_INJECTION_TOKEN_BUDGET } from './tokenBudget.js'
+import type { ActiveSkill } from '../skills/router.js'
+
+export type BuildSystemPromptPartsOpts = {
+  /**
+   * Ultron base dir (e.g. `~/.ultron`) — same value
+   * `QueryEngine._memoryBaseDir` holds. When set, memory entries are
+   * injected as a single `'org'` part at the seam between the preamble
+   * and the volatile tail. When `null`/`undefined`, the injection step
+   * no-ops and behavior is byte-identical to pre-4d.
+   */
+  readonly memoryBaseDir?: string | null
+  /**
+   * Phase 5b: when an `ActiveSkill` snapshot is provided, the skill body
+   * is injected as a single `'org'` part placed AFTER the memory block.
+   * The Anthropic adapter's Pass 2 (last `'org'` part) lands on the
+   * skill body during an activation window — stable bytes within the
+   * window mean a cache hit on the org segment for subsequent turns.
+   * `null`/`undefined` no-ops (no skill injection).
+   */
+  readonly activeSkill?: ActiveSkill | null
+}
 
 export async function buildSystemPromptParts(
   cwd: string,
+  opts: BuildSystemPromptPartsOpts = {},
 ): Promise<SystemPromptPart[]> {
   const staticSections = buildSystemPrompt()
   const systemCtx = await getSystemContext(cwd)
@@ -26,14 +53,27 @@ export async function buildSystemPromptParts(
 
   for (const section of staticSections) {
     if (section.length > 0) {
-      parts.push({ content: section, cacheHint: 'static' })
+      parts.push({ content: section, cacheHint: 'global' })
     }
   }
 
-  // Memory/skills injection seam — phases 4d / 5b insert static parts here.
-  // NOTE: when 4d lands, widen `CacheHint` to distinguish globally-shared
-  // static (preamble above) from org/user-scoped static (memory, CLAUDE.md).
-  // Today both collapse to 'static'; that's fine while the seam is empty.
+  // Memory/skills injection seam — Phase 4d injects memory as 'org' parts
+  // here; Phase 5b appends the active skill body as a single 'org' part
+  // AFTER the memory block. The Anthropic adapter emits a separate cache
+  // breakpoint on the last 'org' part so memory changes leave the 'global'
+  // preamble cache intact, and a skill activation pins the breakpoint on
+  // the skill body for the duration of the window.
+  if (opts.memoryBaseDir) {
+    const memParts = await buildMemoryInjectionParts(
+      opts.memoryBaseDir,
+      MEMORY_INJECTION_TOKEN_BUDGET,
+    )
+    parts.push(...memParts)
+  }
+
+  if (opts.activeSkill) {
+    parts.push(...buildSkillInjectionParts(opts.activeSkill))
+  }
 
   parts.push({ content: currentDate, cacheHint: 'volatile' })
   parts.push({ content: systemCtx.envInfo, cacheHint: 'volatile' })

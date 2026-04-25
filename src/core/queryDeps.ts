@@ -2,7 +2,10 @@ import type { Message, ToolUseBlock, ToolResultBlock, MessageId, UserMessage } f
 import type { ToolExecution } from '../context/attachmentTypes.js'
 import type { SystemPromptPart } from '../context/systemPromptParts.js'
 import type { ToolResult } from './tools/types.js'
+import type { ToolProgressInput } from './tools/context.js'
 import type { PermissionRule } from './permissions/types.js'
+import type { QueryEvent } from './queryEvents.js'
+import type { PreHookOutcome, PostHookOutcome } from '../hooks/types.js'
 import { messageId } from './messages.js'
 import { randomUUID } from 'crypto'
 
@@ -141,11 +144,36 @@ export type AuthorizeToolUseFn = (
 /**
  * Execute a previously-authorized tool call. Performs only tool.call() + error wrapping.
  * Does NOT re-check permissions; the caller is responsible for authorizing first.
+ *
+ * The optional `onProgress` callback (Phase 3d) is plumbed into the per-call
+ * `ToolUseContext` so that tools (e.g., MCP) can surface intermediate progress
+ * on the QueryEvent stream. It must not affect the returned `ToolResult`.
  */
 export type ExecuteToolUseFn = (
   toolUse: ToolUseBlock,
   signal: AbortSignal,
+  onProgress?: (progress: ToolProgressInput) => void,
 ) => Promise<ToolResult>
+
+/**
+ * Run PreToolUse hooks (Phase 2b). Async-generator: yields hook_started /
+ * hook_finished events as subprocesses run; returns whether to block or
+ * continue (with possibly-mutated input).
+ */
+export type RunPreToolUseHooksFn = (
+  toolUse: ToolUseBlock,
+  signal: AbortSignal,
+) => AsyncGenerator<QueryEvent, PreHookOutcome>
+
+/**
+ * Run PostToolUse hooks (Phase 2b). Async-generator: yields hook_started /
+ * hook_finished events; returns a (possibly content-augmented) ToolResult.
+ */
+export type RunPostToolUseHooksFn = (
+  toolUse: ToolUseBlock,
+  result: ToolResult,
+  signal: AbortSignal,
+) => AsyncGenerator<QueryEvent, PostHookOutcome>
 
 /**
  * Compacts a message history to fit within context limits.
@@ -171,6 +199,8 @@ export type QueryDeps = {
   readonly callModel: CallModelFn
   readonly authorizeToolUse: AuthorizeToolUseFn
   readonly executeToolUse: ExecuteToolUseFn
+  readonly runPreToolUseHooks: RunPreToolUseHooksFn
+  readonly runPostToolUseHooks: RunPostToolUseHooksFn
   readonly compact: CompactFn
   readonly uuid: () => MessageId
   readonly getAttachments?: GetAttachmentsFn
@@ -199,11 +229,24 @@ const stubCompact: CompactFn = async (_messages) => {
   throw new Error('Compaction not implemented')
 }
 
+// No-op hook runners. The async-generator yields nothing and returns a
+// continue/pass-through outcome. Used when hookConfig has no matching hooks,
+// which is the common case.
+const noopPreHooks: RunPreToolUseHooksFn = async function* (_toolUse, _signal) {
+  return { kind: 'continue' }
+}
+
+const noopPostHooks: RunPostToolUseHooksFn = async function* (_toolUse, result, _signal) {
+  return { result }
+}
+
 export function stubDeps(overrides?: Partial<QueryDeps>): QueryDeps {
   return {
     callModel: stubCallModel,
     authorizeToolUse: stubAuthorize,
     executeToolUse: stubExecute,
+    runPreToolUseHooks: noopPreHooks,
+    runPostToolUseHooks: noopPostHooks,
     compact: stubCompact,
     uuid: () => messageId('00000000-0000-0000-0000-000000000000'),
     ...overrides,
@@ -215,6 +258,8 @@ export function productionDeps(overrides?: Partial<QueryDeps>): QueryDeps {
     callModel: stubCallModel, // replaced by apiAdapter.createAnthropicCallModel()
     authorizeToolUse: stubAuthorize, // replaced by Phase 3
     executeToolUse: stubExecute,     // replaced by Phase 3
+    runPreToolUseHooks: noopPreHooks,   // replaced by QueryEngine when hooks.json present
+    runPostToolUseHooks: noopPostHooks,
     compact: stubCompact,     // replaced by Phase 10
     uuid: () => messageId(randomUUID()),
     ...overrides,

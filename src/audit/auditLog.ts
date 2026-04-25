@@ -32,10 +32,20 @@ const SHOULD_AUDIT: ReadonlySet<QueryEvent['type']> = new Set<QueryEvent['type']
   'attachment',
   'permission_decision',
   'tool_call_started',
+  'tool_progress',
   'tool_call_finished',
   'tool_result',
+  'hook_started',
+  'hook_finished',
   'compaction_started',
   'compaction_finished',
+  'memory_entry_written',
+  'memory_entry_deleted',
+  'skill_written',
+  'skill_deleted',
+  'skill_activated',
+  'skill_deactivated',
+  'web_backend_resolved',
 ])
 
 export function createAuditWriter(opts: AuditWriterOptions = {}): AuditWriter {

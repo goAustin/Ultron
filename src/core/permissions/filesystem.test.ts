@@ -369,7 +369,7 @@ describe('workingDirectorySafetyCheck', () => {
 
 describe('filesystemSafetyChecks', () => {
   it('contains all safety checks', () => {
-    expect(filesystemSafetyChecks).toHaveLength(3)
+    expect(filesystemSafetyChecks).toHaveLength(4)
     expect(filesystemSafetyChecks).toContain(dangerousPathSafetyCheck)
     expect(filesystemSafetyChecks).toContain(workingDirectorySafetyCheck)
   })

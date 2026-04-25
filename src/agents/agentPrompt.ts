@@ -14,12 +14,12 @@ const SUBAGENT_PREAMBLE = `You are a subagent — a focused assistant delegated 
 
 const SUBAGENT_PREAMBLE_PART: SystemPromptPart = {
   content: SUBAGENT_PREAMBLE,
-  cacheHint: 'static',
+  cacheHint: 'global',
 }
 
 /**
  * Build the subagent's system prompt parts by prepending the subagent
- * preamble as a static part ahead of the parent's parts.
+ * preamble as a global part ahead of the parent's parts.
  */
 export function buildSubagentSystemPrompt(
   parent: readonly SystemPromptPart[],
