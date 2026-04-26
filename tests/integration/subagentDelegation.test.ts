@@ -17,6 +17,12 @@ import { createStore, getDefaultAppState } from '../../src/core/state.js'
 import type { AppState } from '../../src/core/state.js'
 import type { CallModelFn, RawStreamEvent, ApiResponseMeta } from '../../src/core/queryDeps.js'
 import type { AuditWriter } from '../../src/audit/types.js'
+import { toolUseId } from '../../src/core/messages.js'
+
+// Phase 7c: createForkSubagent returns the widened EngineForkSubagentFn that
+// takes (prompt, parentToolUseId). Tests that drive forks directly need a
+// synthetic parent ToolUseBlock.id.
+const TEST_PARENT_TUID = toolUseId('tu_test_parent')
 
 // Null writer for tests — events are thrown away.
 const nullAuditWriter: AuditWriter = {
@@ -56,7 +62,7 @@ describe('subagent delegation', () => {
       const callModel = textCallModel('I found 3 TypeScript files.')
       const parentAppState = createStore<AppState>(getDefaultAppState())
 
-      const forkSubagent = createForkSubagent({
+      const engineForkSubagent = createForkSubagent({
         callModel,
         compactCallModel: callModel,
         parentToolRegistry: createDefaultRegistry(),
@@ -69,13 +75,22 @@ describe('subagent delegation', () => {
         auditWriter: nullAuditWriter,
       })
 
-      const context = createToolUseContext({
+      const baseContext = createToolUseContext({
         appState: parentAppState,
         abortController: new AbortController(),
         messages: [],
         toolRegistry: createDefaultRegistry(),
-        forkSubagent,
+        engineForkSubagent,
       })
+
+      // Phase 7c: AgentTool reads `context.forkSubagent` (unary) — the
+      // executor normally binds this per-call. We're calling AgentTool
+      // directly (not through executeToolUse), so construct the per-call
+      // view here, capturing a synthetic parent ToolUseBlock.id.
+      const context = {
+        ...baseContext,
+        forkSubagent: (prompt: string) => engineForkSubagent(prompt, TEST_PARENT_TUID),
+      }
 
       const agentTool = createAgentTool()
       const result = await agentTool.call(
@@ -109,7 +124,7 @@ describe('subagent delegation', () => {
         auditWriter: nullAuditWriter,
       })
 
-      await forkSubagent('Do something')
+      await forkSubagent('Do something', TEST_PARENT_TUID)
 
       // Parent state should be unchanged
       expect(parentAppState.getState().permissionMode).toBe('default')
@@ -131,7 +146,7 @@ describe('subagent delegation', () => {
         auditWriter: nullAuditWriter,
       })
 
-      const result = await forkSubagent('Research task')
+      const result = await forkSubagent('Research task', TEST_PARENT_TUID)
 
       const agentDir = join(dir, 'agents', result.subagentId)
       expect(existsSync(join(agentDir, 'transcript.jsonl'))).toBe(true)
@@ -156,7 +171,7 @@ describe('subagent delegation', () => {
         auditWriter: nullAuditWriter,
       })
 
-      const result = await forkSubagent('This should abort')
+      const result = await forkSubagent('This should abort', TEST_PARENT_TUID)
       expect(result.terminal.reason).toBe('aborted')
     })
   })

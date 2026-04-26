@@ -49,6 +49,7 @@ export const WebSearchTool = buildTool({
     required: ['query'],
   },
   isMutating: false,
+  isReadOnly: true,
   isConcurrencySafe: () => true,
 
   async validateInput(input) {

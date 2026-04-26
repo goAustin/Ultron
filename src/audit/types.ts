@@ -7,6 +7,7 @@
  */
 
 import type { QueryEvent } from '../core/queryEvents.js'
+import type { ToolUseId } from '../core/messages.js'
 import type { PermissionRule } from '../core/permissions/types.js'
 
 export type AuditWriter = {
@@ -14,11 +15,18 @@ export type AuditWriter = {
   readonly close: () => Promise<void>
   /**
    * Returns a handle that shares this writer's underlying chain + byte accounting
-   * but stamps every envelope on disk with the given `origin` tag. Used to mark
-   * subagent provenance when multiple query loops share one audit file.
+   * but stamps every envelope on disk with the given `origin` tag and (optionally)
+   * a `parentToolUseId` linking events to the parent-side `tool_call_started` that
+   * spawned the writer's owner. Used to mark subagent provenance when multiple
+   * query loops share one audit file (Phase 7a) and to correlate parent → child
+   * subagent events even under parallel fan-out (Phase 7c).
+   *
    * The returned handle is NOT chainable (no nested origins).
    */
-  readonly withOrigin: (origin: string) => AuditWriter
+  readonly withOrigin: (
+    origin: string,
+    opts?: { readonly parentToolUseId: ToolUseId },
+  ) => AuditWriter
 }
 
 export type AuditWriterOptions = {

@@ -3,6 +3,8 @@ import type { ToolExecution } from '../context/attachmentTypes.js'
 import type { SystemPromptPart } from '../context/systemPromptParts.js'
 import type { ToolResult } from './tools/types.js'
 import type { ToolProgressInput } from './tools/context.js'
+import type { ToolRegistry } from './tools/registry.js'
+import { createToolRegistry } from './tools/registry.js'
 import type { PermissionRule } from './permissions/types.js'
 import type { QueryEvent } from './queryEvents.js'
 import type { PreHookOutcome, PostHookOutcome } from '../hooks/types.js'
@@ -204,6 +206,13 @@ export type QueryDeps = {
   readonly compact: CompactFn
   readonly uuid: () => MessageId
   readonly getAttachments?: GetAttachmentsFn
+  /**
+   * The tool registry the loop uses for batch partitioning (Phase 7b).
+   * `partitionIntoBatches` looks up `isConcurrencySafe` per tool to decide
+   * which tool_uses can fan out concurrently. Defaults to an empty registry
+   * in the stubs; production wiring threads in the engine's real registry.
+   */
+  readonly toolRegistry: ToolRegistry
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +258,7 @@ export function stubDeps(overrides?: Partial<QueryDeps>): QueryDeps {
     runPostToolUseHooks: noopPostHooks,
     compact: stubCompact,
     uuid: () => messageId('00000000-0000-0000-0000-000000000000'),
+    toolRegistry: createToolRegistry(),
     ...overrides,
   }
 }
@@ -262,6 +272,7 @@ export function productionDeps(overrides?: Partial<QueryDeps>): QueryDeps {
     runPostToolUseHooks: noopPostHooks,
     compact: stubCompact,     // replaced by Phase 10
     uuid: () => messageId(randomUUID()),
+    toolRegistry: createToolRegistry(), // replaced by QueryEngine / runAgent with the real registry
     ...overrides,
   }
 }

@@ -47,6 +47,7 @@ export const CodeSandboxTool = buildTool({
     required: ['language', 'code'],
   },
   isMutating: false,
+  isReadOnly: true,
   isConcurrencySafe: () => true,
 
   async validateInput(input) {

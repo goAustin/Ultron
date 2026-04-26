@@ -39,6 +39,19 @@ export function createAgentTool(): Tool {
     description: 'Delegate a task to a read-only subagent for research or exploration.',
     inputSchema,
 
+    // Subagents are guaranteed read-only by `buildFilteredRegistry`, which
+    // throws `SubagentScopeError` if any retained tool has
+    // `isReadOnly !== true`. Delegating to a read-only subagent is itself a
+    // read-only operation from the parent's perspective.
+    isReadOnly: true,
+
+    // Multiple `Agent` tool_uses in one turn fan out concurrently (Phase 7b).
+    // Each fork gets a cloned `AppState`, fresh `ReadFileState`, origin-tagged
+    // audit writer (chain-serialized writes), and disjoint transcript dir, so
+    // siblings cannot race. The read-only invariant on the filtered registry
+    // is what makes this safe regardless of caller-supplied `allowedTools`.
+    isConcurrencySafe: () => true,
+
     async validateInput(
       input: Record<string, unknown>,
     ): Promise<ValidationResult> {
@@ -70,9 +83,13 @@ export function createAgentTool(): Tool {
       const prompt = input.prompt as string
       const result = await context.forkSubagent(prompt)
 
+      // Surface subagent terminal errors to the parent model. Without this
+      // a `reason: 'error'` terminal would be indistinguishable from a
+      // successful-but-quiet subagent — the failure-isolation contract
+      // relies on the parent being able to tell.
       return {
         content: result.text,
-        isError: false,
+        isError: result.terminal.reason === 'error',
       }
     },
   }

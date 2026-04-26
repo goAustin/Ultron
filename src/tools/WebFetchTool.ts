@@ -37,6 +37,7 @@ export const WebFetchTool = buildTool({
     required: ['url'],
   },
   isMutating: false,
+  isReadOnly: true,
   isConcurrencySafe: () => true,
   getDomain: (input) => {
     const url = typeof input.url === 'string' ? input.url : ''

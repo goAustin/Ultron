@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { hasPermissionsToUseTool, formatDecisionMessage } from './permissions.js'
+import { hasPermissionsToUseTool, formatDecisionMessage, checkScopedAllowlist } from './permissions.js'
 import type { PermissionRule, PermissionOptions, PermissionDecision, SafetyCheck } from './types.js'
 import { DEFAULT_PERMISSION_OPTIONS } from './types.js'
 import { buildTool } from '../tools/types.js'
@@ -783,6 +783,142 @@ describe('skill scope (scopedToolAllowlist)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Step 1.5: Agent scope (Phase 7a) — same mechanism as skill scope but
+// emits `agentScope` reason variant when `scopeSource: 'agent'`. Subagent
+// forks pass `scopeSource: 'agent'` so the audit trail and user-facing
+// message distinguish runtime-narrowed scope from user-activated skills.
+// ---------------------------------------------------------------------------
+
+describe('agent scope (scopedToolAllowlist + scopeSource: agent)', () => {
+  it('tool in allowlist falls through cascade (no deny here)', async () => {
+    const tool = simpleTool('FileRead')
+    const ctx = makeContext([tool], { permissionMode: 'bypassPermissions' })
+    const decision = await hasPermissionsToUseTool(
+      tool, makeToolUse('FileRead'), ctx,
+      opts({ scopedToolAllowlist: ['FileRead', 'Grep'], scopeSource: 'agent' }),
+    )
+    expect(decision.behavior).toBe('allow')
+    expect(decision.reason).toEqual({ type: 'mode', mode: 'bypassPermissions' })
+  })
+
+  it('tool NOT in allowlist denies with agentScope reason', async () => {
+    const tool = simpleTool('Bash')
+    const ctx = makeContext([tool])
+    const decision = await hasPermissionsToUseTool(
+      tool, makeToolUse('Bash'), ctx,
+      opts({ scopedToolAllowlist: ['FileRead', 'Grep'], scopeSource: 'agent' }),
+    )
+    expect(decision.behavior).toBe('deny')
+    expect(decision.reason).toEqual({
+      type: 'agentScope',
+      toolName: 'Bash',
+      allowed: ['FileRead', 'Grep'],
+    })
+  })
+
+  it('empty allowlist denies every tool with agentScope', async () => {
+    const tool = simpleTool('FileRead')
+    const ctx = makeContext([tool])
+    const decision = await hasPermissionsToUseTool(
+      tool, makeToolUse('FileRead'), ctx,
+      opts({ scopedToolAllowlist: [], scopeSource: 'agent' }),
+    )
+    expect(decision.behavior).toBe('deny')
+    expect(decision.reason).toEqual({
+      type: 'agentScope',
+      toolName: 'FileRead',
+      allowed: [],
+    })
+  })
+
+  it('explicit user deny rule beats agent scope', async () => {
+    const tool = simpleTool('FileRead')
+    const rules: PermissionRule[] = [
+      { toolName: 'FileRead', behavior: 'deny', source: 'userSettings' },
+    ]
+    const ctx = makeContext([tool], { permissionRules: rules })
+    const decision = await hasPermissionsToUseTool(
+      tool, makeToolUse('FileRead'), ctx,
+      opts({ scopedToolAllowlist: ['FileRead'], scopeSource: 'agent' }),
+    )
+    expect(decision.behavior).toBe('deny')
+    expect(decision.reason.type).toBe('rule')
+  })
+
+  it('agent scope beats bypassPermissions mode', async () => {
+    const tool = simpleTool('Bash')
+    const ctx = makeContext([tool], { permissionMode: 'bypassPermissions' })
+    const decision = await hasPermissionsToUseTool(
+      tool, makeToolUse('Bash'), ctx,
+      opts({ scopedToolAllowlist: ['FileRead'], scopeSource: 'agent' }),
+    )
+    expect(decision.behavior).toBe('deny')
+    expect(decision.reason).toEqual({
+      type: 'agentScope',
+      toolName: 'Bash',
+      allowed: ['FileRead'],
+    })
+  })
+
+  it('omitting scopeSource defaults to skillScope (back-compat)', async () => {
+    const tool = simpleTool('Bash')
+    const ctx = makeContext([tool])
+    const decision = await hasPermissionsToUseTool(
+      tool, makeToolUse('Bash'), ctx,
+      opts({ scopedToolAllowlist: ['FileRead'] }),
+    )
+    expect(decision.reason.type).toBe('skillScope')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// checkScopedAllowlist helper (Phase 7a) — shared by cascade and
+// authorizeToolUse pre-resolution gate.
+// ---------------------------------------------------------------------------
+
+describe('checkScopedAllowlist', () => {
+  it('returns null when allowlist is undefined', () => {
+    expect(checkScopedAllowlist('Bash', opts({ scopedToolAllowlist: undefined }))).toBeNull()
+  })
+
+  it('returns null when tool is in allowlist', () => {
+    expect(
+      checkScopedAllowlist('FileRead', opts({ scopedToolAllowlist: ['FileRead'], scopeSource: 'agent' })),
+    ).toBeNull()
+  })
+
+  it('returns agentScope deny when scopeSource is agent and tool is outside list', () => {
+    const decision = checkScopedAllowlist(
+      'Glob',
+      opts({ scopedToolAllowlist: ['FileRead'], scopeSource: 'agent' }),
+    )
+    expect(decision).toEqual({
+      behavior: 'deny',
+      reason: { type: 'agentScope', toolName: 'Glob', allowed: ['FileRead'] },
+    })
+  })
+
+  it('returns skillScope deny when scopeSource is skill and tool is outside list', () => {
+    const decision = checkScopedAllowlist(
+      'Glob',
+      opts({ scopedToolAllowlist: ['FileRead'], scopeSource: 'skill' }),
+    )
+    expect(decision).toEqual({
+      behavior: 'deny',
+      reason: { type: 'skillScope', toolName: 'Glob', allowed: ['FileRead'] },
+    })
+  })
+
+  it('defaults to skillScope when scopeSource is unset', () => {
+    const decision = checkScopedAllowlist(
+      'Glob',
+      opts({ scopedToolAllowlist: ['FileRead'] }),
+    )
+    expect(decision?.reason.type).toBe('skillScope')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // formatDecisionMessage
 // ---------------------------------------------------------------------------
 
@@ -811,6 +947,15 @@ describe('formatDecisionMessage', () => {
       reason: { type: 'skillScope', toolName: 'Bash', allowed: ['FileRead', 'Grep'] },
     })
     expect(msg).toContain("active skill's allowed-tools")
+    expect(msg).toContain('FileRead, Grep')
+  })
+
+  it('formats agentScope', () => {
+    const msg = formatDecisionMessage({
+      behavior: 'deny',
+      reason: { type: 'agentScope', toolName: 'Bash', allowed: ['FileRead', 'Grep'] },
+    })
+    expect(msg).toContain("subagent's allowed tools")
     expect(msg).toContain('FileRead, Grep')
   })
 

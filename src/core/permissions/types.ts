@@ -37,6 +37,7 @@ export type PermissionDecisionReason =
   | { type: 'toolCheck' }
   | { type: 'headlessEscalation'; original: PermissionDecisionReason }
   | { type: 'skillScope'; toolName: string; allowed: readonly string[] }
+  | { type: 'agentScope'; toolName: string; allowed: readonly string[] }
   | { type: 'fallback' }
 
 export type PermissionDecision = {
@@ -83,13 +84,21 @@ export type PermissionOptions = {
   safetyChecks: SafetyCheck[]
   askUser?: AskUserFn
   /**
-   * Phase 5b: when present, the cascade denies any tool not in the list.
+   * Phase 5b / 7a: when present, the cascade denies any tool not in the list.
    * Runs AFTER explicit deny rules (user explicit deny still wins) and
-   * BEFORE explicit ask / mode resolution (skill scope wins over
-   * `bypassPermissions`). Skill activation populates this for the duration
-   * of the activation window.
+   * BEFORE explicit ask / mode resolution (scope wins over
+   * `bypassPermissions`). Skill activation and subagent forks both populate
+   * this — `scopeSource` discriminates the deny reason variant.
    */
   scopedToolAllowlist?: readonly string[]
+  /**
+   * Phase 7a: discriminator for the deny reason emitted when a tool is
+   * outside `scopedToolAllowlist`. Defaults to `'skill'` for back-compat
+   * with Phase 5b call sites that set the allowlist without specifying a
+   * source. Subagents pass `'agent'` so the cascade emits `agentScope`
+   * instead of `skillScope`.
+   */
+  scopeSource?: 'skill' | 'agent'
 }
 
 export const DEFAULT_PERMISSION_OPTIONS: PermissionOptions = {

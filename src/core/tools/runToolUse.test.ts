@@ -289,6 +289,94 @@ describe('authorizeToolUse', () => {
     }
   })
 
+  // Phase 7a — pre-resolution scope gate. The gate fires BEFORE registry
+  // resolve, so an out-of-scope tool name produces a permission deny instead
+  // of `tool_not_found`. This is the regression-guard that proves a filtered
+  // subagent registry surfaces out-of-scope calls as policy decisions, not
+  // precondition failures.
+  it('returns denied with agentScope reason BEFORE resolve when tool is outside scopedToolAllowlist (agent)', async () => {
+    // Registry intentionally does NOT contain `Glob` — mirrors a filtered
+    // subagent registry. With no scope opts, this would surface as
+    // tool_not_found; with scope opts, the pre-resolution gate denies first.
+    const ctx = makeContext([okTool('FileRead')])
+    const permissionOpts: PermissionOptions = {
+      headless: false,
+      safetyChecks: [],
+      scopedToolAllowlist: ['FileRead'],
+      scopeSource: 'agent',
+    }
+    const auth = await authorizeToolUse(makeToolUse('Glob'), ctx, makeSignal(), permissionOpts)
+    expect(auth.outcome).toBe('denied')
+    if (auth.outcome === 'denied') {
+      expect(auth.syntheticResult.errorKind).toBe('permission_denied')
+      expect(auth.decision.decision).toBe('deny')
+      expect(auth.decision.reason).toContain("subagent's allowed tools")
+    }
+  })
+
+  it('returns denied with skillScope reason BEFORE resolve when tool is outside scopedToolAllowlist (default skill)', async () => {
+    const ctx = makeContext([okTool('FileRead')])
+    const permissionOpts: PermissionOptions = {
+      headless: false,
+      safetyChecks: [],
+      scopedToolAllowlist: ['FileRead'],
+      // scopeSource omitted → defaults to skillScope behavior
+    }
+    const auth = await authorizeToolUse(makeToolUse('Glob'), ctx, makeSignal(), permissionOpts)
+    expect(auth.outcome).toBe('denied')
+    if (auth.outcome === 'denied') {
+      expect(auth.syntheticResult.errorKind).toBe('permission_denied')
+      expect(auth.decision.reason).toContain("active skill's allowed-tools")
+    }
+  })
+
+  it('pre-resolution gate is a no-op when scopedToolAllowlist is undefined', async () => {
+    const ctx = makeContext([])
+    const permissionOpts: PermissionOptions = {
+      headless: false,
+      safetyChecks: [],
+    }
+    const auth = await authorizeToolUse(makeToolUse('Missing'), ctx, makeSignal(), permissionOpts)
+    // Falls through to the normal resolve step → tool_not_found.
+    expect(auth.outcome).toBe('precondition_failed')
+    if (auth.outcome === 'precondition_failed') {
+      expect(auth.syntheticResult.errorKind).toBe('tool_not_found')
+    }
+  })
+
+  // Phase 7a + post-7c fix — the pre-resolution gate must not steal the
+  // cascade's explicit-deny precedence when the tool resolves. With a skill
+  // scope active and a user deny rule for an out-of-scope tool that IS in
+  // the (unfiltered) parent registry, the audit reason must be `rule`, not
+  // `skillScope`. Otherwise the cascade invariant in permissions.ts:65-79
+  // — "explicit deny wins over scope" — is silently violated.
+  it('explicit user deny rule wins over skillScope when the tool is resolvable (cascade invariant)', async () => {
+    const tool = okTool('Glob') // tool IS in the registry — parent's view.
+    const ctx = makeContext([tool])
+    // Inject the deny rule onto AppState so the cascade picks it up at step 1.
+    const rules = ctx.appState.getState().permissionRules
+    ctx.appState.setState({
+      permissionRules: [
+        ...rules,
+        { toolName: 'Glob', behavior: 'deny', source: 'userSettings' },
+      ],
+    })
+    const permissionOpts: PermissionOptions = {
+      headless: false,
+      safetyChecks: [],
+      scopedToolAllowlist: ['FileRead'], // skill restricts; Glob is out of scope.
+      // scopeSource omitted → default skill semantics.
+    }
+    const auth = await authorizeToolUse(makeToolUse('Glob'), ctx, makeSignal(), permissionOpts)
+    expect(auth.outcome).toBe('denied')
+    if (auth.outcome === 'denied') {
+      // Cascade reason wins; reason text refers to the rule, not the scope.
+      expect(auth.decision.reason).not.toContain("active skill's allowed-tools")
+      expect(auth.decision.reason).not.toContain("subagent's allowed tools")
+      expect(auth.decision.reason).toContain('rule')
+    }
+  })
+
   it('returns precondition_failed with validation_failed synthetic', async () => {
     const tool = buildTool({
       name: 'Strict',
@@ -529,5 +617,82 @@ describe('executeToolUse', () => {
     const result = await executeToolUse(makeToolUse('ValidatorBoom'), ctx, makeSignal())
     expect(result.isError).toBe(true)
     expect(result.errorKind).toBe('validation_failed')
+  })
+
+  // -------------------------------------------------------------------------
+  // Phase 7c — per-call rebind of forkSubagent
+  // -------------------------------------------------------------------------
+
+  it('binds the per-call forkSubagent from engineForkSubagent, capturing the parent toolUse.id', async () => {
+    const captured: { prompt: string; parentToolUseId: string }[] = []
+
+    // Tool that consumes the per-call unary forkSubagent and asserts it
+    // ends up calling engineForkSubagent with both args.
+    const toolThatForks: Tool = buildTool({
+      name: 'TestForker',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+      call: async (_input, ctx) => {
+        if (!ctx.forkSubagent) {
+          return { content: 'no fork available', isError: true }
+        }
+        await ctx.forkSubagent('test-prompt')
+        return { content: 'ok', isError: false }
+      },
+    })
+
+    const registry = createToolRegistry()
+    registry.register(toolThatForks)
+
+    const ctx = createToolUseContext({
+      appState: createStore({
+        ...getDefaultAppState(),
+        permissionMode: 'bypassPermissions' as const,
+      } as import('../state.js').AppState),
+      abortController: new AbortController(),
+      messages: [],
+      toolRegistry: registry,
+      engineForkSubagent: async (prompt, parentToolUseId) => {
+        captured.push({ prompt, parentToolUseId })
+        return {
+          text: '',
+          terminal: { reason: 'end_turn', messages: [] },
+          subagentId: 'sub-1',
+        }
+      },
+    })
+
+    const tu: ToolUseBlock = {
+      type: 'tool_use',
+      id: toolUseId('tu_seven_c_parent'),
+      name: 'TestForker',
+      input: {},
+    }
+    const result = await executeToolUse(tu, ctx, makeSignal())
+
+    expect(result.isError).toBe(false)
+    expect(captured).toEqual([
+      { prompt: 'test-prompt', parentToolUseId: 'tu_seven_c_parent' },
+    ])
+
+    // The static context never carries forkSubagent — only the per-call
+    // callContext does. (This is the contract that prevents any tool from
+    // accidentally reading a stale unary fn outside its own call.)
+    expect(ctx.forkSubagent).toBeUndefined()
+    expect(ctx.engineForkSubagent).toBeDefined()
+  })
+
+  it('per-call forkSubagent is undefined when engineForkSubagent is unset', async () => {
+    const toolReadingFork: Tool = buildTool({
+      name: 'TestForker',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+      call: async (_input, ctx) => ({
+        content: ctx.forkSubagent ? 'has-fork' : 'no-fork',
+        isError: false,
+      }),
+    })
+    const ctx = makeContext([toolReadingFork])
+    // engineForkSubagent not set → callContext.forkSubagent must stay undefined.
+    const result = await executeToolUse(makeToolUse('TestForker'), ctx, makeSignal())
+    expect(result.content).toBe('no-fork')
   })
 })

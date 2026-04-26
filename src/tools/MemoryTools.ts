@@ -201,6 +201,7 @@ function buildMemoryReadTool(baseDir: string): Tool {
       required: ['mode'],
     },
     isMutating: false,
+    isReadOnly: true,
     isConcurrencySafe: () => true,
     getPath: (input) => synthPath(input.id),
 

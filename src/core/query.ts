@@ -15,13 +15,14 @@ import {
   messageId,
   toolUseId,
 } from './messages.js'
-import type { QueryEvent, CompactionTrigger } from './queryEvents.js'
+import type { QueryEvent, CompactionTrigger, ToolProgressEvent } from './queryEvents.js'
 import type { QueryDeps, RawStreamEvent, RawContentBlockStart, RawContentBlockDelta } from './queryDeps.js'
 import { productionDeps } from './queryDeps.js'
 import {
   makePermissionDecisionEvent,
   makeToolCallStartedEvent,
   makeToolCallFinishedEvent,
+  makeToolProgressEvent,
   makeCompactionStartedEvent,
   makeCompactionFinishedEvent,
 } from './queryEventFactories.js'
@@ -34,9 +35,18 @@ import {
 } from './queryTypes.js'
 import { normalizeMessages } from './normalizeMessages.js'
 import { streamToolUse } from './tools/streamToolUse.js'
+import {
+  partitionIntoBatches,
+  runWithConcurrencyLimit,
+  DEFAULT_MAX_CONCURRENCY,
+} from './tools/toolOrchestration.js'
+import type { ToolResult } from './tools/types.js'
+import type { ToolProgressInput } from './tools/context.js'
 import { toApiMessages, StreamAccumulator } from './providers/anthropicAdapter.js'
 import { estimateTokens } from '../context/tokenEstimator.js'
 import { shouldCompact } from '../context/tokenBudget.js'
+
+const PARALLEL_PROGRESS_BUFFER_CAP = 1000
 
 // ---------------------------------------------------------------------------
 // Main entry point
@@ -236,7 +246,28 @@ export async function* query(
     }
 
     // -----------------------------------------------------------------------
-    // 9. Execute tools
+    // 9. Execute tools (Phase 7b — batched dispatch with parallel fan-out
+    //    for concurrency-safe tools)
+    //
+    // Partition tool_uses into batches of consecutive concurrency-safe tools.
+    // For each batch:
+    //   Phase A — serial authorize + PreToolUse hooks. permission_decision
+    //             events emit live; denied/blocked tools record their
+    //             synthetic result for emission in Phase C (preserves input
+    //             ordering of toolResults within the batch).
+    //   Phase B — parallel `Promise.all` over executeToolUse for concurrent
+    //             batches with N>1 authorized records. Per-tool progress
+    //             callbacks captured into a buffer (cannot yield from inside
+    //             Promise.all). Single-tool / unsafe batches skip Phase B
+    //             and fall through to a live streamToolUse call in Phase C.
+    //   Phase C — serial PostToolUse hooks + emit tool_call_started,
+    //             buffered tool_progress, tool_call_finished, tool_result
+    //             events in tool_use input order.
+    //
+    // Authorize, hooks, and event emission stay serial because askUser may
+    // prompt the user, hooks may run user shell scripts, and the parent
+    // QueryEvent stream must remain ordered for downstream consumers.
+    // `isConcurrencySafe` describes the tool body only.
     // -----------------------------------------------------------------------
     const toolResults: Message[] = []
     // Parallel to toolResults: the tool_use that actually reached tool.call,
@@ -244,80 +275,201 @@ export async function* query(
     // attachment stage below, which zips tool_use × result pairs.
     const effectiveToolUses: ToolUseBlock[] = []
 
-    for (const toolUse of toolUseBlocks) {
-      if (signal.aborted) break
+    type AuthorizedRecord = {
+      readonly kind: 'authorized'
+      readonly toolUse: ToolUseBlock
+      readonly effective: ToolUseBlock
+    }
+    type RejectedRecord = {
+      readonly kind: 'denied' | 'blocked'
+      readonly toolUse: ToolUseBlock
+      readonly result: ToolResult
+    }
+    type PhaseARecord = AuthorizedRecord | RejectedRecord
 
-      // Phase 1 — authorize (resolve + validate + permissions + askUser)
-      const auth = await deps.authorizeToolUse(toolUse, signal)
+    type ParallelRunResult = {
+      readonly durationMs: number
+      readonly result: ToolResult
+      readonly progressEvents: readonly ToolProgressEvent[]
+    }
 
-      // permission_decision is ONLY a policy event — emit it for actual
-      // permission outcomes (authorized or denied). Precondition failures
-      // (tool_not_found, validation, pre-auth abort) are NOT policy decisions;
-      // they surface as a tool_result only.
-      if (auth.outcome === 'authorized' || auth.outcome === 'denied') {
-        yield makePermissionDecisionEvent(
-          toolUse,
-          auth.decision.decision,
-          auth.decision.reason,
-          {
-            userResponse: auth.decision.userResponse,
-            ruleCreated: auth.decision.ruleCreated,
-          },
-        )
+    const batches = partitionIntoBatches(toolUseBlocks, deps.toolRegistry)
+
+    batchLoop: for (const batch of batches) {
+      if (signal.aborted) break batchLoop
+
+      // -------------------------------------------------------------------
+      // Phase A — serial authorize + PreToolUse for every tool in the batch.
+      // On abort: stop *iterating* (don't authorize further tools), but
+      // still fall through to Phase C so denied/blocked records buffered
+      // earlier in this batch get their real tool_result emitted. Without
+      // this, the bottom-of-loop missing-results emitter would synthesize a
+      // generic "Interrupted by user" tool_result for tools that already
+      // produced a permission_decision: deny event, leaving the audit log
+      // with mismatched decision + result rows.
+      // -------------------------------------------------------------------
+      const records: PhaseARecord[] = []
+      for (const toolUse of batch.toolUses) {
+        if (signal.aborted) break  // out of Phase A only — Phase C still runs.
+
+        const auth = await deps.authorizeToolUse(toolUse, signal)
+
+        // permission_decision is ONLY a policy event — emit it for actual
+        // permission outcomes (authorized or denied). Precondition failures
+        // (tool_not_found, validation, pre-auth abort) are NOT policy
+        // decisions; they surface as a tool_result only.
+        if (auth.outcome === 'authorized' || auth.outcome === 'denied') {
+          yield makePermissionDecisionEvent(
+            toolUse,
+            auth.decision.decision,
+            auth.decision.reason,
+            {
+              userResponse: auth.decision.userResponse,
+              ruleCreated: auth.decision.ruleCreated,
+            },
+          )
+        }
+
+        if (auth.outcome !== 'authorized') {
+          records.push({ kind: 'denied', toolUse, result: auth.syntheticResult })
+          continue
+        }
+
+        const preOutcome = yield* deps.runPreToolUseHooks(toolUse, signal)
+
+        if (preOutcome.kind === 'block') {
+          records.push({ kind: 'blocked', toolUse, result: preOutcome.syntheticResult })
+          continue
+        }
+
+        const effective: ToolUseBlock =
+          preOutcome.updatedInput !== undefined
+            ? { ...toolUse, input: preOutcome.updatedInput }
+            : toolUse
+
+        records.push({ kind: 'authorized', toolUse, effective })
       }
 
-      if (auth.outcome !== 'authorized') {
-        const resultMessage = createToolResultMessage(
-          toolUse,
-          auth.syntheticResult,
-          deps.uuid(),
+      // -------------------------------------------------------------------
+      // Phase B — parallel execute for concurrent batches with N>1
+      //           authorized records. Otherwise fall through to Phase C's
+      //           live streamToolUse path.
+      //
+      // Two correctness details:
+      //
+      // 1. `tool_call_started` events emit *here*, before Promise.all,
+      //    so each event's `timestamp` precedes any tool_progress timestamps
+      //    captured during execution. (Progress events are emitted from
+      //    the buffer in Phase C, but their `timestamp` is set when the
+      //    callback fires inside the tool — earlier than now.)
+      // 2. `runWithConcurrencyLimit` caps concurrent in-flight executes at
+      //    DEFAULT_MAX_CONCURRENCY. With 8+ read-only tools declaring
+      //    isConcurrencySafe (Agent, WebFetch, WebSearch, etc.), an
+      //    unbounded `Promise.all` could fan out arbitrarily wide and
+      //    create avoidable API/network bursts.
+      // -------------------------------------------------------------------
+      const authorizedIndices: number[] = []
+      for (let i = 0; i < records.length; i++) {
+        if (records[i].kind === 'authorized') authorizedIndices.push(i)
+      }
+
+      const isParallelBatch = batch.concurrent && authorizedIndices.length > 1
+      let parallelRuns: Map<number, ParallelRunResult> | undefined
+      if (isParallelBatch) {
+        // Emit tool_call_started events upfront in input order so timestamps
+        // precede the tool_progress events that fire inside the parallel
+        // executes.
+        for (const idx of authorizedIndices) {
+          yield makeToolCallStartedEvent((records[idx] as AuthorizedRecord).effective)
+        }
+
+        const tasks = authorizedIndices.map((idx) => () =>
+          executeWithBufferedProgress(
+            (records[idx] as AuthorizedRecord).effective,
+            signal,
+            deps.executeToolUse,
+          ),
         )
+        const settled = await runWithConcurrencyLimit(tasks, DEFAULT_MAX_CONCURRENCY)
+        parallelRuns = new Map()
+        for (let j = 0; j < authorizedIndices.length; j++) {
+          const s = settled[j]
+          // executeWithBufferedProgress is contract-bound never to reject;
+          // defensively turn any rejected entry into an error ToolResult so
+          // a future regression doesn't drop a sibling's results.
+          const run: ParallelRunResult =
+            s.status === 'fulfilled'
+              ? s.value
+              : {
+                  durationMs: 0,
+                  result: {
+                    content:
+                      s.reason instanceof Error ? s.reason.message : String(s.reason),
+                    isError: true,
+                    errorKind: 'execution_error',
+                  },
+                  progressEvents: [],
+                }
+          parallelRuns.set(authorizedIndices[j], run)
+        }
+      }
+
+      // -------------------------------------------------------------------
+      // Phase C — serial event emission + PostToolUse hooks in input order.
+      // For the parallel branch, tool_call_started events were already
+      // emitted in Phase B. The serial branch (single tool, or unsafe
+      // batch) emits started → streamToolUse → finished here.
+      // -------------------------------------------------------------------
+      for (let i = 0; i < records.length; i++) {
+        const rec = records[i]
+
+        if (rec.kind !== 'authorized') {
+          const resultMessage = createToolResultMessage(
+            rec.toolUse,
+            rec.result,
+            deps.uuid(),
+          )
+          toolResults.push(resultMessage)
+          effectiveToolUses.push(rec.toolUse)
+          yield { type: 'tool_result', message: resultMessage }
+          continue
+        }
+
+        let result: ToolResult
+        let durationMs: number
+
+        if (parallelRuns !== undefined) {
+          // tool_call_started already emitted in Phase B (correct timestamp).
+          const run = parallelRuns.get(i)!
+          for (const ev of run.progressEvents) yield ev
+          result = run.result
+          durationMs = run.durationMs
+        } else {
+          // Serial path — emit started here so its timestamp precedes any
+          // progress events that streamToolUse yields.
+          yield makeToolCallStartedEvent(rec.effective)
+          const started = Date.now()
+          result = yield* streamToolUse(rec.effective, signal, deps.executeToolUse)
+          durationMs = Date.now() - started
+        }
+
+        // PostToolUse hooks (2b). Only content mutation; cannot block.
+        const postOutcome = yield* deps.runPostToolUseHooks(rec.effective, result, signal)
+        result = postOutcome.result
+
+        yield makeToolCallFinishedEvent(rec.effective, result, durationMs)
+
+        const resultMessage = createToolResultMessage(rec.effective, result, deps.uuid())
         toolResults.push(resultMessage)
-        effectiveToolUses.push(toolUse)
+        effectiveToolUses.push(rec.effective)
         yield { type: 'tool_result', message: resultMessage }
-        continue
       }
 
-      // Phase 1.5 — PreToolUse hooks (2b)
-      const preOutcome = yield* deps.runPreToolUseHooks(toolUse, signal)
-
-      if (preOutcome.kind === 'block') {
-        const resultMessage = createToolResultMessage(
-          toolUse,
-          preOutcome.syntheticResult,
-          deps.uuid(),
-        )
-        toolResults.push(resultMessage)
-        effectiveToolUses.push(toolUse)
-        yield { type: 'tool_result', message: resultMessage }
-        continue
-      }
-
-      const effectiveToolUse: ToolUseBlock =
-        preOutcome.updatedInput !== undefined
-          ? { ...toolUse, input: preOutcome.updatedInput }
-          : toolUse
-
-      // Phase 2 — execute. executeToolUse re-validates input (2b contract);
-      // permissions are NOT re-checked after hook mutation.
-      // streamToolUse (Phase 3d) bridges any tool-emitted progress callbacks
-      // into tool_progress QueryEvents; the awaited ToolResult is returned
-      // unchanged, so message-history insertion below is unaffected.
-      const started = Date.now()
-      yield makeToolCallStartedEvent(effectiveToolUse)
-      let result = yield* streamToolUse(effectiveToolUse, signal, deps.executeToolUse)
-      const durationMs = Date.now() - started
-
-      // Phase 2.5 — PostToolUse hooks (2b). Only content mutation; cannot block.
-      const postOutcome = yield* deps.runPostToolUseHooks(effectiveToolUse, result, signal)
-      result = postOutcome.result
-
-      yield makeToolCallFinishedEvent(effectiveToolUse, result, durationMs)
-
-      const resultMessage = createToolResultMessage(effectiveToolUse, result, deps.uuid())
-      toolResults.push(resultMessage)
-      effectiveToolUses.push(effectiveToolUse)
-      yield { type: 'tool_result', message: resultMessage }
+      // Phase A may have stopped iterating mid-batch on abort; Phase C
+      // drained the records it had. Now break out of the outer batch loop
+      // so the bottom-of-loop missing-results emitter handles any tool_uses
+      // we never authorized.
+      if (signal.aborted) break batchLoop
     }
 
     // -----------------------------------------------------------------------
@@ -481,6 +633,78 @@ async function* streamModelResponse(
   const message = accumulator.build(deps.uuid())
 
   return { message, withheldError, inputTokens: meta.inputTokens }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel execute helper — runs `executeToolUse` while capturing progress
+// callbacks into a buffer. Used inside Phase B's `Promise.all` for concurrent
+// batches because `yield` from inside `Promise.all` is impossible. The
+// buffered events are replayed in input order during Phase C.
+//
+// Mirrors `streamToolUse`'s overflow handling: drops further progress events
+// once the cap is hit, leaving a single overflow marker so the consumer
+// learns about it. Defensively wraps `executeToolUse`: the contract is that
+// it returns a ToolResult and never throws, but if a future implementation
+// throws we still produce a valid ToolResult instead of leaking the
+// rejection through `Promise.all` (which would short-circuit the batch).
+// ---------------------------------------------------------------------------
+
+async function executeWithBufferedProgress(
+  toolUse: ToolUseBlock,
+  signal: AbortSignal,
+  executeToolUse: QueryDeps['executeToolUse'],
+): Promise<{
+  durationMs: number
+  result: ToolResult
+  progressEvents: readonly ToolProgressEvent[]
+}> {
+  const buffered: ToolProgressEvent[] = []
+  let dropped = 0
+
+  const onProgress = (p: ToolProgressInput): void => {
+    if (buffered.length >= PARALLEL_PROGRESS_BUFFER_CAP) {
+      if (dropped === 0) {
+        buffered.push(
+          makeToolProgressEvent({
+            toolUseId: toolUse.id,
+            progress: 0,
+            total: null,
+            message: 'progress queue overflow; further events dropped',
+          }),
+        )
+      }
+      dropped++
+      return
+    }
+    buffered.push(
+      makeToolProgressEvent({
+        toolUseId: toolUse.id,
+        progress: p.progress,
+        total: p.total ?? null,
+        message: p.message ?? null,
+      }),
+    )
+  }
+
+  const started = Date.now()
+  try {
+    const result = await executeToolUse(toolUse, signal, onProgress)
+    return {
+      durationMs: Date.now() - started,
+      result,
+      progressEvents: buffered,
+    }
+  } catch (err) {
+    return {
+      durationMs: Date.now() - started,
+      result: {
+        content: err instanceof Error ? err.message : String(err),
+        isError: true,
+        errorKind: 'execution_error',
+      },
+      progressEvents: buffered,
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

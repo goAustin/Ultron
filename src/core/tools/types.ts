@@ -75,6 +75,17 @@ export interface Tool {
   isConcurrencySafe?(input: Record<string, unknown>): boolean
 
   /**
+   * True if this tool only reads state — no filesystem writes, no process
+   * spawning, no network mutations, no permission-rule writes. Read-only is
+   * orthogonal to `isConcurrencySafe`: most read-only tools are also
+   * concurrency-safe, but the flags answer different questions. Subagent
+   * forks assert `isReadOnly === true` on every retained tool, so the
+   * subagent registry is provably non-mutating regardless of caller wiring.
+   * Default undefined = false (conservative — write-capable until proven).
+   */
+  readonly isReadOnly?: boolean
+
+  /**
    * Whether this tool mutates state (files, processes, etc.).
    * Filesystem safety checks only fire for mutating tools.
    * Default undefined = true (conservative).
@@ -116,6 +127,7 @@ export type ToolSpec = {
   validateInput?: Tool['validateInput']
   checkPermissions?: Tool['checkPermissions']
   isMutating?: boolean
+  isReadOnly?: boolean
   isConcurrencySafe?: Tool['isConcurrencySafe']
   getPath?: Tool['getPath']
   getDomain?: Tool['getDomain']
@@ -136,6 +148,7 @@ export function buildTool(spec: ToolSpec): Tool {
     source: spec.source ?? 'builtin',
 
     ...(spec.isMutating !== undefined && { isMutating: spec.isMutating }),
+    ...(spec.isReadOnly !== undefined && { isReadOnly: spec.isReadOnly }),
     ...(spec.isConcurrencySafe && { isConcurrencySafe: spec.isConcurrencySafe }),
     ...(spec.getPath && { getPath: spec.getPath }),
     ...(spec.getDomain && { getDomain: spec.getDomain }),

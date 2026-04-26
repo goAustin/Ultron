@@ -6,7 +6,10 @@
 import type { Message } from '../messages.js'
 import type { Store, AppState } from '../state.js'
 import type { ToolRegistry } from './registry.js'
-import type { ForkSubagentFn } from '../../agents/runAgent.js'
+import type {
+  ForkSubagentFn,
+  EngineForkSubagentFn,
+} from '../../agents/runAgent.js'
 
 // ---------------------------------------------------------------------------
 // Read file state — cache of recently read files for stale-edit detection
@@ -65,7 +68,22 @@ export type ToolUseContext = {
   /** Access to the tool registry (for tools that need to discover other tools) */
   toolRegistry: ToolRegistry
 
-  /** Fork a subagent query — only available when AgentTool is wired */
+  /**
+   * Engine-level fork fn — set once by the QueryEngine, takes the parent
+   * `ToolUseBlock.id` as a second arg for audit correlation (Phase 7c).
+   * Tools never read this directly. `executeToolUse` rebinds it per-call
+   * into the unary `forkSubagent` below, capturing the current
+   * `toolUse.id` in a closure so AgentTool's `call()` body stays unaware
+   * of the correlation plumbing.
+   */
+  engineForkSubagent?: EngineForkSubagentFn
+
+  /**
+   * Per-call unary view of `engineForkSubagent`, populated by
+   * `executeToolUse` for each `tool.call`. AgentTool reads this; the
+   * closure has already captured the parent `toolUse.id`. Undefined on
+   * the static context — only set on the per-call `callContext`.
+   */
   forkSubagent?: ForkSubagentFn
 
   /**
@@ -93,7 +111,7 @@ export function createToolUseContext(opts: {
   messages: readonly Message[]
   readFileState?: ReadFileState
   toolRegistry: ToolRegistry
-  forkSubagent?: ForkSubagentFn
+  engineForkSubagent?: EngineForkSubagentFn
   onProgress?: (progress: ToolProgressInput) => void
   notify?: (event: NotifyEvent) => void
 }): ToolUseContext {
@@ -103,7 +121,7 @@ export function createToolUseContext(opts: {
     messages: opts.messages,
     readFileState: opts.readFileState ?? new Map(),
     toolRegistry: opts.toolRegistry,
-    ...(opts.forkSubagent && { forkSubagent: opts.forkSubagent }),
+    ...(opts.engineForkSubagent && { engineForkSubagent: opts.engineForkSubagent }),
     ...(opts.onProgress && { onProgress: opts.onProgress }),
     ...(opts.notify && { notify: opts.notify }),
   }

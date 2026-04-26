@@ -228,4 +228,66 @@ describe('createAuditWriter', () => {
     const child = w.withOrigin('once')
     expect(() => child.withOrigin('twice')).toThrow()
   })
+
+  // -------------------------------------------------------------------------
+  // Phase 7c — parentToolUseId stamping
+  // -------------------------------------------------------------------------
+
+  it('withOrigin stamps parentToolUseId on the envelope when supplied', async () => {
+    const w = createAuditWriter({ dir })
+    const child = w.withOrigin('sub-7c', { parentToolUseId: toolUseId('tu_parent_xyz') })
+    child.write(makeToolCallStartedEvent(dummyToolUse()))
+    await w.close()
+
+    const lines = await readLines(join(dir, 'audit.jsonl'))
+    const parsed = JSON.parse(lines[0]!)
+    expect(parsed.origin).toBe('sub-7c')
+    expect(parsed.parentToolUseId).toBe('tu_parent_xyz')
+  })
+
+  it('withOrigin second arg is optional — back-compat one-arg call still works', async () => {
+    const w = createAuditWriter({ dir })
+    const child = w.withOrigin('sub-no-parent') // no second arg
+    child.write(makeToolCallStartedEvent(dummyToolUse()))
+    await w.close()
+
+    const lines = await readLines(join(dir, 'audit.jsonl'))
+    const parsed = JSON.parse(lines[0]!)
+    expect(parsed.origin).toBe('sub-no-parent')
+    expect(parsed.parentToolUseId).toBeUndefined()
+  })
+
+  it('root writer envelopes do not carry parentToolUseId', async () => {
+    const w = createAuditWriter({ dir })
+    w.write(makeToolCallStartedEvent(dummyToolUse('tu-root')))
+    await w.close()
+
+    const lines = await readLines(join(dir, 'audit.jsonl'))
+    const parsed = JSON.parse(lines[0]!)
+    expect(parsed.origin).toBeUndefined()
+    expect(parsed.parentToolUseId).toBeUndefined()
+  })
+
+  it('mixed root + subagent envelopes preserve correlation per-line', async () => {
+    const w = createAuditWriter({ dir })
+    const childA = w.withOrigin('sub-A', { parentToolUseId: toolUseId('tu_A') })
+    const childB = w.withOrigin('sub-B', { parentToolUseId: toolUseId('tu_B') })
+    w.write(makeToolCallStartedEvent(dummyToolUse('tu_A', 'Agent')))
+    childA.write(makeToolCallStartedEvent(dummyToolUse('tu_inner_A')))
+    childB.write(makeToolCallStartedEvent(dummyToolUse('tu_inner_B')))
+    w.write(makeToolCallFinishedEvent(dummyToolUse('tu_A', 'Agent'), { content: 'ok', isError: false }, 5))
+    await w.close()
+
+    const lines = await readLines(join(dir, 'audit.jsonl'))
+    expect(lines).toHaveLength(4)
+    const parsed = lines.map((l) => JSON.parse(l) as Record<string, unknown>)
+    expect(parsed[0]?.origin).toBeUndefined()
+    expect(parsed[0]?.parentToolUseId).toBeUndefined()
+    expect(parsed[1]?.origin).toBe('sub-A')
+    expect(parsed[1]?.parentToolUseId).toBe('tu_A')
+    expect(parsed[2]?.origin).toBe('sub-B')
+    expect(parsed[2]?.parentToolUseId).toBe('tu_B')
+    expect(parsed[3]?.origin).toBeUndefined()
+    expect(parsed[3]?.parentToolUseId).toBeUndefined()
+  })
 })

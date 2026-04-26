@@ -28,6 +28,7 @@ export const FileReadTool = buildTool({
     required: ['file_path'],
   },
   isMutating: false,
+  isReadOnly: true,
   isConcurrencySafe: () => true,
   getPath: (input) => (typeof input.file_path === 'string' ? input.file_path : ''),
 

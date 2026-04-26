@@ -19,7 +19,7 @@ import { runToolUse } from './runToolUse.js'
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MAX_CONCURRENCY = 10
+export const DEFAULT_MAX_CONCURRENCY = 10
 
 // ---------------------------------------------------------------------------
 // Batch type

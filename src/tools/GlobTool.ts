@@ -24,6 +24,7 @@ export const GlobTool = buildTool({
     required: ['pattern'],
   },
   isMutating: false,
+  isReadOnly: true,
   isConcurrencySafe: () => true,
 
   async validateInput(input) {

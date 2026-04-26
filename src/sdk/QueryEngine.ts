@@ -769,8 +769,10 @@ export class QueryEngine {
       const runPostHooks: RunPostToolUseHooksFn = (toolUse, result, signal) =>
         runPostToolUseHooks(toolUse, result, hookContext, signal)
 
-      // Per-submission subagent fork function
-      const forkSubagent = createForkSubagent({
+      // Per-submission engine-level subagent fork function. Widened with
+      // `parentToolUseId` (Phase 7c) for audit correlation; `executeToolUse`
+      // rebinds it per-call into the unary `forkSubagent` AgentTool consumes.
+      const engineForkSubagent = createForkSubagent({
         callModel: turnCallModel,
         compactCallModel: this.compactCallModel,
         parentToolRegistry: this.toolRegistry,
@@ -794,7 +796,7 @@ export class QueryEngine {
         messages: allMessages,
         readFileState: this.readFileState,
         toolRegistry: this.toolRegistry,
-        forkSubagent,
+        engineForkSubagent,
         notify: (event) => this.emitNotify(event),
       })
       const authorizeToolUse = createAuthorizeToolUseFn(toolUseContext, turnPermissionOpts)
@@ -810,6 +812,7 @@ export class QueryEngine {
         compact: createCompactFn(this.compactCallModel, uuid),
         uuid,
         getAttachments: buildGetAttachments(this.config.cwd),
+        toolRegistry: this.toolRegistry,
         ...this.config.deps, // test-only overrides
       }
 

@@ -16,6 +16,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import type { QueryEvent } from '../core/queryEvents.js'
+import type { ToolUseId } from '../core/messages.js'
 import type { AuditWriter, AuditWriterOptions } from './types.js'
 import { redactSecrets } from '../memory/redact.js'
 
@@ -63,7 +64,11 @@ export function createAuditWriter(opts: AuditWriterOptions = {}): AuditWriter {
   let currentBytes: number | undefined
   let consecutiveFailures = 0
 
-  function write(event: QueryEvent, origin?: string): void {
+  function write(
+    event: QueryEvent,
+    origin?: string,
+    parentToolUseId?: ToolUseId,
+  ): void {
     if (!SHOULD_AUDIT.has(event.type)) return
 
     chain = chain.then(async () => {
@@ -77,7 +82,7 @@ export function createAuditWriter(opts: AuditWriterOptions = {}): AuditWriter {
           currentBytes = await statSize(file)
         }
 
-        const line = serialize(event, origin)
+        const line = serialize(event, origin, parentToolUseId)
         const lineBytes = Buffer.byteLength(line, 'utf8')
 
         // Check BEFORE append. If appending this line would cross the cap,
@@ -105,11 +110,17 @@ export function createAuditWriter(opts: AuditWriterOptions = {}): AuditWriter {
     return chain
   }
 
-  function withOrigin(origin: string): AuditWriter {
+  function withOrigin(
+    origin: string,
+    opts?: { readonly parentToolUseId: ToolUseId },
+  ): AuditWriter {
     // Returns a handle that shares the same promise chain and byte accounting,
-    // but stamps every envelope with the given origin tag (e.g. a subagent id).
+    // but stamps every envelope with the given origin tag (e.g. a subagent id)
+    // and optionally a parentToolUseId linking events to the parent-side
+    // tool_call_started that spawned the writer's owner (Phase 7c).
+    const parentToolUseId = opts?.parentToolUseId
     return {
-      write: (event) => write(event, origin),
+      write: (event) => write(event, origin, parentToolUseId),
       close,
       withOrigin: () => {
         throw new Error('withOrigin does not support chaining; derive from the root writer')
@@ -124,7 +135,11 @@ export function createAuditWriter(opts: AuditWriterOptions = {}): AuditWriter {
   }
 }
 
-function serialize(event: QueryEvent, origin?: string): string {
+function serialize(
+  event: QueryEvent,
+  origin?: string,
+  parentToolUseId?: ToolUseId,
+): string {
   const timestamp = 'timestamp' in event && typeof (event as { timestamp?: unknown }).timestamp === 'number'
     ? (event as { timestamp: number }).timestamp
     : Date.now()
@@ -133,6 +148,7 @@ function serialize(event: QueryEvent, origin?: string): string {
     schemaVersion: SCHEMA_VERSION,
     tsIso: new Date(timestamp).toISOString(),
     ...(origin !== undefined && { origin }),
+    ...(parentToolUseId !== undefined && { parentToolUseId }),
     ...(redactSecrets(event) as Record<string, unknown>),
   }
 

@@ -33,6 +33,7 @@ import { DEFAULT_PERMISSION_OPTIONS } from '../permissions/types.js'
 import {
   hasPermissionsToUseTool,
   formatDecisionMessage,
+  checkScopedAllowlist,
 } from '../permissions/permissions.js'
 import { isValidDomainPattern } from '../../web/domainPolicy.js'
 import { makeErrorResult, makeAbortResult, checkAbort } from './toolExecution.js'
@@ -52,9 +53,36 @@ export async function authorizeToolUse(
     return precondition(makeAbortResult())
   }
 
-  // 2. Resolve tool — NOT a policy decision.
+  // 2. Resolve tool — NOT a policy decision (when found).
+  //
+  //    Phase 7a + post-7c fix: the pre-resolution scope gate fires ONLY when
+  //    the tool can't be resolved from the registry. Two cases:
+  //
+  //    (a) Subagent (filtered registry) — out-of-scope tools aren't in the
+  //        registry; the gate converts what would otherwise surface as
+  //        `tool_not_found` into a proper `agentScope` policy decision.
+  //
+  //    (b) Parent under a skill activation (unfiltered registry) — the tool
+  //        IS in the registry. We MUST fall through to the cascade so
+  //        explicit user deny rules win over `skillScope`, preserving the
+  //        cascade invariant in `permissions.ts:65-79` (explicit deny → step
+  //        1 wins over scope → step 1.5). The cascade contains the same
+  //        `checkScopedAllowlist` call at step 1.5; both paths share the
+  //        helper, so the deny shape is identical.
+  //
+  //    The earlier "pre-resolution gate fires unconditionally" structure
+  //    short-circuited the cascade and silently demoted explicit-deny
+  //    audit reasons to scope reasons in case (b).
   const tool = context.toolRegistry.get(toolUse.name)
   if (!tool) {
+    const scopeDecision = checkScopedAllowlist(toolUse.name, permissionOpts)
+    if (scopeDecision !== null) {
+      const reason = formatDecisionMessage(scopeDecision)
+      return denied(
+        { decision: 'deny', reason },
+        makeErrorResult('permission_denied', reason),
+      )
+    }
     return precondition(
       makeErrorResult('tool_not_found', `Tool "${toolUse.name}" not found`),
     )
@@ -202,9 +230,22 @@ export async function executeToolUse(
   // Phase 3d: per-call context that carries the progress sink (if any). The
   // shared context stays immutable; concurrent tool calls in a future
   // parallel-execution model wouldn't race on this field.
-  const callContext: ToolUseContext = onProgress
-    ? { ...context, onProgress }
-    : context
+  //
+  // Phase 7c: also rebind `engineForkSubagent` (widened, set by the engine)
+  // into the per-call unary `forkSubagent` view AgentTool consumes. The
+  // closure captures `toolUse.id` so subagent audit envelopes stamp the
+  // correct parent correlation id even under parallel `Agent` fan-out
+  // (Phase 7b). Always allocate the shallow copy in this code path — cheap,
+  // and avoids a second branch when both onProgress and engineForkSubagent
+  // are set.
+  const callContext: ToolUseContext = {
+    ...context,
+    ...(onProgress && { onProgress }),
+    ...(context.engineForkSubagent && {
+      forkSubagent: (prompt: string) =>
+        context.engineForkSubagent!(prompt, toolUse.id),
+    }),
+  }
 
   // Phase 2b: re-validate before tool.call. Protects tool implementations
   // from PreToolUse-hook-mutated input that no longer matches the schema.

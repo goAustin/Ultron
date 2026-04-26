@@ -69,23 +69,14 @@ async function runCascade(
     return { behavior: 'deny', reason: { type: 'rule', rule: denyRule } }
   }
 
-  // 1.5. Skill scope (Phase 5b) — when an activation is in flight with a
-  //      narrowed tool list, any tool outside the list denies here. Runs
-  //      AFTER explicit deny (user always wins) and BEFORE explicit ask /
-  //      mode bypass (skill scope wins over `bypassPermissions`).
-  if (
-    opts.scopedToolAllowlist !== undefined &&
-    !opts.scopedToolAllowlist.includes(toolUse.name)
-  ) {
-    return {
-      behavior: 'deny',
-      reason: {
-        type: 'skillScope',
-        toolName: toolUse.name,
-        allowed: opts.scopedToolAllowlist,
-      },
-    }
-  }
+  // 1.5. Scope check (Phase 5b skill activation, Phase 7a subagent fork) —
+  //      when a scoped allowlist is in flight, any tool outside the list
+  //      denies here. Runs AFTER explicit deny (user always wins) and
+  //      BEFORE explicit ask / mode bypass (scope wins over
+  //      `bypassPermissions`). Reason variant discriminated by
+  //      `opts.scopeSource`.
+  const scopeDecision = checkScopedAllowlist(toolUse.name, opts)
+  if (scopeDecision !== null) return scopeDecision
 
   // 2. Explicit ask rules
   const askRule = matching.find((r) => r.behavior === 'ask')
@@ -142,6 +133,37 @@ async function runCascade(
 
   // 7. Fallback
   return { behavior: 'ask', reason: { type: 'fallback' } }
+}
+
+// ---------------------------------------------------------------------------
+// Scope check (Phase 5b skill activation, Phase 7a subagent fork)
+//
+// Shared by the cascade (post-resolution, applied to a resolved Tool object)
+// and `authorizeToolUse` (pre-resolution, applied by name only). Pulling this
+// helper out lets the subagent path emit a permission deny *before* the
+// registry resolve step would short-circuit a filtered registry as
+// `tool_not_found`.
+// ---------------------------------------------------------------------------
+
+export function checkScopedAllowlist(
+  toolName: string,
+  opts: PermissionOptions,
+): PermissionDecision | null {
+  if (
+    opts.scopedToolAllowlist === undefined ||
+    opts.scopedToolAllowlist.includes(toolName)
+  ) {
+    return null
+  }
+  const reasonType = opts.scopeSource === 'agent' ? 'agentScope' : 'skillScope'
+  return {
+    behavior: 'deny',
+    reason: {
+      type: reasonType,
+      toolName,
+      allowed: opts.scopedToolAllowlist,
+    },
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +225,8 @@ export function formatDecisionMessage(decision: PermissionDecision): string {
       return `denied in headless mode (original: ${formatDecisionMessage({ behavior: 'ask', reason: reason.original })})`
     case 'skillScope':
       return `tool not in active skill's allowed-tools (allowed: ${reason.allowed.join(', ')})`
+    case 'agentScope':
+      return `tool not in subagent's allowed tools (allowed: ${reason.allowed.join(', ')})`
     case 'fallback':
       return 'no matching rule; requires approval'
   }

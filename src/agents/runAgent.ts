@@ -23,14 +23,11 @@ import type {
   RunPostToolUseHooksFn,
 } from '../core/queryDeps.js'
 import type { SystemPromptPart } from '../context/systemPromptParts.js'
-import type { Message, MessageId } from '../core/messages.js'
+import type { Message, MessageId, ToolUseId } from '../core/messages.js'
 import { createUserMessage, messageId } from '../core/messages.js'
 import type { Store, AppState } from '../core/state.js'
-import { createStore } from '../core/state.js'
 import type { ToolRegistry } from '../core/tools/registry.js'
-import { createToolRegistry } from '../core/tools/registry.js'
 import { createToolUseContext } from '../core/tools/context.js'
-import type { ReadFileState } from '../core/tools/context.js'
 import {
   createAuthorizeToolUseFn,
   createExecuteToolUseFn,
@@ -41,13 +38,35 @@ import { createCompactFn } from '../context/compact.js'
 import { getInitialAttachments } from '../context/attachments.js'
 import { appendMessage, getEventMessage } from '../session/transcript.js'
 import { buildSubagentSystemPrompt } from './agentPrompt.js'
+import { createSandboxContext, buildFilteredRegistry } from './sandboxContext.js'
+
+// Re-export so existing imports of `buildFilteredRegistry` from `runAgent`
+// keep working without churning unrelated tests.
+export { buildFilteredRegistry }
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-/** Function to fork a subagent. Prompt is purely the task description. */
+/**
+ * Tool-facing fork fn — unary; populated per-call by `executeToolUse`,
+ * which binds the parent `ToolUseBlock.id` into the closure so AgentTool
+ * can stay unaware of the correlation plumbing.
+ */
 export type ForkSubagentFn = (prompt: string) => Promise<SubagentResult>
+
+/**
+ * Engine-level fork fn (Phase 7c) — widened with `parentToolUseId` so
+ * subagent audit envelopes can be correlated back to the parent's
+ * `tool_call_started` for the spawning `Agent` block. Stored on the
+ * static `ToolUseContext.engineForkSubagent`; never read by tools
+ * directly — `executeToolUse` rebinds it into the per-call unary
+ * `forkSubagent` view.
+ */
+export type EngineForkSubagentFn = (
+  prompt: string,
+  parentToolUseId: ToolUseId,
+) => Promise<SubagentResult>
 
 export type SubagentOptions = {
   readonly callModel: CallModelFn
@@ -83,55 +102,58 @@ export type SubagentResult = {
 
 export const DEFAULT_ALLOWED_TOOLS = ['FileRead', 'Glob', 'Grep'] as const
 const DEFAULT_MAX_TURNS = 30
-const AGENT_TOOL_NAME = 'Agent'
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /**
- * Create a ForkSubagentFn bound to the given parent context.
+ * Create an EngineForkSubagentFn bound to the given parent context.
  * Each invocation forks an isolated query() call.
+ *
+ * `parentToolUseId` is the `ToolUseBlock.id` of the parent's `Agent`
+ * tool_use that's spawning this subagent. The sandbox stamps it onto
+ * every audit envelope the subagent emits via `withOrigin(subagentId,
+ * { parentToolUseId })`, so a downstream consumer can correlate
+ * subagent events back to the parent-side `tool_call_started`.
  */
-export function createForkSubagent(opts: SubagentOptions): ForkSubagentFn {
-  return async (prompt: string): Promise<SubagentResult> => {
+export function createForkSubagent(opts: SubagentOptions): EngineForkSubagentFn {
+  return async (prompt: string, parentToolUseId: ToolUseId): Promise<SubagentResult> => {
     const subagentId = randomUUID()
     const transcriptDir = join(opts.sessionDir, 'agents', subagentId)
     const maxTurns = opts.maxTurns ?? DEFAULT_MAX_TURNS
     const allowedTools = opts.allowedTools ?? DEFAULT_ALLOWED_TOOLS
 
-    // Linked abort — parent abort cascades to child
-    const abortController = new AbortController()
-    if (opts.parentSignal.aborted) {
-      abortController.abort()
-    }
-    const onParentAbort = () => abortController.abort()
-    opts.parentSignal.addEventListener('abort', onParentAbort, { once: true })
+    // Phase 7a — extract the isolated execution surface (cloned AppState,
+    // fresh ReadFileState, filtered registry, linked abort, scoped
+    // permission opts, origin-tagged audit writer) into one place.
+    // Phase 7c — also threads parentToolUseId so the subagent's audit
+    // envelopes carry parent → child correlation.
+    const sandbox = createSandboxContext({
+      parentAppState: opts.parentAppState,
+      parentToolRegistry: opts.parentToolRegistry,
+      parentSignal: opts.parentSignal,
+      parentPermissionOpts: opts.permissionOpts,
+      parentAuditWriter: opts.auditWriter,
+      allowedTools,
+      subagentId,
+      parentToolUseId,
+    })
 
     try {
-      // Clone AppState for isolation
-      const parentState = opts.parentAppState.getState()
-      const childAppState = createStore<AppState>({ ...parentState })
-
-      // Fresh read file state
-      const readFileState: ReadFileState = new Map()
-
-      // Filtered tool registry — only allowed tools, never Agent
-      const childRegistry = buildFilteredRegistry(
-        opts.parentToolRegistry,
-        allowedTools,
-      )
-
       // Build tool context (no forkSubagent — prevents recursion)
       const toolUseContext = createToolUseContext({
-        appState: childAppState,
-        abortController,
+        appState: sandbox.appState,
+        abortController: sandbox.abortController,
         messages: [],
-        readFileState,
-        toolRegistry: childRegistry,
+        readFileState: sandbox.readFileState,
+        toolRegistry: sandbox.toolRegistry,
       })
 
-      const authorizeToolUse = createAuthorizeToolUseFn(toolUseContext, opts.permissionOpts)
+      // Use the sandbox's permissionOpts so the cascade and the
+      // pre-resolution gate in authorizeToolUse both deny out-of-scope
+      // calls with `agentScope` reason.
+      const authorizeToolUse = createAuthorizeToolUseFn(toolUseContext, sandbox.permissionOpts)
       const executeToolUse = createExecuteToolUseFn(toolUseContext)
       const uuid = (): MessageId => messageId(randomUUID())
 
@@ -156,6 +178,7 @@ export function createForkSubagent(opts: SubagentOptions): ForkSubagentFn {
         runPostToolUseHooks: opts.runPostToolUseHooks,
         compact: createCompactFn(opts.compactCallModel, uuid),
         uuid,
+        toolRegistry: sandbox.toolRegistry,
         // No getAttachments — read-only subagents don't trigger per-turn refreshes
       }
 
@@ -164,15 +187,11 @@ export function createForkSubagent(opts: SubagentOptions): ForkSubagentFn {
         messages,
         systemPromptParts,
         deps,
-        signal: abortController.signal,
+        signal: sandbox.abortController.signal,
         maxTurns,
         thinkingBudget: opts.parentThinkingBudget,
         interleavedThinking: opts.parentInterleavedThinking,
       })
-
-      // Tag every event written from this fork with the subagent id so the
-      // parent's audit log carries origin provenance.
-      const forkWriter = opts.auditWriter.withOrigin(subagentId)
 
       // Collect events, persist transcript, extract final text
       let lastAssistantText = ''
@@ -182,7 +201,7 @@ export function createForkSubagent(opts: SubagentOptions): ForkSubagentFn {
         const event = result.value
 
         // Tee every event into the parent's shared audit log (with origin stamp).
-        forkWriter.write(event)
+        sandbox.auditWriter.write(event)
 
         // Persist persistable messages to subagent transcript
         const msg = getEventMessage(event)
@@ -211,32 +230,7 @@ export function createForkSubagent(opts: SubagentOptions): ForkSubagentFn {
         subagentId,
       }
     } finally {
-      opts.parentSignal.removeEventListener('abort', onParentAbort)
+      sandbox.cleanup()
     }
   }
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Build a filtered tool registry containing only the named tools.
- * Always excludes 'Agent' to prevent recursive subagents.
- */
-function buildFilteredRegistry(
-  parentRegistry: ToolRegistry,
-  allowedTools: readonly string[],
-): ToolRegistry {
-  const filtered = createToolRegistry()
-
-  for (const name of allowedTools) {
-    if (name === AGENT_TOOL_NAME) continue // never allow recursion
-    const tool = parentRegistry.get(name)
-    if (tool) {
-      filtered.register(tool)
-    }
-  }
-
-  return filtered
 }
