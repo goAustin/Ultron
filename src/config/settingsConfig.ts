@@ -30,6 +30,7 @@ import { homedir, platform } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import type { PermissionRule } from '../core/permissions/types.js'
+import type { ShellSandboxSettingsInput } from '../core/sandbox/types.js'
 
 export type SettingsConfig = {
   schemaVersion?: 1
@@ -44,6 +45,7 @@ export type SettingsConfig = {
     denylist?: string[]
   }
   permissionRules?: PermissionRule[]
+  shellSandbox?: ShellSandboxSettingsInput
 }
 
 const SETTINGS_DIR = join(homedir(), '.ultron')
@@ -83,6 +85,11 @@ export function readSettingsConfig(): SettingsConfig {
  * - `webSearch.apiKeys.{brave,tavily}` — spread-merge (writing one preserves the other).
  * - `webPolicy.{allowlist,denylist}` — replace each array if present in partial.
  * - `permissionRules` — replace if present.
+ * - `shellSandbox` — top-level spread-merge so writing
+ *     `{ failIfUnavailable: true }` doesn't erase `enabled`; nested
+ *     `filesystem` and `network` merge per-key so writing
+ *     `filesystem.denyWrite` keeps a previously-written
+ *     `filesystem.allowWrite`. Arrays at the leaf level still replace.
  * - Top-level keys absent from `partial` are preserved untouched.
  */
 function mergeSettings(prev: SettingsConfig, partial: SettingsConfig): SettingsConfig {
@@ -111,6 +118,28 @@ function mergeSettings(prev: SettingsConfig, partial: SettingsConfig): SettingsC
 
   if (partial.permissionRules !== undefined) {
     next.permissionRules = partial.permissionRules
+  }
+
+  if (partial.shellSandbox !== undefined) {
+    const prevSb = prev.shellSandbox ?? {}
+    const partSb = partial.shellSandbox
+    const merged: NonNullable<SettingsConfig['shellSandbox']> = {
+      ...prevSb,
+      ...partSb,
+    }
+    if (prevSb.filesystem !== undefined || partSb.filesystem !== undefined) {
+      merged.filesystem = {
+        ...(prevSb.filesystem ?? {}),
+        ...(partSb.filesystem ?? {}),
+      }
+    }
+    if (prevSb.network !== undefined || partSb.network !== undefined) {
+      merged.network = {
+        ...(prevSb.network ?? {}),
+        ...(partSb.network ?? {}),
+      }
+    }
+    next.shellSandbox = merged
   }
 
   return next

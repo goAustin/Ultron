@@ -3,6 +3,8 @@
  * No external dependencies.
  */
 
+import { defaultShellSandboxSettings } from './sandbox/settings.js'
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -55,8 +57,14 @@ export type AppState = {
   readonly permissionMode: PermissionMode
   readonly permissionRules: import('./permissions/types.js').PermissionRule[]
   readonly workingDirectories: readonly string[]
+  readonly shellSandbox: import('./sandbox/types.js').ShellSandboxSettings
 }
 
 export function getDefaultAppState(): AppState {
-  return { permissionMode: 'default', permissionRules: [], workingDirectories: [] }
+  return {
+    permissionMode: 'default',
+    permissionRules: [],
+    workingDirectories: [],
+    shellSandbox: defaultShellSandboxSettings,
+  }
 }

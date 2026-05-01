@@ -119,6 +119,40 @@ describe('settingsConfig', () => {
     expect(typeof got).toBe('object')
   })
 
+  it('round-trips a shellSandbox write', () => {
+    writeSettingsConfig({
+      shellSandbox: {
+        failIfUnavailable: true,
+        filesystem: { denyWrite: ['custom.secret'] },
+      },
+    })
+    const got = readSettingsConfig()
+    expect(got.shellSandbox?.failIfUnavailable).toBe(true)
+    expect(got.shellSandbox?.filesystem?.denyWrite).toEqual(['custom.secret'])
+  })
+
+  it('schema-aware merge: writing shellSandbox.failIfUnavailable preserves previously-set filesystem leaves', () => {
+    writeSettingsConfig({
+      shellSandbox: { filesystem: { denyWrite: ['custom.secret'] } },
+    })
+    writeSettingsConfig({ shellSandbox: { failIfUnavailable: true } })
+    const got = readSettingsConfig()
+    expect(got.shellSandbox?.failIfUnavailable).toBe(true)
+    expect(got.shellSandbox?.filesystem?.denyWrite).toEqual(['custom.secret'])
+  })
+
+  it('schema-aware merge: writing shellSandbox.filesystem.denyWrite preserves filesystem.allowWrite', () => {
+    writeSettingsConfig({
+      shellSandbox: { filesystem: { allowWrite: ['extra/path'] } },
+    })
+    writeSettingsConfig({
+      shellSandbox: { filesystem: { denyWrite: ['custom.secret'] } },
+    })
+    const got = readSettingsConfig()
+    expect(got.shellSandbox?.filesystem?.allowWrite).toEqual(['extra/path'])
+    expect(got.shellSandbox?.filesystem?.denyWrite).toEqual(['custom.secret'])
+  })
+
   it('writing replaces permissionRules entirely (does not append)', () => {
     writeSettingsConfig({
       permissionRules: [

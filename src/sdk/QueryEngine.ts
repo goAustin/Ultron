@@ -28,6 +28,7 @@ import {
 } from '../core/tools/toolExecution.js'
 import { createAuditWriter } from '../audit/auditLog.js'
 import { readSettingsConfig } from '../config/settingsConfig.js'
+import { mergeShellSandboxSettings } from '../core/sandbox/settings.js'
 import {
   validateAndNormalizeRules,
   compileWebPolicy,
@@ -259,11 +260,13 @@ export class QueryEngine {
     const seededRules = validateAndNormalizeRules(settings.permissionRules ?? [])
     const seededFromPolicy = compileWebPolicy(settings.webPolicy)
     const seeded = dedupeRules([...seededRules, ...seededFromPolicy])
+    const seededSandbox = mergeShellSandboxSettings(settings.shellSandbox)
 
     const initialState: AppState = {
       ...getDefaultAppState(),
       permissionMode: config.permissionMode ?? 'default',
       workingDirectories: [config.cwd],
+      shellSandbox: seededSandbox,
       ...(seeded.length > 0 && { permissionRules: seeded }),
     }
     this.appState = createStore(initialState)

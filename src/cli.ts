@@ -22,6 +22,7 @@ import { readUserConfig, writeUserConfig } from './config/userConfig.js'
 import { handleMemoryCommand } from './cli/memoryCommand.js'
 import { handleSkillCommand } from './cli/skillsCommand.js'
 import { handleWebCommand } from './cli/webCommand.js'
+import { installEscAbort, type EscAbortController } from './cli/escAbort.js'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -70,8 +71,19 @@ const cwd = process.cwd()
 // Permission approval callback
 // ---------------------------------------------------------------------------
 
+// Set while a query is streaming so the ESC handler can intercept stdin.
+// The wrapped askUser pauses it before delegating to promptForApproval —
+// otherwise the sub-prompt's setRawMode(false) on cleanup would silently
+// disarm us for the rest of the run.
+let escController: EscAbortController | null = null
+
 const askUser: AskUserFn = async (toolName, input, reason, signal) => {
-  return promptForApproval(toolName, input, reason, signal)
+  escController?.pause()
+  try {
+    return await promptForApproval(toolName, input, reason, signal)
+  } finally {
+    escController?.resume()
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +133,7 @@ let rl = createInterface({
   output: process.stdout,
 })
 
-function prompt(): void {
+function prompt(prefill?: string): void {
   rl.question('\n\x1b[36myou>\x1b[0m ', async (input) => {
     const trimmed = input.trim()
     if (!trimmed) {
@@ -303,6 +315,11 @@ function prompt(): void {
     // Fully close readline so raw-mode permission prompts own stdin exclusively
     rl.close()
 
+    // ESC during streaming aborts the agent and re-prompts with the
+    // submitted text pre-filled so the user can revise it.
+    escController = installEscAbort(() => engine.abort())
+
+    let abortRequested = false
     try {
       const gen = engine.submitPrompt(trimmed)
       let result = await gen.next()
@@ -366,12 +383,17 @@ function prompt(): void {
       const terminal = result.value
       if (terminal.reason === 'error') {
         process.stderr.write(`\n\x1b[31m[terminal error: ${terminal.error?.message}]\x1b[0m\n`)
+      } else if (terminal.reason === 'aborted') {
+        abortRequested = true
+        process.stdout.write('\n\x1b[33m[aborted — press Enter to send, or edit]\x1b[0m\n')
       }
 
       process.stdout.write('\n')
     } catch (err) {
       process.stderr.write(`\nError: ${err instanceof Error ? err.message : String(err)}\n`)
     } finally {
+      escController?.detach()
+      escController = null
       // Recreate readline interface for next prompt
       rl = createInterface({
         input: process.stdin,
@@ -379,8 +401,14 @@ function prompt(): void {
       })
     }
 
-    prompt()
+    prompt(abortRequested ? trimmed : undefined)
   })
+  if (prefill !== undefined && prefill.length > 0) {
+    // readline.Interface.write injects characters into the line buffer as if
+    // the user typed them, leaving the cursor at the end. Used after an
+    // aborted run so the user sees their original prompt and can edit it.
+    rl.write(prefill)
+  }
 }
 
 // ---------------------------------------------------------------------------
