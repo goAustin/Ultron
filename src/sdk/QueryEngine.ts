@@ -28,6 +28,7 @@ import {
 } from '../core/tools/toolExecution.js'
 import { createAuditWriter } from '../audit/auditLog.js'
 import { readSettingsConfig } from '../config/settingsConfig.js'
+import { validateComputerUseSettings } from '../config/computerUseSettings.js'
 import { mergeShellSandboxSettings } from '../core/sandbox/settings.js'
 import {
   validateAndNormalizeRules,
@@ -261,6 +262,9 @@ export class QueryEngine {
     const seededFromPolicy = compileWebPolicy(settings.webPolicy)
     const seeded = dedupeRules([...seededRules, ...seededFromPolicy])
     const seededSandbox = mergeShellSandboxSettings(settings.shellSandbox)
+    // v3 Phase 0: validate computerUse so invalid entries warn at startup.
+    // Result is intentionally discarded; Phase 3 will store it for tool gating.
+    validateComputerUseSettings(settings.computerUse)
 
     const initialState: AppState = {
       ...getDefaultAppState(),
@@ -411,6 +415,7 @@ export class QueryEngine {
       supportsThinking: entry.supportsThinking,
       supportsInterleavedThinking: entry.supportsInterleavedThinking,
       promptCacheModel: entry.promptCacheModel,
+      supportsVision: entry.supportsVision,
     }
     return adapter.createCallModel({
       apiKey,
@@ -430,6 +435,7 @@ export class QueryEngine {
       supportsThinking: entry.supportsThinking,
       supportsInterleavedThinking: entry.supportsInterleavedThinking,
       promptCacheModel: entry.promptCacheModel,
+      supportsVision: entry.supportsVision,
     }
   }
 

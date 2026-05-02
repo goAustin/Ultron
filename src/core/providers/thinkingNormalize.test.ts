@@ -12,6 +12,7 @@ const opus: CapabilitySheet = {
   supportsThinking: true,
   supportsInterleavedThinking: true,
   promptCacheModel: 'explicit',
+  supportsVision: true,
 }
 
 const gpt: CapabilitySheet = {
@@ -20,6 +21,7 @@ const gpt: CapabilitySheet = {
   supportsThinking: true,
   supportsInterleavedThinking: false,
   promptCacheModel: 'implicit',
+  supportsVision: true,
 }
 
 const minimax: CapabilitySheet = {
@@ -28,6 +30,7 @@ const minimax: CapabilitySheet = {
   supportsThinking: false,
   supportsInterleavedThinking: false,
   promptCacheModel: 'implicit',
+  supportsVision: false,
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

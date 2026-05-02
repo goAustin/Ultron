@@ -13,6 +13,7 @@ import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
   ChatCompletionChunk,
+  ChatCompletionContentPart,
 } from 'openai/resources/chat/completions.js'
 import type {
   ResponseCreateParamsStreaming,
@@ -54,7 +55,14 @@ type AnthropicBlock =
   | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean }
   | { type: 'thinking'; thinking: string; signature: string }
   | { type: 'redacted_thinking'; data: string }
-  | { type: 'image'; source: unknown }
+  | {
+      type: 'image'
+      source: { type: 'base64'; media_type: string; data: string }
+    }
+
+function imageDataUrl(source: { media_type: string; data: string }): string {
+  return `data:${source.media_type};base64,${source.data}`
+}
 
 type AnthropicMessage = {
   role: 'user' | 'assistant'
@@ -80,30 +88,35 @@ function anthropicToOpenAI(
     const msg = raw as AnthropicMessage
 
     if (msg.role === 'user') {
-      const textParts: string[] = []
-      const toolResults: { tool_call_id: string; content: string }[] = []
-
+      // Chat Completions requires every `tool` response to follow the
+      // assistant tool_calls turn directly — interleaving a `user` message
+      // between tool responses for a multi-call turn is rejected by the API.
+      // So we do two passes: emit all tool responses first, then any user
+      // text/image content. Order within each group is preserved, which keeps
+      // image_A before image_B aligned with tool_A before tool_B for parallel
+      // results.
+      const userContent: ChatCompletionContentPart[] = []
       for (const block of msg.content) {
-        if (block.type === 'text') {
-          textParts.push(block.text)
-        } else if (block.type === 'tool_result') {
-          toolResults.push({
+        if (block.type === 'tool_result') {
+          result.push({
+            role: 'tool',
             tool_call_id: block.tool_use_id,
             content: block.content ?? '',
           })
         }
       }
-
-      for (const tr of toolResults) {
-        result.push({
-          role: 'tool',
-          tool_call_id: tr.tool_call_id,
-          content: tr.content,
-        })
+      for (const block of msg.content) {
+        if (block.type === 'text') {
+          userContent.push({ type: 'text', text: block.text })
+        } else if (block.type === 'image') {
+          userContent.push({
+            type: 'image_url',
+            image_url: { url: imageDataUrl(block.source) },
+          })
+        }
       }
-
-      if (textParts.length > 0) {
-        result.push({ role: 'user', content: textParts.join('\n') })
+      if (userContent.length > 0) {
+        result.push({ role: 'user', content: userContent })
       }
     } else if (msg.role === 'assistant') {
       let textContent = ''
@@ -143,23 +156,41 @@ function anthropicToResponsesInput(messages: unknown[]): ResponseInput {
     const msg = raw as AnthropicMessage
 
     if (msg.role === 'user') {
-      const textParts: string[] = []
+      // Stream-emit. function_call_output is string-only (OpenAI Responses
+      // spec), so an accompanying screenshot must be a sibling user
+      // input_image item — emitted right after the tool_result it belongs to.
+      let pendingText: string[] = []
+      const flushText = () => {
+        if (pendingText.length > 0) {
+          result.push({ role: 'user', content: pendingText.join('\n') })
+          pendingText = []
+        }
+      }
 
       for (const block of msg.content) {
         if (block.type === 'text') {
-          textParts.push(block.text)
+          pendingText.push(block.text)
         } else if (block.type === 'tool_result') {
+          flushText()
           result.push({
             type: 'function_call_output',
             call_id: block.tool_use_id,
             output: block.content ?? '',
           })
+        } else if (block.type === 'image') {
+          flushText()
+          result.push({
+            type: 'message',
+            role: 'user',
+            content: [{
+              type: 'input_image',
+              image_url: imageDataUrl(block.source),
+              detail: 'auto',
+            }],
+          })
         }
       }
-
-      if (textParts.length > 0) {
-        result.push({ role: 'user', content: textParts.join('\n') })
-      }
+      flushText()
     } else if (msg.role === 'assistant') {
       let textContent = ''
 
@@ -617,6 +648,7 @@ const MODELS: readonly ModelEntry[] = [
     supportsThinking: true,
     supportsInterleavedThinking: false,
     promptCacheModel: 'implicit',
+    supportsVision: true,
   },
   {
     id: 'gpt-5.4-mini',
@@ -628,6 +660,7 @@ const MODELS: readonly ModelEntry[] = [
     supportsThinking: true,
     supportsInterleavedThinking: false,
     promptCacheModel: 'implicit',
+    supportsVision: true,
   },
   {
     id: 'gpt-5.4-nano',
@@ -639,6 +672,7 @@ const MODELS: readonly ModelEntry[] = [
     supportsThinking: true,
     supportsInterleavedThinking: false,
     promptCacheModel: 'implicit',
+    supportsVision: true,
   },
 ]
 

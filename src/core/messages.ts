@@ -1,6 +1,8 @@
 // Internal message representation for Ultron.
 // No Anthropic SDK imports — this is the single source of truth for message shape.
 
+import type { ToolResultAttachment } from './tools/imageAttachment.js'
+
 // ---------------------------------------------------------------------------
 // Branded IDs
 // ---------------------------------------------------------------------------
@@ -56,6 +58,13 @@ export type ImageBlock = {
   readonly type: 'image'
   readonly mediaType: string
   readonly data: string // base64
+  // Optional metadata populated by tool-result attachments (v3 Phase 1).
+  // Wire-format adapters (Anthropic, OpenAI) ignore these fields; they
+  // exist so audit redaction can record dimensions without re-parsing
+  // the PNG. See `src/audit/redactImageData.ts`.
+  readonly width?: number
+  readonly height?: number
+  readonly byteSize?: number
 }
 
 export type ContentBlock =
@@ -142,26 +151,47 @@ export function createAssistantMessage(
 }
 
 /**
- * Build a UserMessage containing a single tool_result block
- * paired to the given tool_use.
+ * Build a UserMessage containing a tool_result block paired to the given
+ * tool_use. If `result.attachments` is non-empty, image attachments are
+ * laid down as adjacent `ImageBlock`s in the same UserMessage, immediately
+ * after the `ToolResultBlock`. Resulting content shape:
+ *
+ *   [ToolResultBlock, ImageBlock?, ImageBlock?, ...]
+ *
+ * v3 Phase 1 — see `docs/ultron_v3/v3-phase1-design.md` for why attachments
+ * are siblings of the tool_result rather than nested inside it.
  */
 export function createToolResultMessage(
   toolUse: ToolUseBlock,
-  result: { content: string; isError: boolean },
+  result: {
+    content: string
+    isError: boolean
+    attachments?: readonly ToolResultAttachment[]
+  },
   id: MessageId,
   timestamp?: number,
 ): UserMessage {
-  return createUserMessage(
-    [
-      {
-        type: 'tool_result',
-        toolUseId: toolUse.id,
-        content: result.content,
-        isError: result.isError,
-      },
-    ],
-    { id, timestamp },
-  )
+  const blocks: ContentBlock[] = [
+    {
+      type: 'tool_result',
+      toolUseId: toolUse.id,
+      content: result.content,
+      isError: result.isError,
+    },
+  ]
+  if (result.attachments && result.attachments.length > 0) {
+    for (const att of result.attachments) {
+      blocks.push({
+        type: 'image',
+        mediaType: att.mediaType,
+        data: att.data,
+        width: att.width,
+        height: att.height,
+        byteSize: att.byteSize,
+      })
+    }
+  }
+  return createUserMessage(blocks, { id, timestamp })
 }
 
 /**

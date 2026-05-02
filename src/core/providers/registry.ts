@@ -61,5 +61,6 @@ export function resolveCapabilities(modelId: string): CapabilitySheet {
     supportsThinking: entry.supportsThinking,
     supportsInterleavedThinking: entry.supportsInterleavedThinking,
     promptCacheModel: entry.promptCacheModel,
+    supportsVision: entry.supportsVision,
   }
 }

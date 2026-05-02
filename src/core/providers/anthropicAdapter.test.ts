@@ -1,9 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-import { buildAnthropicSystemField, anthropicAdapter } from './anthropicAdapter.js'
+import { buildAnthropicSystemField, anthropicAdapter, toApiMessages } from './anthropicAdapter.js'
 import type { SystemPromptPart } from '../../context/systemPromptParts.js'
 import type { CapabilitySheet } from './types.js'
 import { __resetWarnOnceForTesting } from './warnOnce.js'
+import { createUserMessage, messageId, toolUseId } from '../messages.js'
+import type { ContentBlock } from '../messages.js'
 
 // Module-level mock state — captured by the vi.mock factory below.
 const messagesStreamSpy = vi.fn()
@@ -23,6 +25,7 @@ const opusCaps: CapabilitySheet = {
   supportsThinking: true,
   supportsInterleavedThinking: true,
   promptCacheModel: 'explicit',
+  supportsVision: true,
 }
 
 const haikuCaps: CapabilitySheet = {
@@ -31,6 +34,7 @@ const haikuCaps: CapabilitySheet = {
   supportsThinking: true,
   supportsInterleavedThinking: false,
   promptCacheModel: 'explicit',
+  supportsVision: true,
 }
 
 // Empty async iterator — neither test reads stream output, only the request shape.
@@ -264,6 +268,28 @@ describe('anthropicAdapter.createCallModel — thinking + interleaved', () => {
       typeof c[0] === 'string' && (c[0] as string).includes('interleavedThinking'),
     )
     expect(warns.length).toBe(1)
+  })
+
+  it('maps image-bearing tool_result messages with adjacent image_block_param (v3 Phase 1)', () => {
+    // Internal user message: [tool_result, image] adjacent — what
+    // createToolResultMessage produces when a tool returns attachments.
+    const blocks: ContentBlock[] = [
+      { type: 'tool_result', toolUseId: toolUseId('tu-1'), content: 'observed', isError: false },
+      { type: 'image', mediaType: 'image/png', data: 'AAAA' },
+    ]
+    const msg = createUserMessage(blocks, { id: messageId('u-1'), timestamp: 1 })
+    const apiMessages = toApiMessages([msg])
+    expect(apiMessages).toHaveLength(1)
+    const content = apiMessages[0]!.content
+    expect(Array.isArray(content)).toBe(true)
+    const arr = content as Array<{ type: string }>
+    expect(arr).toHaveLength(2)
+    expect(arr[0]!.type).toBe('tool_result')
+    expect(arr[1]!.type).toBe('image')
+    const img = arr[1]! as unknown as { source: { type: string; media_type: string; data: string } }
+    expect(img.source.type).toBe('base64')
+    expect(img.source.media_type).toBe('image/png')
+    expect(img.source.data).toBe('AAAA')
   })
 
   it('produces a body byte-identical to pre-1c when thinkingBudget is omitted', async () => {

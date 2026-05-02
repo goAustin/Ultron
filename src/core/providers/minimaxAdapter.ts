@@ -23,6 +23,7 @@ const MODELS: readonly ModelEntry[] = [
     supportsThinking: false,
     supportsInterleavedThinking: false,
     promptCacheModel: 'implicit',
+    supportsVision: false,
   },
 ]
 

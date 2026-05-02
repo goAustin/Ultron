@@ -14,6 +14,7 @@ const REQUIRED_CAPABILITY_FIELDS = [
   'supportsThinking',
   'supportsInterleavedThinking',
   'promptCacheModel',
+  'supportsVision',
 ] as const
 
 export function assertCapabilitiesPopulated(

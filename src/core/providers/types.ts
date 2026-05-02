@@ -24,6 +24,10 @@ export type ModelEntry = {
   readonly supportsThinking: boolean
   readonly supportsInterleavedThinking: boolean
   readonly promptCacheModel: 'explicit' | 'implicit' | 'none'
+  // v3 Phase 1: model can receive image inputs (tool-result screenshots,
+  // user-message images). Phase 3 will gate Computer-Use tool registration
+  // on this. See docs/ultron_v3/v3-phase1-design.md.
+  readonly supportsVision: boolean
 }
 
 export type CapabilitySheet = Pick<
@@ -33,6 +37,7 @@ export type CapabilitySheet = Pick<
   | 'supportsThinking'
   | 'supportsInterleavedThinking'
   | 'promptCacheModel'
+  | 'supportsVision'
 >
 
 export type CreateCallModelOptions = {

@@ -427,6 +427,7 @@ const MODELS: readonly ModelEntry[] = [
     supportsThinking: true,
     supportsInterleavedThinking: true,
     promptCacheModel: 'explicit',
+    supportsVision: true,
   },
   {
     id: 'claude-sonnet-4-6',
@@ -438,6 +439,7 @@ const MODELS: readonly ModelEntry[] = [
     supportsThinking: true,
     supportsInterleavedThinking: true,
     promptCacheModel: 'explicit',
+    supportsVision: true,
   },
   {
     id: 'claude-haiku-4-5-20251001',
@@ -449,6 +451,7 @@ const MODELS: readonly ModelEntry[] = [
     supportsThinking: true,
     supportsInterleavedThinking: false,
     promptCacheModel: 'explicit',
+    supportsVision: true,
   },
 ]
 

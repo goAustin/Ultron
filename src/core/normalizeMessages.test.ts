@@ -44,6 +44,10 @@ function thinking(t: string): ContentBlock {
   return { type: 'thinking', thinking: t, signature: 'sig' }
 }
 
+function image(data: string): ContentBlock {
+  return { type: 'image', mediaType: 'image/png', data }
+}
+
 // ---------------------------------------------------------------------------
 // Step 1: stripMetaMessages
 // ---------------------------------------------------------------------------
@@ -251,6 +255,27 @@ describe('stripStaleThinkingBlocks', () => {
     expect(result[1]!.content).toHaveLength(1)
     expect(result[1]!.content[0]!.type).toBe('text')
   })
+
+  it('preserves thinking when current trajectory contains image-bearing tool_result (v3 Phase 1)', () => {
+    // The user turn between the assistant's tool_use and the next assistant
+    // turn carries [tool_result, image]. Without the image-aware predicate,
+    // the trajectory walk would stop at the image-bearing message and treat
+    // the assistant's thinking as stale.
+    const msgs: Message[] = [
+      user('please observe', 'u0'),
+      assistant([thinking('plan: take screenshot'), toolUse('tu1', 'ComputerObserve')], 'a1'),
+      user([
+        { type: 'tool_result', toolUseId: toolUseId('tu1'), content: 'observed', isError: false },
+        image('AAAA'),
+      ], 'u1'),
+      assistant([text('I see the page.')], 'a2'),
+    ]
+    const result = stripStaleThinkingBlocks(msgs)
+    // Assistant a1's thinking must be preserved — it belongs to the current trajectory.
+    const a1 = result[1]!
+    expect(a1.content[0]!.type).toBe('thinking')
+    expect(a1.content).toHaveLength(2)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -271,6 +296,50 @@ describe('normalizeMessages', () => {
     for (let i = 1; i < result.length; i++) {
       expect(result[i]!.role).not.toBe(result[i - 1]!.role)
     }
+  })
+
+  it('preserves image attachments adjacent to their tool_result through the pipeline (v3 Phase 1)', () => {
+    const msgs: Message[] = [
+      assistant([toolUse('tu1', 'ComputerObserve')], 'a1'),
+      user([
+        { type: 'tool_result', toolUseId: toolUseId('tu1'), content: 'observed', isError: false },
+        image('AAAA'),
+      ], 'u1'),
+    ]
+    const result = normalizeMessages(msgs)
+    expect(result).toHaveLength(2)
+    const userMsg = result[1]!
+    expect(userMsg.role).toBe('user')
+    expect(userMsg.content).toHaveLength(2)
+    expect(userMsg.content[0]!.type).toBe('tool_result')
+    expect(userMsg.content[1]!.type).toBe('image')
+  })
+
+  it('preserves [tr_A, img_A, tr_B, img_B] ordering after enforceRoleAlternation merge (v3 Phase 1)', () => {
+    // Two parallel tool results land in adjacent user messages and merge.
+    const msgs: Message[] = [
+      assistant([toolUse('tu_a', 'ComputerObserve'), toolUse('tu_b', 'ComputerObserve')], 'a1'),
+      user([
+        { type: 'tool_result', toolUseId: toolUseId('tu_a'), content: 'A', isError: false },
+        image('AAAA'),
+      ], 'u1'),
+      user([
+        { type: 'tool_result', toolUseId: toolUseId('tu_b'), content: 'B', isError: false },
+        image('BBBB'),
+      ], 'u2'),
+    ]
+    const result = normalizeMessages(msgs)
+    // Two adjacent user messages merge into one with ordered content.
+    expect(result).toHaveLength(2)
+    const merged = result[1]!
+    expect(merged.role).toBe('user')
+    expect(merged.content).toHaveLength(4)
+    expect(merged.content[0]!.type).toBe('tool_result')
+    expect(merged.content[1]!.type).toBe('image')
+    if (merged.content[1]!.type === 'image') expect(merged.content[1]!.data).toBe('AAAA')
+    expect(merged.content[2]!.type).toBe('tool_result')
+    expect(merged.content[3]!.type).toBe('image')
+    if (merged.content[3]!.type === 'image') expect(merged.content[3]!.data).toBe('BBBB')
   })
 
   it('cleans up pathological input', () => {

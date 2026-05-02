@@ -85,6 +85,7 @@ describe('provider registry', () => {
       supportsThinking: true,
       supportsInterleavedThinking: true,
       promptCacheModel: 'explicit',
+      supportsVision: true,
     })
   })
 

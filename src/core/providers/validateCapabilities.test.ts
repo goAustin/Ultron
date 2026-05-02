@@ -13,6 +13,7 @@ const goodModel: ModelEntry = {
   supportsThinking: false,
   supportsInterleavedThinking: false,
   promptCacheModel: 'implicit',
+  supportsVision: false,
 }
 
 function makeAdapter(id: string, models: readonly ModelEntry[]): ProviderAdapter {
@@ -78,5 +79,23 @@ describe('assertCapabilitiesPopulated', () => {
     expect(caught!.message).toContain('maxOutputTokens')
     expect(caught!.message).toContain('supportsThinking')
     expect(caught!.message).toContain('promptCacheModel')
+  })
+
+  it('throws when supportsVision is missing (v3 Phase 1 capability flag)', () => {
+    const broken: ModelEntry = { ...goodModel, id: 'broken-vision' }
+    delete (broken as unknown as Record<string, unknown>).supportsVision
+    const adapter = makeAdapter('vision-offender', [broken])
+
+    let caught: Error | undefined
+    try {
+      assertCapabilitiesPopulated([adapter])
+    } catch (e) {
+      caught = e as Error
+    }
+
+    expect(caught).toBeDefined()
+    expect(caught!.message).toContain('vision-offender')
+    expect(caught!.message).toContain('broken-vision')
+    expect(caught!.message).toContain('supportsVision')
   })
 })

@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
+import { __setSettingsPathForTest, writeSettingsConfig } from '../config/settingsConfig.js'
 import { QueryEngine } from './QueryEngine.js'
 import type { QueryEngineConfig } from './QueryEngine.js'
 import type { QueryEvent } from '../core/queryEvents.js'
@@ -306,6 +307,37 @@ describe('QueryEngine', () => {
       await withTmpDir(async (cwd) => {
         const engine = new QueryEngine(makeConfig(cwd))
         expect(engine.auditWriter).toBe(nullAuditWriter)
+      })
+    })
+  })
+
+  describe('settings seeding (v3 Phase 0)', () => {
+    // Regression guard: the validator's unit tests prove warn-on-invalid in
+    // isolation, but Phase 0 acceptance is "warns at startup". This test
+    // catches a future refactor that drops the validator call from the
+    // QueryEngine constructor.
+    it('invalid computerUse.enabled warns at construction time and does not throw', async () => {
+      await withTmpDir(async (cwd) => {
+        const settingsPath = join(cwd, 'settings.json')
+        __setSettingsPathForTest(settingsPath)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const stderrSpy: any = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+        try {
+          // Cast through unknown to bypass the input type — we're testing
+          // runtime defensiveness against bad JSON, which the type system
+          // would otherwise refuse to express.
+          writeSettingsConfig({ computerUse: { enabled: 'yes' as unknown as boolean } })
+
+          expect(() => new QueryEngine(makeConfig(cwd))).not.toThrow()
+
+          const warned = stderrSpy.mock.calls.some((c: unknown[]) =>
+            String(c[0]).startsWith('[ultron] settings.json: computerUse.enabled'),
+          )
+          expect(warned).toBe(true)
+        } finally {
+          stderrSpy.mockRestore()
+          __setSettingsPathForTest(null)
+        }
       })
     })
   })

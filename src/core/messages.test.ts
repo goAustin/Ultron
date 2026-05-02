@@ -83,6 +83,105 @@ describe('createToolResultMessage', () => {
       expect(block.isError).toBe(false)
     }
   })
+
+  it('preserves single-block content shape when attachments is undefined', () => {
+    const toolUse: ToolUseBlock = {
+      type: 'tool_use',
+      id: toolUseId('tu-undef'),
+      name: 'Bash',
+      input: {},
+    }
+    const msg = createToolResultMessage(
+      toolUse,
+      { content: 'ok', isError: false },
+      messageId('tr-undef'),
+    )
+    expect(msg.content).toHaveLength(1)
+    expect(msg.content[0]!.type).toBe('tool_result')
+  })
+
+  it('preserves single-block content shape when attachments is empty', () => {
+    const toolUse: ToolUseBlock = {
+      type: 'tool_use',
+      id: toolUseId('tu-empty'),
+      name: 'Bash',
+      input: {},
+    }
+    const msg = createToolResultMessage(
+      toolUse,
+      { content: 'ok', isError: false, attachments: [] },
+      messageId('tr-empty'),
+    )
+    expect(msg.content).toHaveLength(1)
+    expect(msg.content[0]!.type).toBe('tool_result')
+  })
+
+  it('lays one attachment down as an adjacent ImageBlock after the ToolResultBlock', () => {
+    const toolUse: ToolUseBlock = {
+      type: 'tool_use',
+      id: toolUseId('tu-2'),
+      name: 'ComputerObserve',
+      input: {},
+    }
+    const msg = createToolResultMessage(
+      toolUse,
+      {
+        content: 'observed',
+        isError: false,
+        attachments: [{
+          type: 'image',
+          mediaType: 'image/png',
+          data: 'AAAA',
+          width: 100,
+          height: 50,
+          byteSize: 3,
+        }],
+      },
+      messageId('tr-2'),
+    )
+    expect(msg.content).toHaveLength(2)
+    expect(msg.content[0]!.type).toBe('tool_result')
+    const img = msg.content[1]!
+    expect(img.type).toBe('image')
+    if (img.type === 'image') {
+      expect(img.mediaType).toBe('image/png')
+      expect(img.data).toBe('AAAA')
+      // Dimensions/byteSize are forwarded so audit redaction can record them
+      // without re-parsing the PNG.
+      expect(img.width).toBe(100)
+      expect(img.height).toBe(50)
+      expect(img.byteSize).toBe(3)
+    }
+  })
+
+  it('lays multiple attachments down in order', () => {
+    const toolUse: ToolUseBlock = {
+      type: 'tool_use',
+      id: toolUseId('tu-3'),
+      name: 'ComputerObserve',
+      input: {},
+    }
+    const msg = createToolResultMessage(
+      toolUse,
+      {
+        content: 'observed',
+        isError: false,
+        attachments: [
+          { type: 'image', mediaType: 'image/png', data: 'A', width: 1, height: 1, byteSize: 1 },
+          { type: 'image', mediaType: 'image/png', data: 'B', width: 2, height: 2, byteSize: 1 },
+          { type: 'image', mediaType: 'image/png', data: 'C', width: 3, height: 3, byteSize: 1 },
+        ],
+      },
+      messageId('tr-3'),
+    )
+    expect(msg.content).toHaveLength(4)
+    expect(msg.content[0]!.type).toBe('tool_result')
+    expect(msg.content[1]!.type).toBe('image')
+    expect(msg.content[2]!.type).toBe('image')
+    expect(msg.content[3]!.type).toBe('image')
+    const datas = msg.content.slice(1).map(b => (b.type === 'image' ? b.data : ''))
+    expect(datas).toEqual(['A', 'B', 'C'])
+  })
 })
 
 describe('createErrorToolResult', () => {

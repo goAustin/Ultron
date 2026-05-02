@@ -153,6 +153,35 @@ describe('settingsConfig', () => {
     expect(got.shellSandbox?.filesystem?.denyWrite).toEqual(['custom.secret'])
   })
 
+  it('round-trips a computerUse write', () => {
+    writeSettingsConfig({
+      computerUse: {
+        enabled: true,
+        allowedDomains: ['example.com'],
+        viewport: { width: 1280, height: 720 },
+      },
+    })
+    const got = readSettingsConfig()
+    expect(got.computerUse?.enabled).toBe(true)
+    expect(got.computerUse?.allowedDomains).toEqual(['example.com'])
+    expect(got.computerUse?.viewport).toEqual({ width: 1280, height: 720 })
+  })
+
+  it('schema-aware merge: writing computerUse.viewport.width preserves a previously-written maxSteps', () => {
+    writeSettingsConfig({ computerUse: { maxSteps: 50 } })
+    writeSettingsConfig({ computerUse: { viewport: { width: 1280 } } })
+    const got = readSettingsConfig()
+    expect(got.computerUse?.maxSteps).toBe(50)
+    expect(got.computerUse?.viewport?.width).toBe(1280)
+  })
+
+  it('schema-aware merge: writing computerUse.viewport.width preserves previously-written viewport.height', () => {
+    writeSettingsConfig({ computerUse: { viewport: { height: 800 } } })
+    writeSettingsConfig({ computerUse: { viewport: { width: 1280 } } })
+    const got = readSettingsConfig()
+    expect(got.computerUse?.viewport).toEqual({ width: 1280, height: 800 })
+  })
+
   it('writing replaces permissionRules entirely (does not append)', () => {
     writeSettingsConfig({
       permissionRules: [

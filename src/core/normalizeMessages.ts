@@ -158,11 +158,19 @@ export function stripStaleThinkingBlocks(messages: readonly Message[]): Message[
 
   // Find the start of the current trajectory: walk backwards from
   // lastAssistantIdx through alternating tool_result(user)/assistant pairs.
+  // A "tool-result user message" may also carry adjacent `image` blocks
+  // (v3 Phase 1 — screenshot attachments laid down by createToolResultMessage),
+  // so the predicate accepts tool_result + image, requiring at least one
+  // tool_result so plain image-only user turns don't extend the trajectory.
   let trajectoryStart = lastAssistantIdx
   if (trajectoryStart > 0) {
     for (let i = lastAssistantIdx - 1; i >= 0; i--) {
       const msg = messages[i]!
-      if (msg.role === 'user' && msg.content.every((b) => b.type === 'tool_result')) {
+      const isToolResultMessage =
+        msg.role === 'user'
+        && msg.content.some((b) => b.type === 'tool_result')
+        && msg.content.every((b) => b.type === 'tool_result' || b.type === 'image')
+      if (isToolResultMessage) {
         trajectoryStart = i
         // Check if there's an assistant message before this tool_result
         if (i > 0 && messages[i - 1]!.role === 'assistant') {

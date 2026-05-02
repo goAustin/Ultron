@@ -4,6 +4,9 @@
  */
 
 import type { ToolUseContext } from './context.js'
+import type { ToolResultAttachment } from './imageAttachment.js'
+
+export type { ToolResultAttachment } from './imageAttachment.js'
 
 // ---------------------------------------------------------------------------
 // JSON Schema for tool inputs (always type: 'object')
@@ -33,6 +36,13 @@ export type ToolResult = {
   readonly content: string
   readonly isError: boolean
   readonly errorKind?: ToolErrorKind
+  /**
+   * Image attachments emitted alongside the text content. v3 Phase 1 lays
+   * these down as adjacent `ImageBlock`s in the same `UserMessage` that
+   * carries the `ToolResultBlock`. See `src/core/tools/imageAttachment.ts`
+   * for the validator and `docs/ultron_v3/v3-phase1-design.md`.
+   */
+  readonly attachments?: readonly ToolResultAttachment[]
 }
 
 export type ToolErrorKind =

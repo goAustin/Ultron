@@ -32,6 +32,31 @@ import { dirname, join } from 'node:path'
 import type { PermissionRule } from '../core/permissions/types.js'
 import type { ShellSandboxSettingsInput } from '../core/sandbox/types.js'
 
+/**
+ * Loose, all-optional shape for the `computerUse` section of settings.json
+ * (v3 Phase 0). Validation and defaulting live in
+ * `src/config/computerUseSettings.ts`. Fields mirror the v3 plan's example
+ * block (`docs/ultron_v3/v3-computer-use-plan.md:470-491`).
+ */
+export type ComputerUseSettingsInput = {
+  enabled?: boolean
+  defaultEnvironment?: 'browser' | 'desktop'
+  viewport?: { width?: number; height?: number }
+  displaySize?: { width?: number; height?: number }
+  maxSteps?: number
+  maxDurationMs?: number
+  maxScreenshotBytes?: number
+  maxScreenshotDimensions?: { width?: number; height?: number }
+  ariaSnapshotMaxTokens?: number
+  allowedDomains?: string[]
+  deniedDomains?: string[]
+  persistProfiles?: boolean
+  allowDownloads?: boolean
+  allowUploads?: boolean
+  allowAuthHandoff?: boolean
+  debugPersistScreenshots?: boolean
+}
+
 export type SettingsConfig = {
   schemaVersion?: 1
   webSearch?: {
@@ -46,6 +71,7 @@ export type SettingsConfig = {
   }
   permissionRules?: PermissionRule[]
   shellSandbox?: ShellSandboxSettingsInput
+  computerUse?: ComputerUseSettingsInput
 }
 
 const SETTINGS_DIR = join(homedir(), '.ultron')
@@ -90,6 +116,10 @@ export function readSettingsConfig(): SettingsConfig {
  *     `filesystem` and `network` merge per-key so writing
  *     `filesystem.denyWrite` keeps a previously-written
  *     `filesystem.allowWrite`. Arrays at the leaf level still replace.
+ * - `computerUse` — same shape as `shellSandbox`: top-level spread-merge,
+ *     nested `viewport`, `displaySize`, and `maxScreenshotDimensions` merge
+ *     per-key so writing `viewport.width` doesn't erase `viewport.height`.
+ *     Arrays (`allowedDomains`, `deniedDomains`) replace.
  * - Top-level keys absent from `partial` are preserved untouched.
  */
 function mergeSettings(prev: SettingsConfig, partial: SettingsConfig): SettingsConfig {
@@ -140,6 +170,34 @@ function mergeSettings(prev: SettingsConfig, partial: SettingsConfig): SettingsC
       }
     }
     next.shellSandbox = merged
+  }
+
+  if (partial.computerUse !== undefined) {
+    const prevCu = prev.computerUse ?? {}
+    const partCu = partial.computerUse
+    const merged: ComputerUseSettingsInput = { ...prevCu, ...partCu }
+    if (prevCu.viewport !== undefined || partCu.viewport !== undefined) {
+      merged.viewport = {
+        ...(prevCu.viewport ?? {}),
+        ...(partCu.viewport ?? {}),
+      }
+    }
+    if (prevCu.displaySize !== undefined || partCu.displaySize !== undefined) {
+      merged.displaySize = {
+        ...(prevCu.displaySize ?? {}),
+        ...(partCu.displaySize ?? {}),
+      }
+    }
+    if (
+      prevCu.maxScreenshotDimensions !== undefined ||
+      partCu.maxScreenshotDimensions !== undefined
+    ) {
+      merged.maxScreenshotDimensions = {
+        ...(prevCu.maxScreenshotDimensions ?? {}),
+        ...(partCu.maxScreenshotDimensions ?? {}),
+      }
+    }
+    next.computerUse = merged
   }
 
   return next

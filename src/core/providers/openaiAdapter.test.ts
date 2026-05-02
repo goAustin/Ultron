@@ -5,9 +5,12 @@ import {
   bucketReasoningEffort,
   createOpenAICompatibleCallModel,
 } from './openaiAdapter.js'
+import { toApiMessages } from './anthropicAdapter.js'
 import type { SystemPromptPart } from '../../context/systemPromptParts.js'
 import type { CapabilitySheet } from './types.js'
 import { __resetWarnOnceForTesting } from './warnOnce.js'
+import { createUserMessage, messageId, toolUseId } from '../messages.js'
+import type { ContentBlock } from '../messages.js'
 
 const chatCreateSpy = vi.fn()
 const responsesCreateSpy = vi.fn()
@@ -26,6 +29,7 @@ const gptCaps: CapabilitySheet = {
   supportsThinking: true,
   supportsInterleavedThinking: false,
   promptCacheModel: 'implicit',
+  supportsVision: true,
 }
 
 const minimaxCaps: CapabilitySheet = {
@@ -34,6 +38,7 @@ const minimaxCaps: CapabilitySheet = {
   supportsThinking: false,
   supportsInterleavedThinking: false,
   promptCacheModel: 'implicit',
+  supportsVision: false,
 }
 
 function emptyAsyncIter(): AsyncIterable<never> {
@@ -219,6 +224,168 @@ describe('createOpenAICompatibleCallModel — thinking translation', () => {
     const body = responsesCreateSpy.mock.calls[0]![0]
     expect(body.reasoning).toBeUndefined()
     expect(stderrSpy).not.toHaveBeenCalled()
+  })
+
+  it('Responses: maps image-bearing tool_result with adjacent input_image user message (v3 Phase 1)', async () => {
+    const blocks: ContentBlock[] = [
+      { type: 'tool_result', toolUseId: toolUseId('call_obs'), content: 'observed', isError: false },
+      { type: 'image', mediaType: 'image/png', data: 'AAAA' },
+    ]
+    const msg = createUserMessage(blocks, { id: messageId('u-img'), timestamp: 1 })
+    const apiMessages = toApiMessages([msg])
+
+    const callModel = createOpenAICompatibleCallModel({
+      apiKey: 'k',
+      model: 'gpt-5.4',
+      capabilities: gptCaps,
+    })
+    await drain({
+      [Symbol.asyncIterator]: () => callModel(
+        apiMessages,
+        [{ content: 'preamble' }],
+        {},
+        new AbortController().signal,
+      ),
+    })
+
+    const body = responsesCreateSpy.mock.calls[0]![0]
+    const input = body.input as Array<Record<string, unknown>>
+    expect(input).toHaveLength(2)
+    // function_call_output emitted first (string-only output).
+    expect(input[0]!.type).toBe('function_call_output')
+    expect(input[0]!.call_id).toBe('call_obs')
+    expect(input[0]!.output).toBe('observed')
+    // input_image follows as a sibling user message, with required `detail`.
+    expect(input[1]!.type).toBe('message')
+    expect(input[1]!.role).toBe('user')
+    const imgContent = input[1]!.content as Array<Record<string, unknown>>
+    expect(imgContent).toHaveLength(1)
+    expect(imgContent[0]!.type).toBe('input_image')
+    expect(imgContent[0]!.image_url).toBe('data:image/png;base64,AAAA')
+    expect(imgContent[0]!.detail).toBe('auto')
+  })
+
+  it('Responses: keeps parallel tool_results inline-ordered with their images', async () => {
+    // Simulates `[tr_A, img_A, tr_B, img_B]` — what enforceRoleAlternation
+    // produces when two parallel tool runs land in adjacent user messages.
+    const blocks: ContentBlock[] = [
+      { type: 'tool_result', toolUseId: toolUseId('call_a'), content: 'A', isError: false },
+      { type: 'image', mediaType: 'image/png', data: 'AAAA' },
+      { type: 'tool_result', toolUseId: toolUseId('call_b'), content: 'B', isError: false },
+      { type: 'image', mediaType: 'image/png', data: 'BBBB' },
+    ]
+    const msg = createUserMessage(blocks, { id: messageId('u-par'), timestamp: 1 })
+    const apiMessages = toApiMessages([msg])
+
+    const callModel = createOpenAICompatibleCallModel({
+      apiKey: 'k',
+      model: 'gpt-5.4',
+      capabilities: gptCaps,
+    })
+    await drain({
+      [Symbol.asyncIterator]: () => callModel(
+        apiMessages,
+        [{ content: 'preamble' }],
+        {},
+        new AbortController().signal,
+      ),
+    })
+
+    const body = responsesCreateSpy.mock.calls[0]![0]
+    const input = body.input as Array<Record<string, unknown>>
+    expect(input).toHaveLength(4)
+    expect(input[0]!.type).toBe('function_call_output')
+    expect(input[0]!.call_id).toBe('call_a')
+    expect(input[1]!.type).toBe('message')
+    const imgA = (input[1]!.content as Array<Record<string, unknown>>)[0]!
+    expect(imgA.image_url).toBe('data:image/png;base64,AAAA')
+    expect(input[2]!.type).toBe('function_call_output')
+    expect(input[2]!.call_id).toBe('call_b')
+    expect(input[3]!.type).toBe('message')
+    const imgB = (input[3]!.content as Array<Record<string, unknown>>)[0]!
+    expect(imgB.image_url).toBe('data:image/png;base64,BBBB')
+  })
+
+  it('Chat Completions: emits all tool responses before user image messages for parallel results (v3 Phase 1)', async () => {
+    // Chat Completions requires tool responses to follow assistant tool_calls
+    // directly — interleaving a user message between them is invalid. The
+    // adapter must emit all tool messages first, then user images.
+    const blocks: ContentBlock[] = [
+      { type: 'tool_result', toolUseId: toolUseId('call_a'), content: 'A', isError: false },
+      { type: 'image', mediaType: 'image/png', data: 'AAAA' },
+      { type: 'tool_result', toolUseId: toolUseId('call_b'), content: 'B', isError: false },
+      { type: 'image', mediaType: 'image/png', data: 'BBBB' },
+    ]
+    const msg = createUserMessage(blocks, { id: messageId('u-par-chat'), timestamp: 1 })
+    const apiMessages = toApiMessages([msg])
+
+    const callModel = createOpenAICompatibleCallModel({
+      apiKey: 'k',
+      model: 'minimax-vision',
+      baseUrl: 'https://example.test/v1',
+      capabilities: minimaxCaps,
+    })
+    await drain({
+      [Symbol.asyncIterator]: () => callModel(
+        apiMessages,
+        [{ content: 'preamble' }],
+        {},
+        new AbortController().signal,
+      ),
+    })
+
+    const body = chatCreateSpy.mock.calls[0]![0]
+    const messages = body.messages as Array<Record<string, unknown>>
+    // [system, tool(A), tool(B), user(img_A, img_B)] — both tool responses
+    // first, image-to-tool order preserved by sequence within each group.
+    expect(messages).toHaveLength(4)
+    expect(messages[0]!.role).toBe('system')
+    expect(messages[1]!.role).toBe('tool')
+    expect(messages[1]!.tool_call_id).toBe('call_a')
+    expect(messages[2]!.role).toBe('tool')
+    expect(messages[2]!.tool_call_id).toBe('call_b')
+    expect(messages[3]!.role).toBe('user')
+    const imgs = messages[3]!.content as Array<Record<string, unknown>>
+    expect(imgs).toHaveLength(2)
+    expect((imgs[0]!.image_url as Record<string, unknown>).url).toBe('data:image/png;base64,AAAA')
+    expect((imgs[1]!.image_url as Record<string, unknown>).url).toBe('data:image/png;base64,BBBB')
+  })
+
+  it('Chat Completions: maps image_url alongside text in the same user message (v3 Phase 1)', async () => {
+    // Plain user message with an image — exercises the user-content branch.
+    const blocks: ContentBlock[] = [
+      { type: 'text', text: 'check this out' },
+      { type: 'image', mediaType: 'image/png', data: 'AAAA' },
+    ]
+    const msg = createUserMessage(blocks, { id: messageId('u-chat'), timestamp: 1 })
+    const apiMessages = toApiMessages([msg])
+
+    const callModel = createOpenAICompatibleCallModel({
+      apiKey: 'k',
+      model: 'minimax-vision',
+      baseUrl: 'https://example.test/v1',
+      capabilities: minimaxCaps,
+    })
+    await drain({
+      [Symbol.asyncIterator]: () => callModel(
+        apiMessages,
+        [{ content: 'preamble' }],
+        {},
+        new AbortController().signal,
+      ),
+    })
+
+    const body = chatCreateSpy.mock.calls[0]![0]
+    // Skip the system message; the user message is at index 1.
+    const userMsg = body.messages[1] as { role: string; content: unknown[] }
+    expect(userMsg.role).toBe('user')
+    expect(Array.isArray(userMsg.content)).toBe(true)
+    expect(userMsg.content).toHaveLength(2)
+    expect(userMsg.content[0]).toEqual({ type: 'text', text: 'check this out' })
+    expect(userMsg.content[1]).toEqual({
+      type: 'image_url',
+      image_url: { url: 'data:image/png;base64,AAAA' },
+    })
   })
 
   it('sends function tools through Responses and converts streamed calls to tool_use events', async () => {

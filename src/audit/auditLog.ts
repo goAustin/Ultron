@@ -19,6 +19,7 @@ import type { QueryEvent } from '../core/queryEvents.js'
 import type { ToolUseId } from '../core/messages.js'
 import type { AuditWriter, AuditWriterOptions } from './types.js'
 import { redactSecrets } from '../memory/redact.js'
+import { redactImageData } from './redactImageData.js'
 
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 const DEFAULT_KEEP = 5
@@ -144,12 +145,15 @@ function serialize(
     ? (event as { timestamp: number }).timestamp
     : Date.now()
 
+  // v3 Phase 1: strip raw image bytes before secret redaction so the audit
+  // log carries metadata-only image summaries, not 2 MB base64 blobs.
+  const stripped = redactImageData(event)
   const envelope: Record<string, unknown> = {
     schemaVersion: SCHEMA_VERSION,
     tsIso: new Date(timestamp).toISOString(),
     ...(origin !== undefined && { origin }),
     ...(parentToolUseId !== undefined && { parentToolUseId }),
-    ...(redactSecrets(event) as Record<string, unknown>),
+    ...(redactSecrets(stripped) as Record<string, unknown>),
   }
 
   return JSON.stringify(envelope) + '\n'
