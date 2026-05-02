@@ -5,11 +5,15 @@ import {
   type ComputerUseSettings,
 } from '../../config/computerUseSettings.js'
 
+import type { AriaTreeSnapshot, BoundingBox } from './ariaSnapshot.js'
+
 import { SessionManager, type BrowserSessionFactory } from './sessionManager.js'
 import {
   BrowserSessionError,
   type BrowserSession,
   type ComputerSessionId,
+  type MouseButton,
+  type NormalizedPoint,
   type ScreenshotResult,
 } from './types.js'
 
@@ -17,6 +21,7 @@ class FakeBrowserSession implements BrowserSession {
   readonly id: ComputerSessionId
   readonly viewport = { width: 1024, height: 768, deviceScaleFactor: 1 }
   readonly displaySize = { width: 1024, height: 768 }
+  readonly headless = true
   closeCalls = 0
   navCalls = 0
   private _closed = false
@@ -44,6 +49,27 @@ class FakeBrowserSession implements BrowserSession {
   async close(): Promise<void> {
     this.closeCalls++
     this._closed = true
+  }
+  async click(_p: NormalizedPoint, _b: MouseButton, _s: AbortSignal): Promise<void> {}
+  async doubleClick(_p: NormalizedPoint, _b: MouseButton, _s: AbortSignal): Promise<void> {}
+  async typeText(_t: string, _s: AbortSignal): Promise<void> {}
+  async pressKey(_k: string, _s: AbortSignal): Promise<void> {}
+  async scroll(_p: NormalizedPoint | null, _dx: number, _dy: number, _s: AbortSignal): Promise<void> {}
+  async drag(_f: NormalizedPoint, _t: NormalizedPoint, _s: AbortSignal): Promise<void> {}
+  async ariaSnapshot(_s: AbortSignal): Promise<AriaTreeSnapshot> {
+    throw new Error('not exercised in this test')
+  }
+  lastAriaSnapshot(): AriaTreeSnapshot | null {
+    return null
+  }
+  async getSensitiveRegions(
+    _extraSelectors: readonly string[],
+    _signal: AbortSignal,
+  ): Promise<readonly BoundingBox[]> {
+    return []
+  }
+  async exportStorageState(_signal: AbortSignal): Promise<unknown> {
+    return {}
   }
 }
 

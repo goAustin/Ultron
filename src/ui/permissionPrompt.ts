@@ -4,13 +4,34 @@
  * - formatApprovalPrompt() is pure (returns a string)
  * - promptForApproval() handles raw-mode terminal I/O with arrow-key selector
  * - TerminalIO is injectable for testability
+ *
+ * Phase 4·1 widened the signature with optional `opts.metadata` (Computer-Use
+ * `SafetyMetadata`) and `opts.sessionLookup` (so the Computer branch can
+ * render the current URL without parsing the reason string). Both are
+ * optional — non-Computer call sites pass nothing and get the existing render.
  */
+
+import type { SafetyMetadata } from '../core/permissions/types.js'
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 export type ApprovalAction = 'allow_once' | 'deny_once' | 'allow_by_rule' | 'abort'
+
+/**
+ * Look up display information for a Computer-Use session id. Returned
+ * synchronously because the prompt formatter is sync. Returns `null` when
+ * the session has been closed or the id is unknown.
+ */
+export type SessionLookup = (
+  sessionId: string,
+) => { readonly url: string | null; readonly title: string | null } | null
+
+export type FormatApprovalPromptOpts = {
+  readonly metadata?: SafetyMetadata
+  readonly sessionLookup?: SessionLookup
+}
 
 /** Injectable terminal I/O for testability. */
 export type TerminalIO = {
@@ -38,35 +59,57 @@ const MAX_INPUT_DISPLAY = 120
 /**
  * Format the approval prompt header. Pure function — no I/O.
  * Does NOT include the selector options (those are rendered by promptForApproval).
+ *
+ * Phase 4·1: optional `opts.metadata` and `opts.sessionLookup` enable the
+ * Computer-tool branch to render risk level + URL + nearby text without
+ * parsing the reason string.
  */
 export function formatApprovalPrompt(
   toolName: string,
   input: Record<string, unknown>,
   reason: string,
+  opts?: FormatApprovalPromptOpts,
 ): string {
   const lines: string[] = [
     '─── Permission Required ───',
-    `Tool:   ${toolName}`,
+    `Tool:    ${toolName}`,
   ]
 
-  const inputDisplay = formatInputDisplay(toolName, input)
+  const inputDisplay = formatInputDisplay(toolName, input, opts)
   if (inputDisplay) {
     lines.push(inputDisplay)
   }
 
-  lines.push(`Reason: ${reason}`)
+  // Computer-Use branch: render risk-level + nearby-text on dedicated lines
+  // (the reason string is still appended below as the audit-trail line).
+  if (toolName.startsWith('Computer') && opts?.metadata !== undefined) {
+    const m = opts.metadata
+    lines.push(`Risk:    level ${m.riskLevel} (${m.riskCategory})`)
+    if (m.evidence?.nearbyText !== undefined) {
+      lines.push(`Target:  «${truncate(m.evidence.nearbyText, MAX_INPUT_DISPLAY)}»`)
+    }
+    if (m.evidence?.fieldType !== undefined) {
+      lines.push(`Field:   ${m.evidence.fieldType}`)
+    }
+  }
+
+  lines.push(`Reason:  ${reason}`)
 
   return lines.join('\n')
 }
 
-function formatInputDisplay(toolName: string, input: Record<string, unknown>): string | null {
+function formatInputDisplay(
+  toolName: string,
+  input: Record<string, unknown>,
+  opts?: FormatApprovalPromptOpts,
+): string | null {
   if (FILE_TOOLS.has(toolName) && typeof input.file_path === 'string') {
-    return `Path:   ${input.file_path}`
+    return `Path:    ${input.file_path}`
   }
 
   if (toolName === 'Bash' && typeof input.command === 'string') {
     const cmd = truncate(input.command, MAX_INPUT_DISPLAY)
-    return `Cmd:    ${cmd}`
+    return `Cmd:     ${cmd}`
   }
 
   if ((toolName === 'Grep' || toolName === 'Glob') && typeof input.pattern === 'string') {
@@ -74,13 +117,87 @@ function formatInputDisplay(toolName: string, input: Record<string, unknown>): s
     return `Pattern: ${truncate(input.pattern + path, MAX_INPUT_DISPLAY)}`
   }
 
+  // Phase 4·1 — Computer-Use branch
+  if (toolName.startsWith('Computer') && typeof input.sessionId === 'string') {
+    return formatComputerActionDisplay(toolName, input, opts?.sessionLookup)
+  }
+
   // Generic fallback
   const json = JSON.stringify(input)
   if (json !== '{}') {
-    return `Input:  ${truncate(json, MAX_INPUT_DISPLAY)}`
+    return `Input:   ${truncate(json, MAX_INPUT_DISPLAY)}`
   }
 
   return null
+}
+
+function formatComputerActionDisplay(
+  toolName: string,
+  input: Record<string, unknown>,
+  sessionLookup?: SessionLookup,
+): string {
+  const sessionId = input.sessionId as string
+  const shortId = sessionId.length > 8 ? `${sessionId.slice(0, 8)}…` : sessionId
+  const lookup = sessionLookup?.(sessionId) ?? null
+  const sessionLine =
+    lookup?.url !== null && lookup?.url !== undefined
+      ? `Session: ${shortId} → ${lookup.url}`
+      : `Session: ${shortId}`
+  const actionSummary = computerActionSummary(toolName, input)
+  return actionSummary !== null ? `${sessionLine}\nAction:  ${actionSummary}` : sessionLine
+}
+
+/**
+ * One-line summary of a Computer-tool action, derived from its input. Shared
+ * between the approval prompt (Phase 4·1) and the watch-mode renderer
+ * (Phase 4·3) so both surfaces describe the same action identically.
+ */
+export function computerActionSummary(toolName: string, input: Record<string, unknown>): string | null {
+  switch (toolName) {
+    case 'ComputerNavigate':
+      return typeof input.url === 'string' ? `navigate(${truncate(input.url, MAX_INPUT_DISPLAY)})` : null
+    case 'ComputerClick':
+    case 'ComputerDoubleClick': {
+      const verb = toolName === 'ComputerDoubleClick' ? 'double-click' : 'click'
+      if (typeof input.x === 'number' && typeof input.y === 'number') {
+        const button = typeof input.button === 'string' ? input.button : 'left'
+        return `${verb}(${input.x.toFixed(2)}, ${input.y.toFixed(2)}) — ${button} button`
+      }
+      return verb
+    }
+    case 'ComputerType': {
+      if (typeof input.text === 'string') {
+        const txt =
+          input.sensitive === true
+            ? `<redacted ${input.text.length} chars>`
+            : truncate(input.text, MAX_INPUT_DISPLAY)
+        return `type(${txt})`
+      }
+      return 'type'
+    }
+    case 'ComputerKey':
+      return typeof input.key === 'string' ? `key(${input.key})` : 'key'
+    case 'ComputerScroll':
+      return `scroll(dx=${input.deltaX ?? 0}, dy=${input.deltaY ?? 0})`
+    case 'ComputerDrag':
+      return typeof input.fromX === 'number' && typeof input.toX === 'number'
+        ? `drag(${input.fromX}, ${input.fromY}) → (${input.toX}, ${input.toY})`
+        : 'drag'
+    case 'ComputerHandoffToUser':
+      return typeof input.message === 'string' ? `handoff: ${truncate(input.message, MAX_INPUT_DISPLAY)}` : 'handoff'
+    case 'ComputerStop':
+      return 'stop session'
+    case 'ComputerObserve':
+      return 'observe (capture screenshot + ARIA)'
+    case 'ComputerWait':
+      return typeof input.ms === 'number' ? `wait(${input.ms}ms)` : 'wait'
+    case 'ComputerStart':
+      return typeof input.headless === 'boolean'
+        ? `start session (headless: ${input.headless})`
+        : 'start session'
+    default:
+      return null
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +210,9 @@ function formatInputDisplay(toolName: string, input: Record<string, unknown>): s
  * Default selection is "Deny once" (index 0 — safe default).
  *
  * @param io - Injectable terminal I/O. Defaults to process.stdin/stdout.
+ * @param opts - Phase 4·1 — optional `metadata` (forwarded to
+ *   `formatApprovalPrompt` for rich Computer rendering) and `sessionLookup`
+ *   (so the Computer branch can show the current URL).
  */
 export function promptForApproval(
   toolName: string,
@@ -100,6 +220,7 @@ export function promptForApproval(
   reason: string,
   signal: AbortSignal,
   io?: TerminalIO,
+  opts?: FormatApprovalPromptOpts,
 ): Promise<ApprovalAction> {
   if (signal.aborted) return Promise.resolve('abort')
 
@@ -155,7 +276,7 @@ export function promptForApproval(
     }
 
     function initialRender() {
-      const header = formatApprovalPrompt(toolName, input, reason)
+      const header = formatApprovalPrompt(toolName, input, reason, opts)
       outputStream.write('\n' + header + '\n\n')
 
       const selectorLines = OPTIONS.map((opt, i) => {

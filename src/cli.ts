@@ -15,6 +15,7 @@ import { createInterface } from 'node:readline'
 import { QueryEngine } from './sdk/QueryEngine.js'
 import { promptForApproval } from './ui/permissionPrompt.js'
 import { promptForModel } from './ui/modelMenu.js'
+import { createComputerWatchMode, type WatchModeRenderer } from './ui/computerWatchMode.js'
 import type { AskUserFn } from './core/permissions/types.js'
 import { resolveModel } from './core/providers/registry.js'
 import { UnknownModelError } from './core/providers/types.js'
@@ -77,10 +78,14 @@ const cwd = process.cwd()
 // disarm us for the rest of the run.
 let escController: EscAbortController | null = null
 
-const askUser: AskUserFn = async (toolName, input, reason, signal) => {
+// Phase 4·1: opts (5th arg) carries `metadata` (Computer-Use risk classifier
+// payload) and `sessionLookup` (injected by QueryEngine's wrapper for
+// Computer tools). Forward it untouched so promptForApproval can render the
+// Computer branch — risk level, target text, current URL.
+const askUser: AskUserFn = async (toolName, input, reason, signal, opts) => {
   escController?.pause()
   try {
-    return await promptForApproval(toolName, input, reason, signal)
+    return await promptForApproval(toolName, input, reason, signal, undefined, opts)
   } finally {
     escController?.resume()
   }
@@ -112,6 +117,19 @@ const engine = new QueryEngine({
     }
   },
 })
+
+// Phase 4·3 — opt-in watch-mode renderer. Constructed once per CLI process
+// when the user has set `computerUse.watchMode: true` AND stderr is a TTY
+// (no spam in piped logs). The renderer fans events out from the existing
+// submitPrompt loop below; engine internals are untouched.
+const computerWatchMode: WatchModeRenderer | null =
+  engine.getComputerUseSettings().watchMode && Boolean(process.stderr.isTTY)
+    ? createComputerWatchMode({
+        output: process.stderr,
+        isTTY: true,
+        sessionLookup: engine.getComputerSessionLookup() ?? undefined,
+      })
+    : null
 
 // One-shot deprecation notice for the retired Phase 1 permissions log.
 // Does not touch the user's existing file; new decisions flow to ~/.ultron/audit.jsonl.
@@ -327,6 +345,10 @@ function prompt(prefill?: string): void {
       while (!result.done) {
         const event = result.value
 
+        // Phase 4·3 — fan event out to the watch-mode renderer (if active).
+        // No-op when watchMode is disabled or stderr is not a TTY.
+        computerWatchMode?.handle(event)
+
         switch (event.type) {
           case 'text_delta':
             process.stdout.write(event.text)
@@ -430,6 +452,7 @@ let shuttingDown = false
 const gracefulExit = async (code: number): Promise<void> => {
   if (shuttingDown) return
   shuttingDown = true
+  computerWatchMode?.detach()
   try {
     await engine.dispose()
   } catch {

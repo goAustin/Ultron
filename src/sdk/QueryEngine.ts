@@ -18,6 +18,9 @@ import type { PermissionMode, AppState } from '../core/state.js'
 import { createStore, getDefaultAppState } from '../core/state.js'
 import type { AskUserFn, PermissionOptions } from '../core/permissions/types.js'
 import { filesystemSafetyChecks } from '../core/permissions/filesystem.js'
+import { makeComputerUseSafetyCheck } from '../core/permissions/computerSafetyChecks.js'
+import type { ComputerSessionId } from '../core/computer/types.js'
+import type { SessionLookup } from '../ui/permissionPrompt.js'
 import { createDefaultRegistry } from '../core/tools/registry.js'
 import { createToolUseContext } from '../core/tools/context.js'
 import type { ReadFileState, NotifyEvent } from '../core/tools/context.js'
@@ -28,7 +31,16 @@ import {
 } from '../core/tools/toolExecution.js'
 import { createAuditWriter } from '../audit/auditLog.js'
 import { readSettingsConfig } from '../config/settingsConfig.js'
-import { validateComputerUseSettings } from '../config/computerUseSettings.js'
+import {
+  validateComputerUseSettings,
+  type ComputerUseSettings,
+} from '../config/computerUseSettings.js'
+import {
+  SessionManager,
+  type BrowserSessionFactory,
+} from '../core/computer/sessionManager.js'
+import type { ComputerSessionManager } from '../core/computer/types.js'
+import { createComputerUseTools } from '../tools/ComputerTools.js'
 import { mergeShellSandboxSettings } from '../core/sandbox/settings.js'
 import {
   validateAndNormalizeRules,
@@ -164,6 +176,21 @@ export type QueryEngineConfig = {
    * stderr. Tests usually omit this (silent).
    */
   readonly onNotify?: (event: NotifyEvent) => void
+  /**
+   * v3 Phase 3: override the validated `computerUse` settings (test seam).
+   * Production reads from settings.json and validates at boot. When set,
+   * completely replaces the disk-loaded settings for the engine's lifetime.
+   */
+  readonly computerUseSettings?: ComputerUseSettings
+  /**
+   * v3 Phase 3: inject a pre-built session manager (test seam). Typed
+   * against the public `ComputerSessionManager` interface so structural
+   * fakes satisfy it without inheriting `SessionManager`'s private brand.
+   * When provided, the engine skips the lazy Playwright factory entirely —
+   * no `await import('playwright')` is reachable on the test path. Mirrors
+   * the `mcpManager` injection seam.
+   */
+  readonly sessionManager?: ComputerSessionManager
 }
 
 export type SubmitPromptOptions = {
@@ -211,6 +238,9 @@ export class QueryEngine {
   private _mcpInitPromise: Promise<void> | null = null
   private _callModelRebuilt = false
   private _disposed = false
+  // v3 Phase 3
+  private readonly _computerUseSettings: ComputerUseSettings
+  private readonly _sessionManager: ComputerSessionManager | null
 
   // --- Skill activation (Phase 5b) ---
   private _activeSkill: ActiveSkill | null = null
@@ -232,6 +262,22 @@ export class QueryEngine {
     // in their closures before the registry is frozen into `toolDefs`.
     this._auditWriter = config.auditWriter ?? createAuditWriter()
 
+    // Phase 6b: seed permissionRules from ~/.ultron/settings.json. Validation
+    // is permissive — invalid entries warn to stderr and are skipped, never
+    // throw. Tests can shadow the settings path via __setSettingsPathForTest.
+    // Read once up front: needed both for tool registration (computerUse) and
+    // for the AppState seed (permissionRules / webPolicy / shellSandbox).
+    const settings = readSettingsConfig()
+    const seededRules = validateAndNormalizeRules(settings.permissionRules ?? [])
+    const seededFromPolicy = compileWebPolicy(settings.webPolicy)
+    const seeded = dedupeRules([...seededRules, ...seededFromPolicy])
+    const seededSandbox = mergeShellSandboxSettings(settings.shellSandbox)
+    // v3 Phase 3: validate computerUse and store on the engine. Test seam:
+    // `config.computerUseSettings` replaces the disk-loaded value.
+    const computerUseSettings =
+      config.computerUseSettings ?? validateComputerUseSettings(settings.computerUse)
+    this._computerUseSettings = computerUseSettings
+
     // Long-lived deps
     this.toolRegistry = createDefaultRegistry()
     if (!config.disableMemory) {
@@ -247,6 +293,40 @@ export class QueryEngine {
     } else {
       this._memoryBaseDir = null
     }
+    // v3 Phase 3: conditionally build a SessionManager + register the 11
+    // Computer-Use tools BEFORE getToolDefinitions snapshots the registry.
+    // This keeps the model's tool list in sync with what's actually registered.
+    if (computerUseSettings.enabled) {
+      // The factory is built lazily — `playwrightBrowserSession.js` (which
+      // imports the playwright package at module load) is only fetched when
+      // ComputerStart actually runs, not at QueryEngine construction. This
+      // keeps the Phase 0 disabled-state contract intact: an engine with
+      // `computerUse.enabled === false` (the default) never loads playwright.
+      const lazyFactory: BrowserSessionFactory = async (params) => {
+        const mod = await import('../core/computer/playwrightBrowserSession.js')
+        return mod.createPlaywrightSessionFactory()(params)
+      }
+      this._sessionManager =
+        config.sessionManager ??
+        new SessionManager({ settings: computerUseSettings, factory: lazyFactory })
+      const computerTools = createComputerUseTools({
+        sessionManager: this._sessionManager,
+        settings: computerUseSettings,
+      })
+      this.toolRegistry.register(computerTools.start)
+      this.toolRegistry.register(computerTools.observe)
+      this.toolRegistry.register(computerTools.navigate)
+      this.toolRegistry.register(computerTools.click)
+      this.toolRegistry.register(computerTools.type)
+      this.toolRegistry.register(computerTools.key)
+      this.toolRegistry.register(computerTools.scroll)
+      this.toolRegistry.register(computerTools.drag)
+      this.toolRegistry.register(computerTools.wait)
+      this.toolRegistry.register(computerTools.handoffToUser)
+      this.toolRegistry.register(computerTools.stop)
+    } else {
+      this._sessionManager = null
+    }
     const toolDefs = getToolDefinitions(this.toolRegistry)
 
     this._model = config.model
@@ -254,17 +334,6 @@ export class QueryEngine {
     this.compactCallModel = config.compactModel
       ? this.resolveCallModel(config.compactModel, toolDefs)
       : this.callModel
-    // Phase 6b: seed permissionRules from ~/.ultron/settings.json. Validation
-    // is permissive — invalid entries warn to stderr and are skipped, never
-    // throw. Tests can shadow the settings path via __setSettingsPathForTest.
-    const settings = readSettingsConfig()
-    const seededRules = validateAndNormalizeRules(settings.permissionRules ?? [])
-    const seededFromPolicy = compileWebPolicy(settings.webPolicy)
-    const seeded = dedupeRules([...seededRules, ...seededFromPolicy])
-    const seededSandbox = mergeShellSandboxSettings(settings.shellSandbox)
-    // v3 Phase 0: validate computerUse so invalid entries warn at startup.
-    // Result is intentionally discarded; Phase 3 will store it for tool gating.
-    validateComputerUseSettings(settings.computerUse)
 
     const initialState: AppState = {
       ...getDefaultAppState(),
@@ -277,10 +346,21 @@ export class QueryEngine {
     this.readFileState = new Map()
 
     const headless = config.headless ?? false
+    // Phase 4·1: when Computer-Use is enabled, register the non-bypassable
+    // risk-classifier safety check (cascade step 4) AND wrap the user-supplied
+    // askUser in a closure that injects a sessionLookup for the prompt UI's
+    // Computer branch. Both are no-ops when the engine has no SessionManager.
+    const safetyChecks = [
+      ...filesystemSafetyChecks,
+      makeComputerUseSafetyCheck({ sessionManager: this._sessionManager }),
+    ]
+    const askUser = headless
+      ? undefined
+      : wrapAskUserWithSessionLookup(config.askUser, this._sessionManager)
     this.permissionOpts = {
       headless,
-      safetyChecks: [...filesystemSafetyChecks],
-      askUser: headless ? undefined : config.askUser,
+      safetyChecks,
+      ...(askUser !== undefined && { askUser }),
     }
     // Hook config is lazily loaded on first submitPrompt. An explicitly-provided
     // hookConfig short-circuits the lazy-load path (tests, SDK embedders).
@@ -901,6 +981,36 @@ export class QueryEngine {
   }
 
   /**
+   * Phase 4·3 — public read-only accessor for the resolved Computer-Use
+   * settings. The CLI uses this to decide whether to wire watch-mode
+   * without reaching into the engine's private config.
+   */
+  getComputerUseSettings(): ComputerUseSettings {
+    return this._computerUseSettings
+  }
+
+  /**
+   * Phase 4·3 — public sessionLookup factory for watch-mode rendering.
+   *
+   * Returns a synchronous lookup compatible with `permissionPrompt.SessionLookup`,
+   * letting watch-mode display the current URL alongside Computer events. The
+   * lookup resolves through the engine's SessionManager; returns `null` for
+   * any non-resolvable id (closed session, unknown id, or Computer-Use
+   * disabled).
+   *
+   * Returns `null` when no SessionManager exists (Computer-Use disabled).
+   */
+  getComputerSessionLookup(): SessionLookup | null {
+    const manager = this._sessionManager
+    if (manager === null) return null
+    return (sessionId: string) => {
+      const session = manager.get(sessionId as ComputerSessionId)
+      if (!session) return null
+      return { url: session.currentUrl(), title: null }
+    }
+  }
+
+  /**
    * Optional pre-warm: eagerly bootstrap MCP so failures surface before the
    * first `submitPrompt`. Idempotent. Safe to skip — `submitPrompt` auto-inits.
    */
@@ -917,12 +1027,16 @@ export class QueryEngine {
   }
 
   /**
-   * Terminal dispose — shuts down MCP subprocesses. After dispose, subsequent
-   * `submitPrompt` calls reject. Idempotent.
+   * Terminal dispose — shuts down MCP subprocesses and any live Computer-Use
+   * browser sessions. After dispose, subsequent `submitPrompt` calls reject.
+   * Idempotent.
    */
   async dispose(): Promise<void> {
     if (this._disposed) return
     this._disposed = true
+    if (this._sessionManager) {
+      await this._sessionManager.stopAll()
+    }
     await this.mcpManager.shutdown()
   }
 
@@ -1004,5 +1118,45 @@ export class QueryEngine {
       if (tool.source === 'mcp') return true
     }
     return false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4·1 — askUser wrapper that injects a sessionLookup
+//
+// When the cascade emits a level-2/3 ask for a Computer tool, the prompt UI
+// reads `opts.metadata` (already threaded through `runToolUse.ts`) AND wants
+// to display the session's current URL. That requires a sessionLookup —
+// which the SDK caller can't provide because they don't have a reference to
+// SessionManager.
+//
+// This wrapper sits between the cascade and the user-supplied askUser. The
+// wrapped function:
+//   - For Computer tools, builds a sessionLookup from the SessionManager and
+//     merges it into `opts` before calling through to the user askUser.
+//   - For non-Computer tools, passes opts unchanged.
+//
+// Returns undefined iff no user askUser was provided (preserves the existing
+// "no askUser → headless deny" semantic).
+// ---------------------------------------------------------------------------
+
+function wrapAskUserWithSessionLookup(
+  userAskUser: AskUserFn | undefined,
+  sessionManager: ComputerSessionManager | null,
+): AskUserFn | undefined {
+  if (userAskUser === undefined) return undefined
+  return async (toolName, input, reason, signal, opts) => {
+    if (!toolName.startsWith('Computer') || sessionManager === null) {
+      return userAskUser(toolName, input, reason, signal, opts)
+    }
+    const mergedOpts = {
+      ...opts,
+      sessionLookup: (sessionId: string) => {
+        const session = sessionManager.get(sessionId as ComputerSessionId)
+        if (!session) return null
+        return { url: session.currentUrl(), title: null }
+      },
+    }
+    return userAskUser(toolName, input, reason, signal, mergedOpts)
   }
 }

@@ -22,8 +22,10 @@ import type { ToolUseBlock } from '../messages.js'
 import type { Tool, ToolResult } from './types.js'
 import type { ToolUseContext, ToolProgressInput } from './context.js'
 import type {
+  PermissionDecisionReason,
   PermissionOptions,
   PermissionRule,
+  SafetyMetadata,
 } from '../permissions/types.js'
 import type {
   AuthorizeDecisionPayload,
@@ -107,10 +109,24 @@ export async function authorizeToolUse(
   // 5. Check permissions via engine — this is the actual policy decision.
   const decision = await hasPermissionsToUseTool(tool, toolUse, context, permissionOpts)
 
+  // Phase 4·1: structured metadata from a `safetyCheck` reason (Computer-Use
+  // risk classifier) rides through the cascade. Captured once here so every
+  // exit path gets the same payload.
+  //
+  // Headless mode wraps the original `safetyCheck` reason in
+  // `headlessEscalation` (`permissions.ts:39-44`), so we recursively unwrap
+  // to find the underlying safety metadata. Without this unwrap, a
+  // headless-denied dangerous action's audit row would lose its riskLevel.
+  const safetyMetadata = extractSafetyMetadata(decision.reason)
+
   if (decision.behavior === 'deny') {
     const reason = formatDecisionMessage(decision)
     return denied(
-      { decision: 'deny', reason },
+      {
+        decision: 'deny',
+        reason,
+        ...(safetyMetadata && { safetyMetadata }),
+      },
       makeErrorResult('permission_denied', reason),
     )
   }
@@ -123,12 +139,18 @@ export async function authorizeToolUse(
       // This IS a policy-adjacent outcome: the engine asked, nobody answered,
       // so it's recorded as a deny on the permission event stream.
       return denied(
-        { decision: 'ask', reason },
+        { decision: 'ask', reason, ...(safetyMetadata && { safetyMetadata }) },
         makeErrorResult('permission_ask', reason),
       )
     }
 
-    const response = await permissionOpts.askUser(toolUse.name, toolUse.input, reason, signal)
+    const response = await permissionOpts.askUser(
+      toolUse.name,
+      toolUse.input,
+      reason,
+      signal,
+      safetyMetadata !== undefined ? { metadata: safetyMetadata } : undefined,
+    )
 
     const ruleCreated: PermissionRule | undefined =
       response === 'allow_by_rule'
@@ -140,6 +162,7 @@ export async function authorizeToolUse(
       reason,
       userResponse: response,
       ...(ruleCreated && { ruleCreated }),
+      ...(safetyMetadata && { safetyMetadata }),
     }
 
     if (response === 'abort') {
@@ -166,7 +189,11 @@ export async function authorizeToolUse(
   // behavior === 'allow'
   return {
     outcome: 'authorized',
-    decision: { decision: 'allow', reason: formatDecisionMessage(decision) },
+    decision: {
+      decision: 'allow',
+      reason: formatDecisionMessage(decision),
+      ...(safetyMetadata && { safetyMetadata }),
+    },
   }
 }
 
@@ -300,4 +327,19 @@ function denied(
 
 function precondition(syntheticResult: ToolResult): AuthorizeToolOutcome {
   return { outcome: 'precondition_failed', syntheticResult }
+}
+
+/**
+ * Phase 4·1 — recursively unwrap a `PermissionDecisionReason` to find a
+ * `safetyCheck.metadata` payload. Headless mode wraps the original safety
+ * reason in `{ type: 'headlessEscalation', original: ... }`; without this
+ * helper, headless-denied dangerous actions would lose their structured
+ * audit metadata.
+ */
+function extractSafetyMetadata(
+  reason: PermissionDecisionReason,
+): SafetyMetadata | undefined {
+  if (reason.type === 'safetyCheck') return reason.metadata
+  if (reason.type === 'headlessEscalation') return extractSafetyMetadata(reason.original)
+  return undefined
 }

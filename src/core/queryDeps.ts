@@ -5,7 +5,7 @@ import type { ToolResult } from './tools/types.js'
 import type { ToolProgressInput } from './tools/context.js'
 import type { ToolRegistry } from './tools/registry.js'
 import { createToolRegistry } from './tools/registry.js'
-import type { PermissionRule } from './permissions/types.js'
+import type { PermissionRule, SafetyMetadata } from './permissions/types.js'
 import type { QueryEvent } from './queryEvents.js'
 import type { PreHookOutcome, PostHookOutcome } from '../hooks/types.js'
 import { messageId } from './messages.js'
@@ -120,6 +120,13 @@ export type AuthorizeDecisionPayload = {
   readonly reason: string
   readonly userResponse?: 'allow_once' | 'deny_once' | 'allow_by_rule' | 'abort'
   readonly ruleCreated?: PermissionRule
+  /**
+   * Phase 4·1 — populated when the cascade decision came from a SafetyCheck
+   * that returned structured `metadata` (today: `computerUseSafetyCheck`).
+   * Rides through to `permission_decision` events for audit, and is passed
+   * to `askUser` so the prompt UI can render rich risk context.
+   */
+  readonly safetyMetadata?: SafetyMetadata
 }
 
 export type AuthorizeToolOutcome =

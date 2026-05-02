@@ -55,6 +55,13 @@ export type ComputerUseSettingsInput = {
   allowUploads?: boolean
   allowAuthHandoff?: boolean
   debugPersistScreenshots?: boolean
+  // Phase 4·2 — extra CSS selectors for sensitive-region detection. Appended
+  // to the built-in list in `redaction.SENSITIVE_SELECTORS` at screenshot time.
+  redactionSelectors?: string[]
+  // Phase 4·2 — toggle for the post-action verify pipeline. Default true.
+  verifyActions?: boolean
+  // Phase 4·3 — opt-in CLI watch-mode renderer. Default false.
+  watchMode?: boolean
 }
 
 export type SettingsConfig = {

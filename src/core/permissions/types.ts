@@ -29,9 +29,29 @@ export type PermissionRule = {
 // Decision reasons
 // ---------------------------------------------------------------------------
 
+/**
+ * v3 Phase 4·1 — structured payload riding alongside a `safetyCheck` reason.
+ * Lets the cascade thread risk-classifier evidence end-to-end (audit log
+ * `safetyMetadata` + `formatApprovalPrompt` rich rendering) without parsing
+ * the human-facing `message` string.
+ *
+ * `checkName` is open-ended now because Computer-Use is the only safety check
+ * that emits structured metadata today. Future safety checks can add their
+ * own discriminator value without breaking existing readers.
+ */
+export type SafetyMetadata = {
+  readonly checkName: string
+  readonly riskLevel: 0 | 1 | 2 | 3 | 4
+  readonly riskCategory: string
+  readonly evidence?: {
+    readonly nearbyText?: string
+    readonly fieldType?: string
+  }
+}
+
 export type PermissionDecisionReason =
   | { type: 'rule'; rule: PermissionRule }
-  | { type: 'safetyCheck'; message: string }
+  | { type: 'safetyCheck'; message: string; metadata?: SafetyMetadata }
   | { type: 'mode'; mode: PermissionMode }
   | { type: 'toolCheck'; message: string }
   | { type: 'toolCheck' }
@@ -63,12 +83,23 @@ export type SafetyCheck = (
 // Approval callbacks
 // ---------------------------------------------------------------------------
 
-/** Callback to prompt the user for a permission decision. */
+/**
+ * Callback to prompt the user for a permission decision.
+ *
+ * Phase 4·1 widened the signature with an optional fifth `opts` arg that
+ * carries `safetyMetadata` for Computer-Use risk decisions (so the prompt
+ * UI can render risk level, nearby text, etc.). All existing callers can
+ * ignore `opts`; new callers populate it from `decision.reason.metadata`
+ * when the reason is a `safetyCheck`.
+ */
 export type AskUserFn = (
   toolName: string,
   input: Record<string, unknown>,
   reason: string,
   signal: AbortSignal,
+  opts?: {
+    readonly metadata?: SafetyMetadata
+  },
 ) => Promise<'allow_once' | 'deny_once' | 'allow_by_rule' | 'abort'>
 
 // ---------------------------------------------------------------------------

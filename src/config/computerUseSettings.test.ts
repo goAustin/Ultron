@@ -46,6 +46,9 @@ describe('validateComputerUseSettings', () => {
       allowUploads: true,
       allowAuthHandoff: true,
       debugPersistScreenshots: true,
+      redactionSelectors: ['.secret-input'],
+      verifyActions: false,
+      watchMode: true,
     }
     const out = validateComputerUseSettings(valid)
     expect(out).toEqual(valid)
@@ -163,5 +166,86 @@ describe('validateComputerUseSettings', () => {
     expect(out.allowAuthHandoff).toBe(false)
     expect(out.debugPersistScreenshots).toBe(false)
     expect(stderrSpy).toHaveBeenCalledTimes(5)
+  })
+
+  // -------------------------------------------------------------------------
+  // Phase 4·2 settings — redactionSelectors + verifyActions
+  // -------------------------------------------------------------------------
+
+  describe('redactionSelectors (Phase 4·2)', () => {
+    it('defaults to []', () => {
+      expect(validateComputerUseSettings({}).redactionSelectors).toEqual([])
+    })
+
+    it('accepts an array of CSS selectors', () => {
+      const out = validateComputerUseSettings({
+        redactionSelectors: ['.secret', '#card-number', 'input[data-sensitive]'],
+      })
+      expect(out.redactionSelectors).toEqual([
+        '.secret',
+        '#card-number',
+        'input[data-sensitive]',
+      ])
+    })
+
+    it('warns and falls back to [] when not an array', () => {
+      const out = validateComputerUseSettings({ redactionSelectors: '.secret' })
+      expect(out.redactionSelectors).toEqual([])
+      expect(stderrSpy).toHaveBeenCalled()
+    })
+
+    it('skips non-string entries with a warn', () => {
+      const out = validateComputerUseSettings({
+        redactionSelectors: ['.kept', 42, null, '#also-kept'],
+      })
+      expect(out.redactionSelectors).toEqual(['.kept', '#also-kept'])
+      expect(stderrSpy).toHaveBeenCalledTimes(2)
+    })
+
+    it('trims and skips empty / whitespace-only entries', () => {
+      const out = validateComputerUseSettings({
+        redactionSelectors: ['  .padded  ', '', '   ', '.kept'],
+      })
+      expect(out.redactionSelectors).toEqual(['.padded', '.kept'])
+    })
+
+    it('deduplicates exact-match entries', () => {
+      const out = validateComputerUseSettings({
+        redactionSelectors: ['.dup', '.dup', '.unique'],
+      })
+      expect(out.redactionSelectors).toEqual(['.dup', '.unique'])
+    })
+  })
+
+  describe('verifyActions (Phase 4·2)', () => {
+    it('defaults to true', () => {
+      expect(validateComputerUseSettings({}).verifyActions).toBe(true)
+    })
+
+    it('accepts true / false', () => {
+      expect(validateComputerUseSettings({ verifyActions: true }).verifyActions).toBe(true)
+      expect(validateComputerUseSettings({ verifyActions: false }).verifyActions).toBe(false)
+    })
+
+    it('warns and defaults to true when non-boolean', () => {
+      expect(validateComputerUseSettings({ verifyActions: 'yes' }).verifyActions).toBe(true)
+      expect(stderrSpy).toHaveBeenCalled()
+    })
+  })
+
+  describe('watchMode (Phase 4·3)', () => {
+    it('defaults to false', () => {
+      expect(validateComputerUseSettings({}).watchMode).toBe(false)
+    })
+
+    it('accepts true / false', () => {
+      expect(validateComputerUseSettings({ watchMode: true }).watchMode).toBe(true)
+      expect(validateComputerUseSettings({ watchMode: false }).watchMode).toBe(false)
+    })
+
+    it('warns and defaults to false when non-boolean', () => {
+      expect(validateComputerUseSettings({ watchMode: 'on' }).watchMode).toBe(false)
+      expect(stderrSpy).toHaveBeenCalled()
+    })
   })
 })

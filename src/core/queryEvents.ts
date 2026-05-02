@@ -1,6 +1,6 @@
 import type { AssistantMessage, ToolUseId, UserMessage } from './messages.js'
 import type { ToolErrorKind } from './tools/types.js'
-import type { PermissionRule } from './permissions/types.js'
+import type { PermissionRule, SafetyMetadata } from './permissions/types.js'
 
 // ---------------------------------------------------------------------------
 // Streaming events yielded by query()
@@ -65,6 +65,13 @@ export type PermissionDecisionEvent = {
   readonly reason: string
   readonly userResponse?: 'allow_once' | 'deny_once' | 'allow_by_rule' | 'abort'
   readonly ruleCreated?: PermissionRule
+  /**
+   * Phase 4·1: structured payload from a SafetyCheck that emitted typed
+   * metadata. Today this is `computerUseSafetyCheck` — risk level, category,
+   * and evidence (nearby text / fieldType). Backward-compatible: every
+   * existing reader treats `undefined` as "no safety metadata."
+   */
+  readonly safetyMetadata?: SafetyMetadata
   readonly timestamp: number
 }
 

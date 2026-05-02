@@ -34,6 +34,33 @@ export type ComputerUseSettings = {
   allowUploads: boolean
   allowAuthHandoff: boolean
   debugPersistScreenshots: boolean
+  /**
+   * Phase 4·2 — extra CSS selectors for sensitive-region detection. Appended
+   * to the built-in list (`SENSITIVE_SELECTORS` in `redaction.ts`) when the
+   * BrowserSession queries the page for elements whose pixels should be
+   * blacked out before the screenshot leaves the runtime.
+   *
+   * Empty array (default) means "use built-ins only." Invalid entries are
+   * skipped with a warn at boot — bad selectors never throw at runtime.
+   */
+  redactionSelectors: readonly string[]
+  /**
+   * Phase 4·2 — toggle for the post-action verify pipeline. When `true`
+   * (default) every action tool captures pre/post ARIA + screenshots and
+   * appends a WARNING to the result text when neither signal detected
+   * change. Set `false` to skip pre-state capture and verification — saves
+   * one ARIA snapshot per action, at the cost of losing the
+   * "claimed-clicked-but-didn't" guard.
+   */
+  verifyActions: boolean
+  /**
+   * Phase 4·3 — opt-in CLI watch-mode renderer. When `true` AND the CLI's
+   * stderr is a TTY, every Computer-tool event (start, ask, allow/deny,
+   * finish) renders one line to stderr so the user can follow what the
+   * model is doing in the browser. Defaults to `false` (silent — stderr is
+   * left alone). No-op on piped stderr regardless of this setting.
+   */
+  watchMode: boolean
 }
 
 export const defaultComputerUseSettings: ComputerUseSettings = {
@@ -53,6 +80,9 @@ export const defaultComputerUseSettings: ComputerUseSettings = {
   allowUploads: false,
   allowAuthHandoff: false,
   debugPersistScreenshots: false,
+  redactionSelectors: [],
+  verifyActions: true,
+  watchMode: false,
 }
 
 const VIEWPORT_MAX = 4096
@@ -148,6 +178,37 @@ function validateDomainList(v: unknown, field: string): string[] {
       continue
     }
     out.push(lowered)
+  }
+  return out
+}
+
+/**
+ * Phase 4·2 — validate `redactionSelectors`. Each entry must be a non-empty
+ * string. We can't fully syntax-check arbitrary CSS selectors here without
+ * pulling in a parser, so we just trim + dedupe; the BrowserSession's
+ * `page.locator(...)` will surface a Playwright error at runtime if a
+ * selector is malformed (and the redaction layer swallows that into a
+ * "no regions found" result, never blocking the screenshot).
+ */
+function validateSelectorList(v: unknown, field: string): string[] {
+  if (v === undefined) return []
+  if (!Array.isArray(v)) {
+    warn(`computerUse.${field} must be an array; got ${describeKind(v)}; using empty list`)
+    return []
+  }
+  const out: string[] = []
+  for (let i = 0; i < v.length; i++) {
+    const entry = v[i]
+    if (typeof entry !== 'string') {
+      warn(`computerUse.${field}[${i}] is not a string; skipping`)
+      continue
+    }
+    const trimmed = entry.trim()
+    if (trimmed.length === 0) {
+      warn(`computerUse.${field}[${i}] is empty; skipping`)
+      continue
+    }
+    if (!out.includes(trimmed)) out.push(trimmed)
   }
   return out
 }
@@ -253,6 +314,17 @@ export function validateComputerUseSettings(raw: unknown): ComputerUseSettings {
       raw.debugPersistScreenshots,
       'debugPersistScreenshots',
       defaultComputerUseSettings.debugPersistScreenshots,
+    ),
+    redactionSelectors: validateSelectorList(raw.redactionSelectors, 'redactionSelectors'),
+    verifyActions: validateBoolean(
+      raw.verifyActions,
+      'verifyActions',
+      defaultComputerUseSettings.verifyActions,
+    ),
+    watchMode: validateBoolean(
+      raw.watchMode,
+      'watchMode',
+      defaultComputerUseSettings.watchMode,
     ),
   }
 }

@@ -6,7 +6,7 @@
 
 import type { ToolUseBlock } from './messages.js'
 import type { ToolResult } from './tools/types.js'
-import type { PermissionRule } from './permissions/types.js'
+import type { PermissionRule, SafetyMetadata } from './permissions/types.js'
 import type {
   PermissionDecisionEvent,
   ToolCallStartedEvent,
@@ -40,6 +40,7 @@ export function makePermissionDecisionEvent(
   extra?: {
     userResponse?: PermissionDecisionEvent['userResponse']
     ruleCreated?: PermissionRule
+    safetyMetadata?: SafetyMetadata
   },
 ): PermissionDecisionEvent {
   return {
@@ -51,6 +52,7 @@ export function makePermissionDecisionEvent(
     reason,
     ...(extra?.userResponse !== undefined && { userResponse: extra.userResponse }),
     ...(extra?.ruleCreated !== undefined && { ruleCreated: extra.ruleCreated }),
+    ...(extra?.safetyMetadata !== undefined && { safetyMetadata: extra.safetyMetadata }),
     timestamp: Date.now(),
   }
 }

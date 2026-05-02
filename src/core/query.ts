@@ -326,6 +326,7 @@ export async function* query(
             {
               userResponse: auth.decision.userResponse,
               ruleCreated: auth.decision.ruleCreated,
+              safetyMetadata: auth.decision.safetyMetadata,
             },
           )
         }

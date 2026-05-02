@@ -6,7 +6,7 @@ import type { ToolUseContext } from './context.js'
 import { createToolUseContext } from './context.js'
 import { createToolRegistry } from './registry.js'
 import { createStore, getDefaultAppState } from '../state.js'
-import type { PermissionOptions } from '../permissions/types.js'
+import type { PermissionOptions, SafetyCheck } from '../permissions/types.js'
 import type { ToolUseBlock } from '../messages.js'
 import { toolUseId } from '../messages.js'
 
@@ -554,6 +554,113 @@ describe('authorizeToolUse', () => {
         })
       }
     })
+  })
+})
+
+describe('safetyMetadata threading (Phase 4·1)', () => {
+  // SafetyCheck that mimics computerUseSafetyCheck — emits typed metadata
+  const sensitiveCheck: SafetyCheck = (tool) => {
+    if (tool.name !== 'PretendComputer') return null
+    return {
+      behavior: 'ask',
+      reason: {
+        type: 'safetyCheck',
+        message: 'sensitive action',
+        metadata: {
+          checkName: 'computerUseSafetyCheck',
+          riskLevel: 3,
+          riskCategory: 'irreversible',
+          evidence: { nearbyText: 'Delete account' },
+        },
+      },
+    }
+  }
+
+  it('threads safetyMetadata from a safetyCheck-ask through to AuthorizeDecisionPayload', async () => {
+    const tool = okTool('PretendComputer')
+    const ctx = makeContext([tool])
+    const askSpy = vi.fn<
+      (
+        toolName: string,
+        input: Record<string, unknown>,
+        reason: string,
+        signal: AbortSignal,
+        opts?: { metadata?: unknown },
+      ) => Promise<'allow_once'>
+    >(async () => 'allow_once' as const)
+    const permissionOpts: PermissionOptions = {
+      headless: false,
+      safetyChecks: [sensitiveCheck],
+      askUser: askSpy,
+    }
+    const auth = await authorizeToolUse(
+      makeToolUse('PretendComputer'),
+      ctx,
+      makeSignal(),
+      permissionOpts,
+    )
+    expect(auth.outcome).toBe('authorized')
+    if (auth.outcome === 'authorized') {
+      expect(auth.decision.safetyMetadata).toEqual({
+        checkName: 'computerUseSafetyCheck',
+        riskLevel: 3,
+        riskCategory: 'irreversible',
+        evidence: { nearbyText: 'Delete account' },
+      })
+    }
+    // askUser receives metadata as the 5th-arg opts.
+    expect(askSpy).toHaveBeenCalledTimes(1)
+    const askArgs = askSpy.mock.calls[0]!
+    expect(askArgs[4]).toMatchObject({
+      metadata: { riskLevel: 3, riskCategory: 'irreversible' },
+    })
+  })
+
+  it('threads safetyMetadata through headless escalation (fix #4)', async () => {
+    // Without the recursive unwrap in extractSafetyMetadata, headless mode
+    // wraps the original safetyCheck reason in headlessEscalation and the
+    // riskLevel disappears from audit.
+    const tool = okTool('PretendComputer')
+    const ctx = makeContext([tool])
+    const permissionOpts: PermissionOptions = {
+      headless: true, // forces ask → deny escalation
+      safetyChecks: [sensitiveCheck],
+    }
+    const auth = await authorizeToolUse(
+      makeToolUse('PretendComputer'),
+      ctx,
+      makeSignal(),
+      permissionOpts,
+    )
+    expect(auth.outcome).toBe('denied')
+    if (auth.outcome === 'denied') {
+      expect(auth.decision.decision).toBe('deny')
+      // Critical: metadata must survive headlessEscalation wrapping.
+      expect(auth.decision.safetyMetadata).toEqual({
+        checkName: 'computerUseSafetyCheck',
+        riskLevel: 3,
+        riskCategory: 'irreversible',
+        evidence: { nearbyText: 'Delete account' },
+      })
+    }
+  })
+
+  it('non-safetyCheck reasons get undefined safetyMetadata', async () => {
+    const tool = okTool('Foo')
+    const ctx = makeContext([tool])
+    // Add an explicit ask rule → reason.type === 'rule', no metadata
+    ctx.appState.setState({
+      permissionRules: [{ toolName: 'Foo', behavior: 'ask', source: 'userSettings' }],
+    })
+    const permissionOpts: PermissionOptions = {
+      headless: false,
+      safetyChecks: [],
+      askUser: async () => 'allow_once' as const,
+    }
+    const auth = await authorizeToolUse(makeToolUse('Foo'), ctx, makeSignal(), permissionOpts)
+    if (auth.outcome === 'authorized') {
+      expect(auth.decision.safetyMetadata).toBeUndefined()
+    }
   })
 })
 

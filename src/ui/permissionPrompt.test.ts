@@ -95,6 +95,117 @@ describe('formatApprovalPrompt', () => {
     const result = formatApprovalPrompt('CustomTool', {}, 'reason')
     expect(result).not.toContain('Input:')
   })
+
+  // -------------------------------------------------------------------------
+  // Phase 4·1 — Computer-tool rendering
+  // -------------------------------------------------------------------------
+
+  describe('Computer-Use branch', () => {
+    it('renders sessionId + url + click action when sessionLookup is provided', () => {
+      const result = formatApprovalPrompt(
+        'ComputerClick',
+        { sessionId: 'abc12345-def0-1111-2222-333344445555', x: 0.5, y: 0.3, button: 'left' },
+        'requires approval',
+        {
+          sessionLookup: () => ({
+            url: 'https://github.com/u/repo/settings',
+            title: 'Settings',
+          }),
+        },
+      )
+      expect(result).toContain('Tool:    ComputerClick')
+      expect(result).toContain('Session: abc12345…')
+      expect(result).toContain('https://github.com/u/repo/settings')
+      expect(result).toContain('click(0.50, 0.30)')
+      expect(result).toContain('left button')
+    })
+
+    it('renders risk-level + nearby text when metadata is provided', () => {
+      const result = formatApprovalPrompt(
+        'ComputerClick',
+        { sessionId: 's1', x: 0.5, y: 0.3 },
+        'level 3 click',
+        {
+          metadata: {
+            checkName: 'computerUseSafetyCheck',
+            riskLevel: 3,
+            riskCategory: 'irreversible',
+            evidence: { nearbyText: 'Delete account' },
+          },
+        },
+      )
+      expect(result).toContain('Risk:    level 3 (irreversible)')
+      expect(result).toContain('Target:  «Delete account»')
+    })
+
+    it('renders fieldType when present in metadata.evidence', () => {
+      const result = formatApprovalPrompt(
+        'ComputerType',
+        { sessionId: 's1', text: 'x', sensitive: true },
+        'sensitive input',
+        {
+          metadata: {
+            checkName: 'computerUseSafetyCheck',
+            riskLevel: 2,
+            riskCategory: 'sensitive_input',
+            evidence: { fieldType: 'password' },
+          },
+        },
+      )
+      expect(result).toContain('Field:   password')
+    })
+
+    it('redacts text content when sensitive=true', () => {
+      const result = formatApprovalPrompt(
+        'ComputerType',
+        { sessionId: 's1', text: 'hunter2', sensitive: true },
+        'sensitive',
+      )
+      expect(result).toContain('<redacted 7 chars>')
+      expect(result).not.toContain('hunter2')
+    })
+
+    it('falls back gracefully when sessionLookup returns null', () => {
+      const result = formatApprovalPrompt(
+        'ComputerNavigate',
+        { sessionId: 'unknown-id', url: 'https://example.com' },
+        'navigate',
+        { sessionLookup: () => null },
+      )
+      expect(result).toContain('Session: unknown-…')
+      expect(result).toContain('navigate(https://example.com)')
+    })
+
+    it('handles ComputerStart (no sessionId in input)', () => {
+      const result = formatApprovalPrompt(
+        'ComputerStart',
+        { headless: false },
+        'requires approval',
+      )
+      // ComputerStart has no sessionId, so the Computer branch is skipped;
+      // falls through to the generic JSON renderer.
+      expect(result).toContain('Tool:    ComputerStart')
+      expect(result).toContain('Input:')
+      expect(result).toContain('headless')
+    })
+
+    it('non-Computer tools ignore opts.metadata (no Risk: line)', () => {
+      const result = formatApprovalPrompt(
+        'Bash',
+        { command: 'ls' },
+        'requires approval',
+        {
+          metadata: {
+            checkName: 'computerUseSafetyCheck',
+            riskLevel: 3,
+            riskCategory: 'irreversible',
+          },
+        },
+      )
+      expect(result).toContain('Cmd:     ls')
+      expect(result).not.toContain('Risk:')
+    })
+  })
 })
 
 // ---------------------------------------------------------------------------

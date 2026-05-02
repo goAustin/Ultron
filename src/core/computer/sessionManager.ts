@@ -24,6 +24,7 @@ import {
   BrowserSessionError,
   type BrowserSession,
   type ComputerSessionId,
+  type ComputerSessionManager,
   type StartSessionOptions,
 } from './types.js'
 
@@ -50,7 +51,7 @@ type SessionEntry = {
   closed: boolean
 }
 
-export class SessionManager {
+export class SessionManager implements ComputerSessionManager {
   private readonly _settings: ComputerUseSettings
   private readonly _factory: BrowserSessionFactory
   private readonly _sessions = new Map<ComputerSessionId, SessionEntry>()

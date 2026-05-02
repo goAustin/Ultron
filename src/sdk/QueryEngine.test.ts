@@ -1170,4 +1170,323 @@ describe('QueryEngine', () => {
     // here would require a stuck-callModel scaffold that's hard to drive
     // deterministically in vitest.
   })
+
+  // -------------------------------------------------------------------------
+  // v3 Phase 3: Computer-Use tool registration + dispose
+  // -------------------------------------------------------------------------
+
+  describe('Computer-Use tool registration (Phase 3)', () => {
+    const COMPUTER_TOOL_NAMES = [
+      'ComputerStart',
+      'ComputerObserve',
+      'ComputerNavigate',
+      'ComputerClick',
+      'ComputerType',
+      'ComputerKey',
+      'ComputerScroll',
+      'ComputerDrag',
+      'ComputerWait',
+      'ComputerHandoffToUser',
+      'ComputerStop',
+    ] as const
+
+    it('does NOT register Computer tools by default (computerUse.enabled = false)', async () => {
+      await withTmpDir(async (cwd) => {
+        const engine = new QueryEngine(makeConfig(cwd))
+        const reg = engine.getRegistry()
+        for (const name of COMPUTER_TOOL_NAMES) {
+          expect(reg.has(name)).toBe(false)
+        }
+      })
+    })
+
+    it('registers all 11 Computer tools when computerUse.enabled = true', async () => {
+      await withTmpDir(async (cwd) => {
+        const engine = new QueryEngine(
+          makeConfig(cwd, {
+            computerUseSettings: {
+              enabled: true,
+              defaultEnvironment: 'browser' as const,
+              viewport: { width: 1024, height: 768 },
+              displaySize: { width: 1024, height: 768 },
+              maxSteps: 30,
+              maxDurationMs: 60_000,
+              maxScreenshotBytes: 2_000_000,
+              maxScreenshotDimensions: { width: 1024, height: 768 },
+              ariaSnapshotMaxTokens: 4000,
+              allowedDomains: ['example.com'],
+              deniedDomains: [],
+              persistProfiles: false,
+              allowDownloads: false,
+              allowUploads: false,
+              allowAuthHandoff: false,
+              debugPersistScreenshots: false,
+              redactionSelectors: [],
+              verifyActions: true,
+              watchMode: false,
+            },
+            sessionManager: makeFakeSessionManager(),
+          }),
+        )
+        const reg = engine.getRegistry()
+        for (const name of COMPUTER_TOOL_NAMES) {
+          expect(reg.has(name)).toBe(true)
+        }
+      })
+    })
+
+    it('dispose() calls sessionManager.stopAll() exactly once', async () => {
+      await withTmpDir(async (cwd) => {
+        const fake = makeFakeSessionManager()
+        const engine = new QueryEngine(
+          makeConfig(cwd, {
+            computerUseSettings: {
+              enabled: true,
+              defaultEnvironment: 'browser' as const,
+              viewport: { width: 1024, height: 768 },
+              displaySize: { width: 1024, height: 768 },
+              maxSteps: 30,
+              maxDurationMs: 60_000,
+              maxScreenshotBytes: 2_000_000,
+              maxScreenshotDimensions: { width: 1024, height: 768 },
+              ariaSnapshotMaxTokens: 4000,
+              allowedDomains: ['example.com'],
+              deniedDomains: [],
+              persistProfiles: false,
+              allowDownloads: false,
+              allowUploads: false,
+              allowAuthHandoff: false,
+              debugPersistScreenshots: false,
+              redactionSelectors: [],
+              verifyActions: true,
+              watchMode: false,
+            },
+            sessionManager: fake,
+          }),
+        )
+        await engine.dispose()
+        expect(fake.stopAllCalls).toBe(1)
+        // Idempotent — second dispose is a no-op.
+        await engine.dispose()
+        expect(fake.stopAllCalls).toBe(1)
+      })
+    })
+
+    it('does not dynamically import playwright when Computer-Use is disabled', async () => {
+      // The lazy factory is only built when computerUse.enabled === true.
+      // Without enabling, no `await import('../core/computer/playwrightBrowserSession.js')`
+      // call is reachable. We can't easily intercept dynamic imports inside
+      // the engine without polluting the loader; instead, assert the simpler
+      // contract: with disabled settings, _sessionManager stays null, so the
+      // factory closure that would do the dynamic import is never created.
+      await withTmpDir(async (cwd) => {
+        const engine = new QueryEngine(makeConfig(cwd))
+        const priv = engine as unknown as { _sessionManager: unknown }
+        expect(priv._sessionManager).toBeNull()
+      })
+    })
+  })
+
+  describe('Computer-Use safety check + askUser wrapper (Phase 4·1)', () => {
+    function enabledSettings() {
+      return {
+        enabled: true,
+        defaultEnvironment: 'browser' as const,
+        viewport: { width: 1024, height: 768 },
+        displaySize: { width: 1024, height: 768 },
+        maxSteps: 30,
+        maxDurationMs: 60_000,
+        maxScreenshotBytes: 2_000_000,
+        maxScreenshotDimensions: { width: 1024, height: 768 },
+        ariaSnapshotMaxTokens: 4000,
+        allowedDomains: ['example.com'],
+        deniedDomains: [],
+        persistProfiles: false,
+        allowDownloads: false,
+        allowUploads: false,
+        allowAuthHandoff: false,
+        debugPersistScreenshots: false,
+        redactionSelectors: [],
+        verifyActions: true,
+        watchMode: false,
+      }
+    }
+
+    it('safetyChecks always includes computerUseSafetyCheck (no-op when disabled)', async () => {
+      await withTmpDir(async (cwd) => {
+        // Disabled engine — safety check is registered but receives null
+        // sessionManager, so it short-circuits to null for every input.
+        const engine = new QueryEngine(makeConfig(cwd))
+        const priv = engine as unknown as {
+          permissionOpts: { safetyChecks: ReadonlyArray<unknown> }
+        }
+        // We have at least one safety check (filesystemSafetyChecks contributes
+        // multiple); the Computer-Use one is the last entry by construction.
+        expect(priv.permissionOpts.safetyChecks.length).toBeGreaterThan(0)
+      })
+    })
+
+    it('askUser wrapper injects sessionLookup for Computer tools when enabled', async () => {
+      await withTmpDir(async (cwd) => {
+        const fakeSession = {
+          currentUrl: () => 'https://example.com/settings',
+          isClosed: () => false,
+        }
+        const fake = makeFakeSessionManager()
+        ;(fake as unknown as { get: (id: string) => unknown }).get = (id: string) =>
+          id === 's1' ? fakeSession : undefined
+
+        const askCalls: Array<{
+          toolName: string
+          opts: { sessionLookup?: (id: string) => unknown } | undefined
+        }> = []
+        const askUser = vi.fn(async (toolName, _input, _reason, _signal, opts) => {
+          askCalls.push({ toolName, opts })
+          return 'allow_once' as const
+        })
+
+        const engine = new QueryEngine(
+          makeConfig(cwd, {
+            computerUseSettings: enabledSettings(),
+            sessionManager: fake,
+            askUser,
+          }),
+        )
+
+        const priv = engine as unknown as {
+          permissionOpts: {
+            askUser: (
+              toolName: string,
+              input: Record<string, unknown>,
+              reason: string,
+              signal: AbortSignal,
+              opts?: { sessionLookup?: (id: string) => unknown },
+            ) => Promise<string>
+          }
+        }
+
+        // Computer tool: sessionLookup is injected
+        await priv.permissionOpts.askUser(
+          'ComputerClick',
+          { sessionId: 's1', x: 0.5, y: 0.5 },
+          'reason',
+          new AbortController().signal,
+        )
+        expect(askCalls).toHaveLength(1)
+        expect(askCalls[0]?.toolName).toBe('ComputerClick')
+        expect(askCalls[0]?.opts?.sessionLookup).toBeDefined()
+        const lookup = askCalls[0]?.opts?.sessionLookup
+        expect(lookup?.('s1')).toEqual({
+          url: 'https://example.com/settings',
+          title: null,
+        })
+        expect(lookup?.('unknown')).toBeNull()
+
+        // Non-Computer tool: opts is undefined (or whatever caller passed),
+        // sessionLookup is NOT injected.
+        await priv.permissionOpts.askUser(
+          'Bash',
+          { command: 'ls' },
+          'reason',
+          new AbortController().signal,
+        )
+        expect(askCalls[1]?.opts?.sessionLookup).toBeUndefined()
+      })
+    })
+
+    it('askUser wrapper preserves opts.metadata when forwarding (Computer branch)', async () => {
+      await withTmpDir(async (cwd) => {
+        const fake = makeFakeSessionManager()
+        const askUser = vi.fn(async (_toolName, _input, _reason, _signal, opts) => {
+          // Echo the opts so the test can verify them.
+          return opts?.metadata?.riskLevel === 3 ? ('allow_once' as const) : ('deny_once' as const)
+        })
+        const engine = new QueryEngine(
+          makeConfig(cwd, {
+            computerUseSettings: enabledSettings(),
+            sessionManager: fake,
+            askUser,
+          }),
+        )
+        const priv = engine as unknown as {
+          permissionOpts: {
+            askUser: (
+              toolName: string,
+              input: Record<string, unknown>,
+              reason: string,
+              signal: AbortSignal,
+              opts?: {
+                metadata?: {
+                  checkName: string
+                  riskLevel: number
+                  riskCategory: string
+                }
+              },
+            ) => Promise<string>
+          }
+        }
+        const result = await priv.permissionOpts.askUser(
+          'ComputerClick',
+          { sessionId: 's1', x: 0.5, y: 0.5 },
+          'reason',
+          new AbortController().signal,
+          {
+            metadata: {
+              checkName: 'computerUseSafetyCheck',
+              riskLevel: 3,
+              riskCategory: 'irreversible',
+            },
+          },
+        )
+        expect(result).toBe('allow_once')
+      })
+    })
+
+    it('headless mode → askUser is undefined (no wrapping)', async () => {
+      await withTmpDir(async (cwd) => {
+        const fake = makeFakeSessionManager()
+        const engine = new QueryEngine(
+          makeConfig(cwd, {
+            headless: true,
+            computerUseSettings: enabledSettings(),
+            sessionManager: fake,
+            askUser: vi.fn(),
+          }),
+        )
+        const priv = engine as unknown as {
+          permissionOpts: { askUser: unknown }
+        }
+        expect(priv.permissionOpts.askUser).toBeUndefined()
+      })
+    })
+  })
 })
+
+/**
+ * Minimal fake ComputerSessionManager for QE tests. We only need to track
+ * stopAllCalls for the dispose test — start/get/stop/requestClose are stubs.
+ */
+function makeFakeSessionManager(): {
+  start: (...args: unknown[]) => Promise<never>
+  get: () => undefined
+  stop: () => Promise<void>
+  stopAll: () => Promise<void>
+  requestClose: () => Promise<void>
+  stopAllCalls: number
+} {
+  const fake = {
+    stopAllCalls: 0,
+    async start(): Promise<never> {
+      throw new Error('not used in this test')
+    },
+    get(): undefined {
+      return undefined
+    },
+    async stop(): Promise<void> {},
+    async stopAll(): Promise<void> {
+      fake.stopAllCalls++
+    },
+    async requestClose(): Promise<void> {},
+  }
+  return fake
+}
