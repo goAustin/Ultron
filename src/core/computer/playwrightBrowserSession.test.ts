@@ -781,3 +781,168 @@ describe('PlaywrightBrowserSession action methods', () => {
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+// Phase 4b — atom cache surface (setAtomCache / lookupAtom / currentAtomCache)
+// ---------------------------------------------------------------------------
+
+describe('PlaywrightBrowserSession atom cache (Phase 4b)', () => {
+  // Build a session whose `page.evaluate` returns a controllable AriaNode tree
+  // — we use the same trick as the ariaSnapshot tests so we can drive
+  // `_lastAriaSnapshot` explicitly between cache operations.
+  function makeSession(
+    evaluateImpl: () => Promise<unknown>,
+    navigateImpl?: (url: string) => Promise<unknown>,
+  ): PlaywrightBrowserSession {
+    const noop = async () => {}
+    const noopRoute = async (_pattern: string, _handler: unknown) => {}
+    const noopOn = (_event: string, _handler: unknown) => {}
+    const launched: LaunchedBrowser = {
+      browser: { close: noop } as unknown as LaunchedBrowser['browser'],
+      context: {
+        close: noop,
+        route: noopRoute,
+        on: noopOn,
+      } as unknown as LaunchedBrowser['context'],
+      page: {
+        url: () => 'about:blank',
+        title: async () => '',
+        goto: navigateImpl !== undefined ? vi.fn(navigateImpl) : async () => null,
+        evaluate: vi.fn(evaluateImpl),
+      } as unknown as LaunchedBrowser['page'],
+    }
+    return new PlaywrightBrowserSession({
+      id: 'sess-atom' as ComputerSessionId,
+      settings: makeSettings({ allowedDomains: ['example.com'] }),
+      options: { headless: true, allowHttpForTest: false },
+      requestClose: async () => {},
+      launched,
+    })
+  }
+
+  function makeAtomCache(ariaHash: string, atomId = 'a-0'): {
+    url: string
+    ariaHash: string
+    entries: Map<string, import('./atomResolver.js').AtomEntry>
+  } {
+    return {
+      url: 'https://example.com/',
+      ariaHash,
+      entries: new Map([
+        [
+          atomId,
+          {
+            atomId,
+            role: 'button',
+            displayName: 'X',
+            locatorName: 'X',
+            node: {
+              role: 'button', name: 'X', bbox: null, focused: false, disabled: false, children: [],
+            },
+            ancestorPath: [],
+            nth: 0,
+          },
+        ],
+      ]),
+    }
+  }
+
+  const sampleTree = {
+    role: 'main', name: null, bbox: null, focused: false, disabled: false,
+    children: [{ role: 'button', name: 'X', bbox: null, focused: false, disabled: false, children: [] }],
+  }
+
+  it('setAtomCache + currentAtomCache round-trip', () => {
+    const session = makeSession(async () => sampleTree)
+    expect(session.currentAtomCache()).toBeNull()
+    const cache = makeAtomCache('h1')
+    session.setAtomCache(cache)
+    expect(session.currentAtomCache()).toBe(cache)
+  })
+
+  it('lookupAtom returns null when no cache is set', () => {
+    const session = makeSession(async () => sampleTree)
+    expect(session.lookupAtom('a-0')).toBeNull()
+  })
+
+  it('lookupAtom returns the entry when cache.ariaHash matches the live ARIA hash (replay)', async () => {
+    const session = makeSession(async () => sampleTree)
+    // Take a snapshot so _lastAriaSnapshot is set; build the cache against that hash.
+    const snap = await session.ariaSnapshot(new AbortController().signal)
+    session.setAtomCache(makeAtomCache(snap.hash))
+    const entry = session.lookupAtom('a-0')
+    expect(entry).not.toBeNull()
+    expect(entry?.atomId).toBe('a-0')
+  })
+
+  it('lookupAtom returns null when liveAriaHash diverges from cache.ariaHash (stale-cache guard)', async () => {
+    // This is the high-severity bypass fix: after an action mutates the page
+    // and a fresh ariaSnapshot updates _lastAriaSnapshot to a NEW hash, the
+    // cached atomId must no longer resolve — the cached AriaNode could
+    // misrepresent the live element (e.g., a previously-disabled Delete
+    // button that's now enabled).
+    let call = 0
+    const trees = [
+      sampleTree,
+      // Second snapshot has a different child name → different YAML hash.
+      {
+        role: 'main', name: null, bbox: null, focused: false, disabled: false,
+        children: [{ role: 'button', name: 'Y', bbox: null, focused: false, disabled: false, children: [] }],
+      },
+    ]
+    const session = makeSession(async () => {
+      const t = trees[call] ?? sampleTree
+      call++
+      return t
+    })
+    const snap1 = await session.ariaSnapshot(new AbortController().signal)
+    session.setAtomCache(makeAtomCache(snap1.hash))
+    expect(session.lookupAtom('a-0')).not.toBeNull()
+    // Recapture — _lastAriaSnapshot now has a different hash.
+    const snap2 = await session.ariaSnapshot(new AbortController().signal)
+    expect(snap2.hash).not.toBe(snap1.hash)
+    // Cache wasn't refreshed → lookupAtom must refuse.
+    expect(session.lookupAtom('a-0')).toBeNull()
+  })
+
+  it('lookupAtom returns null when _lastAriaSnapshot is null (post-action capture failed)', async () => {
+    let call = 0
+    const session = makeSession(async () => {
+      call++
+      if (call === 1) return sampleTree
+      throw new Error('evaluate failed')
+    })
+    const snap = await session.ariaSnapshot(new AbortController().signal)
+    session.setAtomCache(makeAtomCache(snap.hash))
+    expect(session.lookupAtom('a-0')).not.toBeNull()
+    // Failed recapture clears _lastAriaSnapshot (Phase 4·1 fix #7).
+    await expect(session.ariaSnapshot(new AbortController().signal)).rejects.toMatchObject({
+      kind: 'interaction_failed',
+    })
+    expect(session.lastAriaSnapshot()).toBeNull()
+    // Defensive posture: no live hash means we can't trust the cache either.
+    expect(session.lookupAtom('a-0')).toBeNull()
+  })
+
+  it('navigate() clears the atom cache eagerly', async () => {
+    const session = makeSession(
+      async () => sampleTree,
+      async () => null,
+    )
+    const snap = await session.ariaSnapshot(new AbortController().signal)
+    session.setAtomCache(makeAtomCache(snap.hash))
+    expect(session.currentAtomCache()).not.toBeNull()
+    await session.navigate('https://example.com/x', new AbortController().signal)
+    expect(session.currentAtomCache()).toBeNull()
+  })
+
+  it('close() clears the atom cache', async () => {
+    const session = makeSession(async () => sampleTree)
+    const snap = await session.ariaSnapshot(new AbortController().signal)
+    session.setAtomCache(makeAtomCache(snap.hash))
+    expect(session.currentAtomCache()).not.toBeNull()
+    await session.close()
+    expect(session.currentAtomCache()).toBeNull()
+    expect(session.lookupAtom('a-0')).toBeNull()
+  })
+})

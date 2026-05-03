@@ -324,6 +324,9 @@ export class QueryEngine {
       this.toolRegistry.register(computerTools.wait)
       this.toolRegistry.register(computerTools.handoffToUser)
       this.toolRegistry.register(computerTools.stop)
+      // Phase 4b — DOM-first action path.
+      this.toolRegistry.register(computerTools.observeActions)
+      this.toolRegistry.register(computerTools.actAtom)
     } else {
       this._sessionManager = null
     }
@@ -798,6 +801,7 @@ export class QueryEngine {
       const systemPromptParts = await buildFullSystemPromptParts(this.config.cwd, {
         memoryBaseDir: this._memoryBaseDir,
         activeSkill: this._activeSkill,
+        computerUseEnabled: this._computerUseSettings.enabled,
       })
 
       // Phase 5b: when a skill with allowedTools is active, the cascade

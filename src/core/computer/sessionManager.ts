@@ -26,7 +26,43 @@ import {
   type ComputerSessionId,
   type ComputerSessionManager,
   type StartSessionOptions,
+  type StepDecision,
+  type StepSignals,
 } from './types.js'
+
+/**
+ * v3 Phase 5 — ring length for the no-progress detector. Hardcoded for v3;
+ * Phase 6 evals decide whether to lift it into `ComputerUseSettings`.
+ */
+export const NO_PROGRESS_WINDOW = 3
+
+function pushRing<T>(ring: T[], value: T, cap: number): void {
+  ring.push(value)
+  while (ring.length > cap) ring.shift()
+}
+
+/**
+ * True iff the ring has reached `cap` entries AND every entry is non-null.
+ * "Non-null" means the underlying capture (ARIA or pHash) succeeded; a
+ * `null` entry is a missing-signal hole, not a stall.
+ */
+function ringFullyNonNull<T>(ring: (T | null)[], cap: number): boolean {
+  if (ring.length !== cap) return false
+  for (const v of ring) {
+    if (v === null) return false
+  }
+  return true
+}
+
+/** True iff every entry in the ring equals the first entry. Empty rings → false. */
+function ringAllEqual<T>(ring: T[]): boolean {
+  if (ring.length === 0) return false
+  const first = ring[0]
+  for (let i = 1; i < ring.length; i++) {
+    if (ring[i] !== first) return false
+  }
+  return true
+}
 
 /**
  * Factory injected into SessionManager so unit tests can run without Playwright.
@@ -42,6 +78,18 @@ export type BrowserSessionFactory = (params: {
   readonly requestClose: (reason: 'aborted' | 'timeout' | 'error') => Promise<void>
 }) => Promise<BrowserSession>
 
+/**
+ * v3 Phase 5 — per-session step counter + no-progress signal rings.
+ * Mutated in place by `recordStep`. Bag is part of the entry to keep state
+ * lifecycle tied to the session (clears with `closeOnce`).
+ */
+type StepHistory = {
+  stepCount: number
+  recentAriaHashes: (string | null)[]
+  recentPhashes: (string | null)[]
+  recentVerifyOk: (boolean | null)[]
+}
+
 type SessionEntry = {
   readonly id: ComputerSessionId
   readonly session: BrowserSession
@@ -49,6 +97,7 @@ type SessionEntry = {
   readonly abortListener: (() => void) | null
   readonly abortSignal: AbortSignal | null
   closed: boolean
+  readonly history: StepHistory
 }
 
 export class SessionManager implements ComputerSessionManager {
@@ -110,6 +159,12 @@ export class SessionManager implements ComputerSessionManager {
       abortListener: null,
       abortSignal: signal,
       closed: false,
+      history: {
+        stepCount: 0,
+        recentAriaHashes: [],
+        recentPhashes: [],
+        recentVerifyOk: [],
+      },
     }
 
     // Build the runtime session.
@@ -179,6 +234,107 @@ export class SessionManager implements ComputerSessionManager {
   async stopAll(): Promise<void> {
     const ids = [...this._sessions.keys()]
     await Promise.all(ids.map((id) => this.closeOnce(id)))
+  }
+
+  /**
+   * v3 Phase 5 — record a mutating-action step. See the `ComputerSessionManager`
+   * interface JSDoc for the full contract.
+   *
+   * Behavior:
+   * 1. No-op (`{abort: false}`) for unknown / closed sessions.
+   * 2. Increment `stepCount`. If `> settings.maxSteps`, return abort with a
+   *    `step_limit_exceeded` reason and schedule `requestClose(id, 'error')`
+   *    via `setImmediate` so the tool's response ships first.
+   * 3. Push signals onto the no-progress rings (capped at `NO_PROGRESS_WINDOW`).
+   * 4. Evaluate no-progress with the false-positive guard:
+   *    - **Primary** (`verifyActions === true`): abort iff `recentVerifyOk`
+   *      length === 3 AND every entry is strictly `false`. `verified === false`
+   *      already means "no available signal detected change", so this single
+   *      check covers both the canvas case (pHash moved → `verified: true` →
+   *      ring resets) and the DOM-only case (ARIA changed → `verified: true`
+   *      → ring resets).
+   *    - **Fallback** (`verifyActions === false`): abort iff at least one
+   *      signal has a fully non-null ring AND every fully non-null ring is
+   *      stalled (all entries equal). This matches the v3 plan acceptance
+   *      ("repeated identical screenshots OR repeated identical ARIA
+   *      snapshots") — a stall on the only available signal aborts; a stall
+   *      on one signal while the other shows progress does not (canvas /
+   *      DOM-only false-positive guard); both signals unavailable means no
+   *      evidence and no abort.
+   */
+  recordStep(id: ComputerSessionId, signals: StepSignals): StepDecision {
+    const entry = this._sessions.get(id)
+    if (!entry || entry.closed) return { abort: false }
+
+    const h = entry.history
+    h.stepCount += 1
+
+    if (h.stepCount > this._settings.maxSteps) {
+      this._scheduleClose(id)
+      return {
+        abort: true,
+        reason: `step_limit_exceeded (N=${h.stepCount}, max=${this._settings.maxSteps})`,
+      }
+    }
+
+    pushRing(h.recentAriaHashes, signals.ariaHash, NO_PROGRESS_WINDOW)
+    pushRing(h.recentPhashes, signals.phash, NO_PROGRESS_WINDOW)
+    pushRing(h.recentVerifyOk, signals.verified, NO_PROGRESS_WINDOW)
+
+    if (this._settings.verifyActions) {
+      // Primary rule — verify-driven.
+      if (
+        h.recentVerifyOk.length === NO_PROGRESS_WINDOW &&
+        h.recentVerifyOk.every((v) => v === false)
+      ) {
+        this._scheduleClose(id)
+        return {
+          abort: true,
+          reason: `no_progress: ${NO_PROGRESS_WINDOW} consecutive verified:false steps`,
+        }
+      }
+    } else {
+      // Fallback rule (review fix #2) — abort iff every AVAILABLE signal is
+      // stalled AND at least one signal is available. The previous version
+      // required BOTH signals stalled simultaneously, which silently let
+      // through "3 identical pHashes with ARIA capture failed for all 3"
+      // (a real spinning case the v3 plan calls out: "duplicate screenshot
+      // pHash" alone counts as no-progress) and the symmetric ARIA case.
+      //
+      // The canvas / DOM-only false-positive guard is preserved: when both
+      // signals are AVAILABLE and one shows progress, that signal's ring is
+      // not "stalled" (it has varying entries), so `stalledCount` will not
+      // equal `availableCount` and we don't abort.
+      const ariaAvail = ringFullyNonNull(h.recentAriaHashes, NO_PROGRESS_WINDOW)
+      const phashAvail = ringFullyNonNull(h.recentPhashes, NO_PROGRESS_WINDOW)
+      const ariaStalled = ariaAvail && ringAllEqual(h.recentAriaHashes)
+      const phashStalled = phashAvail && ringAllEqual(h.recentPhashes)
+      const availableCount = (ariaAvail ? 1 : 0) + (phashAvail ? 1 : 0)
+      const stalledCount = (ariaStalled ? 1 : 0) + (phashStalled ? 1 : 0)
+      if (availableCount > 0 && stalledCount === availableCount) {
+        const which: string[] = []
+        if (ariaStalled) which.push('ARIA')
+        if (phashStalled) which.push('pHash')
+        this._scheduleClose(id)
+        return {
+          abort: true,
+          reason: `no_progress: ${which.join(' and ')} unchanged for ${NO_PROGRESS_WINDOW} consecutive steps`,
+        }
+      }
+    }
+
+    return { abort: false }
+  }
+
+  /**
+   * Fire-and-forget close scheduled to run after the current microtask so the
+   * tool's `errorResult` returns to the model before the session tears down.
+   * Mirrors the abort-listener pattern at line 131-133.
+   */
+  private _scheduleClose(id: ComputerSessionId): void {
+    setImmediate(() => {
+      void this.requestClose(id, 'error')
+    })
   }
 
   /**

@@ -15,12 +15,15 @@ import {
   type AriaTreeSnapshot,
   type BoundingBox,
 } from '../computer/ariaSnapshot.js'
+import type { AtomEntry } from '../computer/atomResolver.js'
+import type { SessionAtomCache } from '../computer/selectorCache.js'
 import type {
   BrowserSession,
   ComputerSessionId,
   ComputerSessionManager,
   ComputerViewport,
   StartSessionOptions,
+  StepDecision,
 } from '../computer/types.js'
 import type { Tool } from '../tools/types.js'
 import type { ToolUseContext } from '../tools/context.js'
@@ -95,6 +98,19 @@ class StubSession implements BrowserSession {
   async exportStorageState(): Promise<unknown> {
     return {}
   }
+  // Phase 4b — atom catalog. Tests that exercise ActAtom seed `_atomCache`
+  // directly via `setAtomCache`; the rest get the default empty behavior.
+  private _atomCache: SessionAtomCache | null = null
+  async actOnAtom(): Promise<void> {}
+  setAtomCache(cache: SessionAtomCache): void {
+    this._atomCache = cache
+  }
+  lookupAtom(atomId: string): AtomEntry | null {
+    return this._atomCache?.entries.get(atomId) ?? null
+  }
+  currentAtomCache(): SessionAtomCache | null {
+    return this._atomCache
+  }
 }
 
 class FakeManager implements ComputerSessionManager {
@@ -113,6 +129,7 @@ class FakeManager implements ComputerSessionManager {
   async stop(): Promise<void> {}
   async stopAll(): Promise<void> {}
   async requestClose(): Promise<void> {}
+  recordStep(): StepDecision { return { abort: false } }
 }
 
 function fakeTool(name: string): Tool {
@@ -346,6 +363,119 @@ describe('makeComputerUseSafetyCheck', () => {
       const check = makeComputerUseSafetyCheck({ sessionManager: mgr })
       // ComputerStart is in ALWAYS_REVERSIBLE_TOOLS → level 1 → null.
       expect(check(fakeTool('ComputerStart'), {}, fakeContext())).toBeNull()
+    })
+  })
+
+  describe('Phase 4b — ComputerActAtom atom resolution', () => {
+    it('ComputerObserveActions → null (level 0 observation)', () => {
+      const mgr = new FakeManager()
+      mgr.add('s1', null)
+      const check = makeComputerUseSafetyCheck({ sessionManager: mgr })
+      expect(
+        check(fakeTool('ComputerObserveActions'), { sessionId: 's1' }, fakeContext()),
+      ).toBeNull()
+    })
+
+    it('ComputerActAtom on cached <button>Delete</button> → ask riskLevel 3', () => {
+      const mgr = new FakeManager()
+      mgr.add('s1', null)
+      // Seed the cache directly with an entry whose node carries a dangerous label.
+      const session = mgr.get('s1' as ComputerSessionId)!
+      session.setAtomCache({
+        url: 'https://example.com/',
+        ariaHash: 'h',
+        entries: new Map([
+          [
+            'a-0',
+            {
+              atomId: 'a-0',
+              role: 'button',
+              displayName: 'Delete account',
+              locatorName: 'Delete account',
+              node: node('button', { name: 'Delete account' }),
+              ancestorPath: [],
+              nth: 0,
+            },
+          ],
+        ]),
+      })
+      const check = makeComputerUseSafetyCheck({ sessionManager: mgr })
+      const decision = check(
+        fakeTool('ComputerActAtom'),
+        { sessionId: 's1', atomId: 'a-0', action: { type: 'click' } },
+        fakeContext(),
+      )
+      expect(decision).not.toBeNull()
+      expect(decision!.behavior).toBe('ask')
+      const sc = decision!.reason as {
+        type: 'safetyCheck'
+        metadata?: { riskLevel: number; evidence?: { nearbyText?: string } }
+      }
+      expect(sc.metadata?.riskLevel).toBe(3)
+      expect(sc.metadata?.evidence?.nearbyText).toBe('Delete account')
+    })
+
+    it('ComputerActAtom fill on cached password input → ask riskLevel 2', () => {
+      const mgr = new FakeManager()
+      mgr.add('s1', null)
+      const session = mgr.get('s1' as ComputerSessionId)!
+      session.setAtomCache({
+        url: 'https://example.com/',
+        ariaHash: 'h',
+        entries: new Map([
+          [
+            'a-3',
+            {
+              atomId: 'a-3',
+              role: 'textbox',
+              displayName: '[REDACTED]',
+              locatorName: 'Password',
+              node: node('textbox', { name: 'Password', fieldType: 'password' }),
+              ancestorPath: [],
+              nth: 0,
+            },
+          ],
+        ]),
+      })
+      const check = makeComputerUseSafetyCheck({ sessionManager: mgr })
+      const decision = check(
+        fakeTool('ComputerActAtom'),
+        { sessionId: 's1', atomId: 'a-3', action: { type: 'fill', text: 'x' } },
+        fakeContext(),
+      )
+      expect(decision!.behavior).toBe('ask')
+      const sc = decision!.reason as {
+        type: 'safetyCheck'
+        metadata?: { riskLevel: number; evidence?: { fieldType?: string } }
+      }
+      expect(sc.metadata?.riskLevel).toBe(2)
+      expect(sc.metadata?.evidence?.fieldType).toBe('password')
+    })
+
+    it('ComputerActAtom with cache miss → null (cascade defers; tool errors at execute time)', () => {
+      const mgr = new FakeManager()
+      mgr.add('s1', null) // session exists but has no atom cache
+      const check = makeComputerUseSafetyCheck({ sessionManager: mgr })
+      expect(
+        check(
+          fakeTool('ComputerActAtom'),
+          { sessionId: 's1', atomId: 'a-99', action: { type: 'click' } },
+          fakeContext(),
+        ),
+      ).toBeNull()
+    })
+
+    it('ComputerActAtom with non-string atomId → null (cascade defers)', () => {
+      const mgr = new FakeManager()
+      mgr.add('s1', null)
+      const check = makeComputerUseSafetyCheck({ sessionManager: mgr })
+      expect(
+        check(
+          fakeTool('ComputerActAtom'),
+          { sessionId: 's1', atomId: 42, action: { type: 'click' } },
+          fakeContext(),
+        ),
+      ).toBeNull()
     })
   })
 })

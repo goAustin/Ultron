@@ -11,6 +11,8 @@
 
 import type { ToolResultAttachment } from '../tools/imageAttachment.js'
 import type { AriaTreeSnapshot, BoundingBox } from './ariaSnapshot.js'
+import type { AtomEntry, AtomAction, AtomLocator } from './atomResolver.js'
+import type { SessionAtomCache } from './selectorCache.js'
 
 export type { BoundingBox }
 
@@ -70,6 +72,7 @@ export type BrowserSessionErrorKind =
   | 'aborted'
   | 'timeout'
   | 'interaction_failed'
+  | 'atom_locator_failed'
 
 export class BrowserSessionError extends Error {
   readonly kind: BrowserSessionErrorKind
@@ -153,7 +156,58 @@ export interface BrowserSession {
   // it via `storageStateStore.writeStorageState`. Aborted signal →
   // `BrowserSessionError(kind: 'aborted')` consistent with sibling methods.
   exportStorageState(signal: AbortSignal): Promise<unknown>
+
+  // Phase 4b — DOM-first action path.
+  //
+  // `actOnAtom` resolves a Playwright locator from the cached `AtomLocator`
+  // (role + locatorName + nth), runs two preflight checks, then performs the
+  // requested action:
+  //   1. `getByRole(...).nth(nth).count() === 0` → `BrowserSessionError(kind:
+  //      'atom_locator_failed', message: 'locator resolved zero elements')`.
+  //      The page mutated and the cached element is gone.
+  //   2. When `expectedBbox !== null`, post-resolution `boundingBox()` must
+  //      match within `BBOX_TOLERANCE_PX` (`atomResolver.ts`). Otherwise
+  //      `'atom_locator_failed', 'locator bbox drift exceeds tolerance'` —
+  //      catches the silent-retarget case where a duplicate-name shuffle
+  //      moved `nth` to a different element.
+  // Both error messages stay generic — `mapBrowserSessionError` composes the
+  // model-visible recovery message so `locatorName` never leaks.
+  //
+  // `setAtomCache` / `lookupAtom` / `currentAtomCache` are the storage
+  // surface for `ComputerObserveActions` (write) and the safety check (sync
+  // read). Cache is cleared in `close()` and `navigate()` — atomIds are only
+  // valid for the snapshot they were assigned in.
+  actOnAtom(locator: AtomLocator, action: AtomAction, signal: AbortSignal): Promise<void>
+  setAtomCache(cache: SessionAtomCache): void
+  lookupAtom(atomId: string): AtomEntry | null
+  currentAtomCache(): SessionAtomCache | null
 }
+
+/**
+ * v3 Phase 5 — signals captured after a mutating action, fed into
+ * `recordStep` for step-limit + no-progress detection.
+ *
+ * `ariaHash` and `phash` come from the post-action observation already
+ * computed inside `runActionAndObserve` — capturing them is free.
+ * `verified` is the `VerifyResult.verified` boolean from `verify.ts`,
+ * available only when the action ran with `verifyActions: true`.
+ */
+export type StepSignals = {
+  /** SHA-256 hex prefix of the post-action ARIA YAML; null if capture failed. */
+  readonly ariaHash: string | null
+  /** Hex string of `aHash8x8(post-action PNG)`; null if capture failed. */
+  readonly phash: string | null
+  /** `verify.ts` verdict for this action; null when verification is disabled. */
+  readonly verified: boolean | null
+}
+
+/**
+ * v3 Phase 5 — `recordStep` decision. `reason` is model-visible (it lands in
+ * the tool's `errorResult` content).
+ */
+export type StepDecision =
+  | { readonly abort: false }
+  | { readonly abort: true; readonly reason: string }
 
 /**
  * Public-shape contract for `SessionManager`. The class implements it; test
@@ -166,4 +220,27 @@ export interface ComputerSessionManager {
   stop(id: ComputerSessionId): Promise<void>
   stopAll(): Promise<void>
   requestClose(id: ComputerSessionId, reason: 'aborted' | 'timeout' | 'error'): Promise<void>
+  /**
+   * v3 Phase 5 — record a mutating-action step. Increments per-session step
+   * counter, pushes signals onto the no-progress rings, returns `{abort: true}`
+   * when (a) `stepCount > settings.maxSteps`, or (b) the no-progress rule
+   * fires. The rule has two modes:
+   *   - When `verifyActions === true`: abort on three consecutive
+   *     `verified: false` results (verify already encodes "no available
+   *     signal moved" — primary path).
+   *   - When `verifyActions === false`: abort when every fully-available
+   *     signal (ARIA hash and/or screenshot pHash) is stalled and at least
+   *     one is available. Matches the v3 acceptance "repeated identical
+   *     screenshots OR repeated identical ARIA snapshots" while preserving
+   *     the canvas / DOM-only false-positive guard (a single moving signal
+   *     resets its ring).
+   * On abort, schedules `requestClose(id, 'error')` via `setImmediate` so
+   * the tool's response ships first.
+   *
+   * Synchronous — only mutates the entry. No-op for unknown / closed sessions.
+   * Read-only tools (`ComputerObserve`, `ComputerWait`, handoff-resume
+   * observation, `ComputerObserveActions`) MUST NOT call this; the counter
+   * measures mutating page interactions.
+   */
+  recordStep(id: ComputerSessionId, signals: StepSignals): StepDecision
 }

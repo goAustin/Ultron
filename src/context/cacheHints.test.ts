@@ -116,6 +116,52 @@ describe('buildSystemPromptParts', () => {
     })
   })
 
+  // -------------------------------------------------------------------------
+  // v3 Phase 5 — computerUseEnabled propagation
+  // -------------------------------------------------------------------------
+
+  it('emits no Computer-Use global part when computerUseEnabled is omitted', async () => {
+    await withTmpDir(async (dir) => {
+      const parts = await buildSystemPromptParts(dir)
+      const cu = parts.find(p => p.cacheHint === 'global' && p.content.includes('# Computer-Use'))
+      expect(cu).toBeUndefined()
+    })
+  })
+
+  it('preamble bytes are identical whether computerUseEnabled is omitted or false', async () => {
+    await withTmpDir(async (dir) => {
+      const omitted = await buildSystemPromptParts(dir)
+      const off = await buildSystemPromptParts(dir, { computerUseEnabled: false })
+      const omittedGlobal = omitted.filter(p => p.cacheHint === 'global').map(p => p.content)
+      const offGlobal = off.filter(p => p.cacheHint === 'global').map(p => p.content)
+      expect(omittedGlobal).toEqual(offGlobal)
+    })
+  })
+
+  it('appends one extra global Computer-Use part when computerUseEnabled is true', async () => {
+    await withTmpDir(async (dir) => {
+      const off = await buildSystemPromptParts(dir)
+      const on = await buildSystemPromptParts(dir, { computerUseEnabled: true })
+      const offGlobal = off.filter(p => p.cacheHint === 'global')
+      const onGlobal = on.filter(p => p.cacheHint === 'global')
+      expect(onGlobal.length).toBe(offGlobal.length + 1)
+      const cu = onGlobal[onGlobal.length - 1]!
+      expect(cu.content).toContain('# Computer-Use')
+      expect(cu.content).toContain('<untrusted-page-text>')
+      expect(cu.cacheHint).toBe('global')
+    })
+  })
+
+  it('Computer-Use part precedes any volatile parts (preamble ordering preserved)', async () => {
+    await withTmpDir(async (dir) => {
+      const parts = await buildSystemPromptParts(dir, { computerUseEnabled: true })
+      const idxCu = parts.findIndex(p => p.content.includes('# Computer-Use'))
+      const idxFirstVol = parts.findIndex(p => p.cacheHint === 'volatile')
+      expect(idxCu).toBeGreaterThanOrEqual(0)
+      expect(idxFirstVol).toBeGreaterThan(idxCu)
+    })
+  })
+
   it('emits exactly one org part between global and volatile when memory has entries', async () => {
     await withTmpDir(async (dir) => {
       await withTmpDir(async (memBase) => {

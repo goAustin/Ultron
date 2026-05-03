@@ -35,9 +35,17 @@ import {
   type AriaTreeSnapshot,
   type BoundingBox,
 } from './ariaSnapshot.js'
+import {
+  bboxesMatch,
+  BBOX_TOLERANCE_PX,
+  type AtomAction,
+  type AtomEntry,
+  type AtomLocator,
+} from './atomResolver.js'
 import { normalizedToCssPx } from './coordinates.js'
 import { isDomainAllowed, isUrlSchemeAllowed } from './policy.js'
 import { blackoutRegions, buildSelectorList } from './redaction.js'
+import type { SessionAtomCache } from './selectorCache.js'
 import { stabilize } from './stabilize.js'
 import type { BrowserSessionFactory } from './sessionManager.js'
 import {
@@ -207,6 +215,12 @@ export class PlaywrightBrowserSession implements BrowserSession {
   // synchronously by the safety check via `lastAriaSnapshot()`. Cleared on
   // close so a closed session can never serve stale ARIA.
   private _lastAriaSnapshot: AriaTreeSnapshot | null = null
+  // Phase 4b: per-session atom catalog. Populated by `ComputerObserveActions`
+  // via `setAtomCache`; read synchronously by the safety check via
+  // `lookupAtom` (so it can pass `targetNode` to the classifier without an
+  // async hop). Cleared on `close()` and `navigate()` — atomIds are only
+  // valid for the snapshot they were assigned in.
+  private _atomCache: SessionAtomCache | null = null
 
   constructor(params: {
     readonly id: ComputerSessionId
@@ -274,6 +288,13 @@ export class PlaywrightBrowserSession implements BrowserSession {
 
   async navigate(url: string, signal: AbortSignal): Promise<void> {
     if (this._closed) throw new BrowserSessionError('session_closed', 'session is closed')
+
+    // Phase 4b — atomIds are scoped to the URL they were observed on.
+    // A navigation invalidates the catalog; locator-name strings might still
+    // match elements on the new page, but they wouldn't be the same elements.
+    // Clear eagerly so a `Observe → Navigate → ActAtom` sequence reaches the
+    // cache-miss path instead of acting on a stale entry.
+    this._atomCache = null
 
     // Pre-flight checks (synchronous; reject before opening any socket).
     const schemeCheck = isUrlSchemeAllowed(url, {
@@ -518,6 +539,7 @@ export class PlaywrightBrowserSession implements BrowserSession {
     if (this._closed) return
     this._closed = true
     this._lastAriaSnapshot = null
+    this._atomCache = null
     // Close context first, then browser. Either may throw if Playwright already
     // tore them down due to a crash; we swallow but do not re-throw because
     // close() must be idempotent and best-effort.
@@ -745,5 +767,120 @@ export class PlaywrightBrowserSession implements BrowserSession {
         throw new BrowserSessionError('interaction_failed', `mouse action failed: ${msg}`)
       }
     })
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 4b — DOM-first action path
+  // -------------------------------------------------------------------------
+
+  async actOnAtom(
+    locator: AtomLocator,
+    action: AtomAction,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (this._closed) throw new BrowserSessionError('session_closed', 'session is closed')
+    await this._withAbort(signal, async () => {
+      const base = this._page.getByRole(
+        locator.role as Parameters<Page['getByRole']>[0],
+        locator.locatorName !== null ? { name: locator.locatorName, exact: true } : {},
+      )
+      const target = base.nth(locator.nth)
+
+      // Preflight 1 — count > 0 (the cached element is still in the DOM).
+      // Generic messages — `mapBrowserSessionError` writes the model-visible
+      // recovery text so `locatorName` never leaks downstream.
+      let matches: number
+      try {
+        matches = await target.count()
+      } catch (err) {
+        if (this._closed) {
+          throw new BrowserSessionError('aborted', 'actOnAtom aborted (session closing)')
+        }
+        const msg = err instanceof Error ? err.message : String(err)
+        throw new BrowserSessionError('interaction_failed', `actOnAtom count failed: ${msg}`)
+      }
+      if (matches === 0) {
+        throw new BrowserSessionError('atom_locator_failed', 'locator resolved zero elements')
+      }
+
+      // Preflight 2 — bbox-drift (page didn't silently retarget `nth` to a
+      // different element via duplicate-name shuffle). Only meaningful when
+      // we have a cached bbox; entries without one fall back to count-only.
+      if (locator.expectedBbox !== null) {
+        let live: BoundingBox | null
+        try {
+          live = await target.boundingBox()
+        } catch (err) {
+          if (this._closed) {
+            throw new BrowserSessionError('aborted', 'actOnAtom aborted (session closing)')
+          }
+          const msg = err instanceof Error ? err.message : String(err)
+          throw new BrowserSessionError('interaction_failed', `actOnAtom boundingBox failed: ${msg}`)
+        }
+        if (live === null || !bboxesMatch(live, locator.expectedBbox, BBOX_TOLERANCE_PX)) {
+          throw new BrowserSessionError(
+            'atom_locator_failed',
+            'locator bbox drift exceeds tolerance',
+          )
+        }
+      }
+
+      // Action.
+      try {
+        switch (action.type) {
+          case 'click':
+            if (action.double === true) {
+              await target.dblclick({ button: action.button ?? 'left' })
+            } else {
+              await target.click({ button: action.button ?? 'left' })
+            }
+            return
+          case 'fill':
+            await target.fill(action.text)
+            return
+          case 'select':
+            await target.selectOption(action.value)
+            return
+        }
+      } catch (err) {
+        if (this._closed) {
+          throw new BrowserSessionError('aborted', 'actOnAtom aborted (session closing)')
+        }
+        const msg = err instanceof Error ? err.message : String(err)
+        throw new BrowserSessionError('interaction_failed', `actOnAtom ${action.type} failed: ${msg}`)
+      }
+    })
+  }
+
+  setAtomCache(cache: SessionAtomCache): void {
+    this._atomCache = cache
+  }
+
+  lookupAtom(atomId: string): AtomEntry | null {
+    if (this._closed) return null
+    if (this._atomCache === null) return null
+    // Phase 4b stale-cache guard: the safety check classifies the cached
+    // `AriaNode`, but `actOnAtom` resolves the LIVE Playwright locator. If
+    // the page mutated since observation (e.g., a disabled `Delete account`
+    // button became enabled), the cached node misrepresents reality and the
+    // classifier could approve a now-dangerous click.
+    //
+    // `runActionAndObserve` refreshes `_lastAriaSnapshot` after every action;
+    // when its hash diverges from the cache's hash, the cache is stale.
+    // Returning null pushes the safety check to `targetNode === null`
+    // (classifier defers to level 1) AND the tool body returns
+    // `'atom_resolution_failed'` so the model re-observes.
+    //
+    // When `_lastAriaSnapshot` is null (post-action recapture failed —
+    // network glitch, page errored), we also refuse: matching Phase 4·1
+    // fix #7's defensive posture for `lastAriaSnapshot` clearing.
+    const liveHash = this._lastAriaSnapshot?.hash
+    if (liveHash === undefined || liveHash !== this._atomCache.ariaHash) return null
+    return this._atomCache.entries.get(atomId) ?? null
+  }
+
+  currentAtomCache(): SessionAtomCache | null {
+    if (this._closed) return null
+    return this._atomCache
   }
 }

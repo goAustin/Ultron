@@ -814,4 +814,144 @@ describe('classifyAction', () => {
       expect(r.level).toBe(1)
     })
   })
+
+  describe('Phase 4b — ComputerObserveActions', () => {
+    it('classifies as level 0 observation', () => {
+      const r = classifyAction({
+        toolName: 'ComputerObserveActions',
+        input: { sessionId: 's1' },
+        currentUrl: null,
+      })
+      expect(r.level).toBe(0)
+      expect(r.category).toBe('observation')
+    })
+  })
+
+  describe('Phase 4b — ComputerActAtom', () => {
+    function nodeFor(role: string, partial: Partial<AriaNode> = {}): AriaNode {
+      return {
+        role,
+        name: partial.name ?? null,
+        bbox: partial.bbox ?? null,
+        focused: partial.focused ?? false,
+        disabled: partial.disabled ?? false,
+        children: partial.children ?? [],
+        ...(partial.fieldType !== undefined && { fieldType: partial.fieldType }),
+        ...(partial.autocomplete !== undefined && { autocomplete: partial.autocomplete }),
+        ...(partial.fieldName !== undefined && { fieldName: partial.fieldName }),
+      }
+    }
+
+    it('click on a Submit button → level 3 with nearbyText evidence', () => {
+      const target = nodeFor('button', { name: 'Submit' })
+      const r = classifyAction({
+        toolName: 'ComputerActAtom',
+        input: { sessionId: 's1', atomId: 'a-0', action: { type: 'click' } },
+        currentUrl: null,
+        targetNode: target,
+      })
+      expect(r.level).toBe(3)
+      expect(r.category).toBe('irreversible')
+      expect(r.evidence?.nearbyText).toBe('Submit')
+    })
+
+    it('click on a Delete account button → level 3', () => {
+      const target = nodeFor('button', { name: 'Delete account' })
+      const r = classifyAction({
+        toolName: 'ComputerActAtom',
+        input: { sessionId: 's1', atomId: 'a-0', action: { type: 'click' } },
+        currentUrl: null,
+        targetNode: target,
+      })
+      expect(r.level).toBe(3)
+    })
+
+    it('click on a Sign in button → level 1 (benign)', () => {
+      const target = nodeFor('button', { name: 'Sign in' })
+      const r = classifyAction({
+        toolName: 'ComputerActAtom',
+        input: { sessionId: 's1', atomId: 'a-0', action: { type: 'click' } },
+        currentUrl: null,
+        targetNode: target,
+      })
+      expect(r.level).toBe(1)
+    })
+
+    it('fill on a password textbox → level 2 with fieldType evidence', () => {
+      const target = nodeFor('textbox', { name: 'Password', fieldType: 'password' })
+      const r = classifyAction({
+        toolName: 'ComputerActAtom',
+        input: { sessionId: 's1', atomId: 'a-0', action: { type: 'fill', text: 'x' } },
+        currentUrl: null,
+        targetNode: target,
+      })
+      expect(r.level).toBe(2)
+      expect(r.category).toBe('sensitive_input')
+      expect(r.evidence?.fieldType).toBe('password')
+    })
+
+    it('fill on a cc-number text input → level 2 (autocomplete-driven)', () => {
+      const target = nodeFor('textbox', {
+        name: 'Card',
+        fieldType: 'text',
+        autocomplete: 'cc-number',
+      })
+      const r = classifyAction({
+        toolName: 'ComputerActAtom',
+        input: { sessionId: 's1', atomId: 'a-0', action: { type: 'fill', text: 'x' } },
+        currentUrl: null,
+        targetNode: target,
+      })
+      expect(r.level).toBe(2)
+      expect(r.evidence?.fieldType).toBe('cc-number')
+    })
+
+    it('fill with sensitive=true on a benign textbox → level 2', () => {
+      const target = nodeFor('textbox', { name: 'Notes', fieldType: 'text' })
+      const r = classifyAction({
+        toolName: 'ComputerActAtom',
+        input: {
+          sessionId: 's1',
+          atomId: 'a-0',
+          action: { type: 'fill', text: 'x', sensitive: true },
+        },
+        currentUrl: null,
+        targetNode: target,
+      })
+      expect(r.level).toBe(2)
+    })
+
+    it('fill on a benign textbox → level 1', () => {
+      const target = nodeFor('textbox', { name: 'Email', fieldType: 'text' })
+      const r = classifyAction({
+        toolName: 'ComputerActAtom',
+        input: { sessionId: 's1', atomId: 'a-0', action: { type: 'fill', text: 'x' } },
+        currentUrl: null,
+        targetNode: target,
+      })
+      expect(r.level).toBe(1)
+    })
+
+    it('select → level 1 regardless of target', () => {
+      const target = nodeFor('combobox', { name: 'Country' })
+      const r = classifyAction({
+        toolName: 'ComputerActAtom',
+        input: { sessionId: 's1', atomId: 'a-0', action: { type: 'select', value: 'US' } },
+        currentUrl: null,
+        targetNode: target,
+      })
+      expect(r.level).toBe(1)
+    })
+
+    it('targetNode === null (cache miss) → level 1; cascade defers', () => {
+      const r = classifyAction({
+        toolName: 'ComputerActAtom',
+        input: { sessionId: 's1', atomId: 'a-99', action: { type: 'click' } },
+        currentUrl: null,
+        targetNode: null,
+      })
+      expect(r.level).toBe(1)
+      expect(r.reason).toContain('atomId not resolvable')
+    })
+  })
 })

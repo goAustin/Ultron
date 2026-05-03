@@ -39,13 +39,19 @@ export type BuildSystemPromptPartsOpts = {
    * `null`/`undefined` no-ops (no skill injection).
    */
   readonly activeSkill?: ActiveSkill | null
+  /**
+   * v3 Phase 5: when `true`, the static preamble includes the Computer-Use
+   * guidance section. Threaded through to `buildSystemPrompt`. Defaults to
+   * the byte-identical pre-Phase-5 preamble when omitted/false.
+   */
+  readonly computerUseEnabled?: boolean
 }
 
 export async function buildSystemPromptParts(
   cwd: string,
   opts: BuildSystemPromptPartsOpts = {},
 ): Promise<SystemPromptPart[]> {
-  const staticSections = buildSystemPrompt()
+  const staticSections = buildSystemPrompt({ computerUseEnabled: opts.computerUseEnabled })
   const systemCtx = await getSystemContext(cwd)
   const currentDate = `Today's date is ${new Date().toISOString().slice(0, 10)}.`
 

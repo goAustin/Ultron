@@ -59,12 +59,24 @@ export function makeComputerUseSafetyCheck(
     const viewport = session?.viewport
     const currentUrl = session?.currentUrl() ?? null
 
+    // Phase 4b — `ComputerActAtom` carries `input.atomId` which the safety
+    // check resolves to the cached `AriaNode` so the classifier reads the
+    // node directly (no coordinate lookup). On cache miss `targetNode` stays
+    // null and `classifyActAtom` defers to level 1; the tool body returns
+    // 'atom_resolution_failed' at execute time.
+    const atomEntry =
+      tool.name === 'ComputerActAtom' && typeof input.atomId === 'string'
+        ? (session?.lookupAtom(input.atomId) ?? null)
+        : null
+    const targetNode = atomEntry?.node ?? null
+
     const assessment = classifyAction({
       toolName: tool.name,
       input,
       currentUrl,
       ariaSnapshot,
       ...(viewport !== undefined && { viewport }),
+      targetNode,
     })
 
     return decisionFromAssessment(tool.name, assessment)

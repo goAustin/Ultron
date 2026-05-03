@@ -150,6 +150,15 @@ export type ClassifyContext = {
   readonly ariaSnapshot?: AriaTreeSnapshot | null
   /** Required only for tools that use NormalizedPoint coordinates. */
   readonly viewport?: ComputerViewport
+  /**
+   * Phase 4b — pre-resolved AriaNode for `ComputerActAtom`. The safety check
+   * resolves `input.atomId` via `BrowserSession.lookupAtom(atomId)` and passes
+   * the resulting `AriaNode` directly so the classifier doesn't need a
+   * coordinate lookup. `null` when the atomId isn't in the cache (cache
+   * miss); the classifier defers to level 1 in that case and ActAtom errors
+   * out at execute time with `'atom_resolution_failed'`.
+   */
+  readonly targetNode?: AriaNode | null
 }
 
 // Dangerous-label regex. Matches at the START of an accessible name so the
@@ -165,6 +174,9 @@ const DANGEROUS_LABEL_RE = /\b(?:submit|delete|send|pay|purchase|buy|confirm|inv
 const ALWAYS_OBSERVATION_TOOLS = new Set([
   'ComputerObserve',
   'ComputerWait',
+  // Phase 4b — listing actionable atoms is a read; the safety check
+  // classifies it identically to ComputerObserve.
+  'ComputerObserveActions',
 ])
 
 const ALWAYS_REVERSIBLE_TOOLS = new Set([
@@ -236,8 +248,68 @@ export function classifyAction(ctx: ClassifyContext): RiskAssessment {
     return classifyDrag(input, ctx.ariaSnapshot ?? null, ctx.viewport)
   }
 
+  // Phase 4b — ComputerActAtom: targetNode is pre-resolved by the safety
+  // check via `BrowserSession.lookupAtom`. We classify against the node
+  // directly — same dangerous-label / sensitive-field checks as
+  // classifyClick + classifyType.
+  if (toolName === 'ComputerActAtom') {
+    return classifyActAtom(input, ctx.targetNode ?? null)
+  }
+
   // Unknown Computer* tool — level 1 by default.
   return { level: 1, category: 'reversible_ui', reason: `${toolName}: no specific classification` }
+}
+
+/**
+ * Phase 4b — risk classifier for `ComputerActAtom`.
+ *
+ * The safety check has already resolved `input.atomId` to an `AriaNode` (via
+ * `BrowserSession.lookupAtom`) and threaded it through as `ctx.targetNode`.
+ * That node's raw `name` and field-shape signals drive the classification —
+ * the same `classifyTarget` and `isSensitiveNode` predicates the coordinate
+ * tools use, so a `<button>Delete</button>` triggers level 3 whether the
+ * model used `ComputerClick` or `ComputerActAtom`.
+ *
+ * `targetNode === null` means the atomId isn't in the cache (cache miss).
+ * The tool body returns `'atom_resolution_failed'` at execute time without
+ * touching the page; classifying as level 1 here lets the cascade defer to
+ * allow rules / fallback ask just like any benign action — the actual deny
+ * happens in the tool's `call`.
+ */
+function classifyActAtom(
+  input: Record<string, unknown>,
+  target: AriaNode | null,
+): RiskAssessment {
+  const action = (input.action ?? {}) as { type?: string; sensitive?: boolean }
+  if (target === null) {
+    return {
+      level: 1,
+      category: 'reversible_ui',
+      reason: 'atomId not resolvable; cascade defers (ActAtom errors at execute time)',
+    }
+  }
+  if (action.type === 'fill') {
+    if (action.sensitive === true || isSensitiveNode(target)) {
+      const signal = describeSensitiveSignal(target) ?? target.fieldType ?? 'unknown'
+      return {
+        level: 2,
+        category: 'sensitive_input',
+        reason: `fill on a sensitive ${signal} field`,
+        evidence: {
+          fieldType: signal,
+          ...(target.name !== null && { nearbyText: target.name }),
+        },
+      }
+    }
+    return { level: 1, category: 'reversible_ui', reason: 'plain text fill' }
+  }
+  if (action.type === 'select') {
+    return { level: 1, category: 'reversible_ui', reason: 'select option' }
+  }
+  // Default to click — the most common action and the one the dangerous-
+  // label regex was built for. `classifyTarget` reuses `isSensitiveNode`
+  // (catches sensitive-element clicks) and the dangerous-label regex.
+  return classifyTarget(target, 'actAtom click')
 }
 
 function classifyType(

@@ -31,10 +31,17 @@
 import type { ComputerUseSettings } from '../config/computerUseSettings.js'
 import { extractHost } from '../web/domainPolicy.js'
 import {
+  buildLocator,
+  type AtomAction,
+} from '../core/computer/atomResolver.js'
+import {
   normalizedToCssPx as _normalizedToCssPx, // imported only to keep the import
   validateNormalizedPoint,
 } from '../core/computer/coordinates.js'
+import { aHash8x8 } from '../core/computer/pHash.js'
 import { isDomainAllowed, isUrlSchemeAllowed } from '../core/computer/policy.js'
+import { buildAtomCache } from '../core/computer/selectorCache.js'
+import { serializeAtoms } from '../core/computer/atomResolver.js'
 import { loadStorageState, writeStorageState } from '../core/computer/storageStateStore.js'
 import {
   BrowserSessionError,
@@ -79,6 +86,9 @@ export type ComputerUseTools = {
   wait: Tool
   handoffToUser: Tool
   stop: Tool
+  // Phase 4b — DOM-first action path.
+  observeActions: Tool
+  actAtom: Tool
 }
 
 export function createComputerUseTools(deps: ComputerUseToolsDeps): ComputerUseTools {
@@ -94,6 +104,8 @@ export function createComputerUseTools(deps: ComputerUseToolsDeps): ComputerUseT
     wait: buildWaitTool(deps),
     handoffToUser: buildHandoffToUserTool(deps),
     stop: buildStopTool(deps),
+    observeActions: buildObserveActionsTool(deps),
+    actAtom: buildActAtomTool(deps),
   }
 }
 
@@ -190,6 +202,19 @@ export function mapBrowserSessionError(err: unknown): ToolResult {
       case 'timeout':
       case 'viewport_mismatch':
         return errorResult('execution_error', err.message)
+      case 'atom_locator_failed':
+        // Phase 4b — both locator-preflight failures (zero-match AND
+        // bbox-drift) converge here. We deliberately do NOT echo `err.message`
+        // (which contains internal diagnostics; the call-site keeps it
+        // generic, but the policy is mapper-side: never surface the raw
+        // locator/name into model-visible output). The recovery message is
+        // self-composed and identical to the cache-miss path's message so
+        // the model sees one consistent retry signal.
+        return errorResult(
+          'atom_resolution_failed',
+          'The atom is no longer resolvable on the current page (it may have been removed or the page changed). ' +
+            'Re-observe with ComputerObserveActions, or fall back to ComputerClick / ComputerType.',
+        )
     }
   }
   return errorResult(
@@ -317,7 +342,23 @@ async function runActionAndObserve(
   signal: AbortSignal,
   prefix: string,
   action: () => Promise<void>,
-  opts: { readonly verify: boolean },
+  opts: {
+    readonly verify: boolean
+    readonly attachScreenshot?: boolean
+    /**
+     * v3 Phase 5 — when `true`, calls `sessionManager.recordStep(...)` after
+     * the action so the step counter and no-progress detector observe this
+     * turn. MUST be `true` for mutating tools (Navigate/Click/Type/Key/Scroll/
+     * Drag/ActAtom) and MUST be `false` (or omitted) for read-only paths
+     * (Observe, handoff-resume observation, ObserveActions) — the counter
+     * measures mutating page interactions only.
+     */
+    readonly countStep?: boolean
+  },
+  // Review fix #3 — required (not optional). TS now enforces what the
+  // doc-comment promised: every caller must provide the manager, so the
+  // `countStep: true` branch can never silently no-op due to a missing arg.
+  sessionManager: ComputerSessionManager,
 ): Promise<ToolResult> {
   let preAria: string | null = null
   let prePng: Uint8Array | null = null
@@ -348,10 +389,15 @@ async function runActionAndObserve(
     /* swallow — verification is best-effort */
   }
 
+  // Decode post-action PNG once: verify needs it for pHash, and the Phase 5
+  // step-counter reuses the same hash to feed `recordStep`. No extra
+  // round-trip — `result.attachment.data` is already in hand.
+  const postPng = decodeAttachmentToBytes(result.attachment.data)
+
   let warning = ''
+  let verdict: VerifyResult | null = null
   if (opts.verify) {
-    const postPng = decodeAttachmentToBytes(result.attachment.data)
-    const verdict: VerifyResult = verify(
+    verdict = verify(
       { ariaHash: preAria, pngBuffer: prePng },
       { ariaHash: postAria, pngBuffer: postPng },
     )
@@ -366,24 +412,63 @@ async function runActionAndObserve(
     }
   }
 
+  // v3 Phase 5 — step counting + no-progress detection. Opt-in per call so
+  // observation paths don't mis-count. `sessionManager` is required at the
+  // signature (review fix #3), so the only knob is the boolean.
+  if (opts.countStep === true) {
+    let phashHex: string | null = null
+    try {
+      phashHex = aHash8x8(postPng).toString(16)
+    } catch {
+      // pHash decode failure isn't an action failure — leave null and let
+      // the no-progress detector treat it as a missing signal.
+    }
+    const decision = sessionManager.recordStep(session.id, {
+      ariaHash: postAria,
+      phash: phashHex,
+      verified: opts.verify ? (verdict?.verified ?? null) : null,
+    })
+    if (decision.abort) {
+      return errorResult(
+        'execution_error',
+        `Computer-Use aborted: ${decision.reason}. Re-plan or hand off to the user.`,
+      )
+    }
+  }
+
+  // Phase 4b — `ComputerActAtom` passes `attachScreenshot: false` so the
+  // model receives no image input on the atom-action turn (acceptance:
+  // "without the model receiving a screenshot for that turn"). Internal
+  // capture above still ran — verify needs the bytes for pHash and the
+  // ARIA refresh primes `lastAriaSnapshot()` for the next safety check.
+  // Coordinate tools default to `attachScreenshot: true` so their post-
+  // action observation continues unchanged.
+  const attachScreenshot = opts.attachScreenshot ?? true
   return {
     content: formatObservationText(prefix, result) + warning,
     isError: false,
-    attachments: [result.attachment],
+    ...(attachScreenshot ? { attachments: [result.attachment] } : {}),
   }
 }
 
 /**
  * Backward-compatible wrapper used by the read-only `ComputerObserve` path.
- * Just runs `runActionAndObserve` with a no-op action and verification off
- * (no pre-state to compare against on a pure observation).
+ * Just runs `runActionAndObserve` with a no-op action, verification off (no
+ * pre-state to compare against on a pure observation), and `countStep`
+ * defaulted off (read-only paths must not advance the step counter).
+ *
+ * `sessionManager` is required by `runActionAndObserve` (review fix #3) but
+ * never invoked here because `countStep` stays at the default. We thread it
+ * through for type compliance — the manager is always available in the
+ * factory closure of every caller.
  */
 async function observeAndPack(
   session: BrowserSession,
   signal: AbortSignal,
   prefix: string,
+  sessionManager: ComputerSessionManager,
 ): Promise<ToolResult> {
-  return runActionAndObserve(session, signal, prefix, async () => {}, { verify: false })
+  return runActionAndObserve(session, signal, prefix, async () => {}, { verify: false }, sessionManager)
 }
 
 async function safelyAriaHash(
@@ -424,13 +509,42 @@ function isAbortError(err: unknown): boolean {
   return err instanceof BrowserSessionError && err.kind === 'aborted'
 }
 
+// v3 Phase 5 — page-derived text (`url`, `title`, atom catalog YAML) is
+// wrapped in `<untrusted-page-text>` delimiters so the model treats it as
+// data, not instructions. The delimiter rule lives in
+// `systemPrompt.computerUseSection`; the wrapping must stay on every
+// observation surface that emits page text. The trusted-prefix and any
+// post-verification WARNING text are written by us and stay outside the
+// delimiter.
+//
+// **Escape vector** (review fix): if a page emits `</untrusted-page-text>`
+// inside its title or an atom's accessible name, naive interpolation would
+// close the wrapper early and let hostile text appear in trusted-prefix
+// territory. `wrapUntrustedPageText` neutralizes the literal closing-tag
+// substring (case-insensitive — HTML attribute names are case-insensitive
+// and we want the same defensive posture for our delimiter) before
+// concatenation. We replace the leading `<` with the HTML-style
+// `&lt;`-equivalent for tags only — the visible mangle keeps the model's
+// audit trail honest while breaking the literal match.
+const UNTRUSTED_CLOSE_TAG_RE = /<\s*\/\s*untrusted-page-text\s*>/gi
+const UNTRUSTED_OPEN_TAG_RE = /<\s*untrusted-page-text\s*>/gi
+
+function escapeUntrustedText(s: string): string {
+  return s
+    .replace(UNTRUSTED_CLOSE_TAG_RE, '<\\/untrusted-page-text>')
+    .replace(UNTRUSTED_OPEN_TAG_RE, '<\\untrusted-page-text>')
+}
+
+function wrapUntrustedPageText(content: string): string {
+  return `<untrusted-page-text>\n${escapeUntrustedText(content)}\n</untrusted-page-text>`
+}
+
 function formatObservationText(prefix: string, result: ScreenshotResult): string {
-  const lines = [prefix]
-  lines.push(`url: ${result.observation.url}`)
+  const pageLines = [`url: ${result.observation.url}`]
   if (result.observation.title !== null) {
-    lines.push(`title: ${result.observation.title}`)
+    pageLines.push(`title: ${result.observation.title}`)
   }
-  return lines.join('\n')
+  return `${prefix}\n${wrapUntrustedPageText(pageLines.join('\n'))}`
 }
 
 // ---------------------------------------------------------------------------
@@ -441,9 +555,13 @@ function buildStartTool(deps: ComputerUseToolsDeps): Tool {
   return buildTool({
     name: 'ComputerStart',
     description:
-      'Start an isolated browser session for Computer-Use. Returns a sessionId ' +
-      'that subsequent Computer* tools must reference. Sessions are bounded by ' +
-      'the configured maxDurationMs. Headless by default.',
+      'Start an isolated browser session for interactive browser operation. ' +
+      'For ordinary information gathering, source discovery, factual lookup, ' +
+      'and reading public pages, use WebSearch / WebFetch first — Computer-Use ' +
+      'is for live-page interaction (login, forms, client-side UI, visual ' +
+      'inspection) only. Returns a sessionId that subsequent Computer* tools ' +
+      'must reference. Sessions are bounded by the configured maxDurationMs. ' +
+      'Headless by default.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -594,7 +712,7 @@ function buildObserveTool(deps: ComputerUseToolsDeps): Tool {
         // explicit Observe calls (Phase 4·1 fix #1). Observe is the most
         // common path between ComputerStart and the model's first risky click,
         // so this is where ARIA priming pays off most.
-        return await observeAndPack(lookup.session, signal, 'observe')
+        return await observeAndPack(lookup.session, signal, 'observe', deps.sessionManager)
       } catch (err) {
         return mapBrowserSessionError(err)
       }
@@ -664,7 +782,8 @@ function buildNavigateTool(deps: ComputerUseToolsDeps): Tool {
           async () => {
             await lookup.session.navigate(input.url as string, signal)
           },
-          { verify: deps.settings.verifyActions },
+          { verify: deps.settings.verifyActions, countStep: true },
+          deps.sessionManager,
         )
       } catch (err) {
         return mapBrowserSessionError(err)
@@ -748,7 +867,8 @@ function buildClickTool(deps: ComputerUseToolsDeps): Tool {
               await lookup.session.click(pt.point, button, signal)
             }
           },
-          { verify: deps.settings.verifyActions },
+          { verify: deps.settings.verifyActions, countStep: true },
+          deps.sessionManager,
         )
       } catch (err) {
         return mapBrowserSessionError(err)
@@ -820,7 +940,8 @@ function buildTypeTool(deps: ComputerUseToolsDeps): Tool {
           async () => {
             await lookup.session.typeText(text, signal)
           },
-          { verify: deps.settings.verifyActions },
+          { verify: deps.settings.verifyActions, countStep: true },
+          deps.sessionManager,
         )
       } catch (err) {
         return mapBrowserSessionError(err)
@@ -880,7 +1001,8 @@ function buildKeyTool(deps: ComputerUseToolsDeps): Tool {
           async () => {
             await lookup.session.pressKey(key, signal)
           },
-          { verify: deps.settings.verifyActions },
+          { verify: deps.settings.verifyActions, countStep: true },
+          deps.sessionManager,
         )
       } catch (err) {
         return mapBrowserSessionError(err)
@@ -956,7 +1078,8 @@ function buildScrollTool(deps: ComputerUseToolsDeps): Tool {
           async () => {
             await lookup.session.scroll(point, dx, dy, signal)
           },
-          { verify: deps.settings.verifyActions },
+          { verify: deps.settings.verifyActions, countStep: true },
+          deps.sessionManager,
         )
       } catch (err) {
         return mapBrowserSessionError(err)
@@ -1015,7 +1138,8 @@ function buildDragTool(deps: ComputerUseToolsDeps): Tool {
           async () => {
             await lookup.session.drag(from.point, to.point, signal)
           },
-          { verify: deps.settings.verifyActions },
+          { verify: deps.settings.verifyActions, countStep: true },
+          deps.sessionManager,
         )
       } catch (err) {
         return mapBrowserSessionError(err)
@@ -1159,7 +1283,7 @@ function buildHandoffToUserTool(deps: ComputerUseToolsDeps): Tool {
         // Capture a fresh observation so the model sees post-handoff state.
         // observeAndPack already passes `verify: false` (resume is a no-op
         // mutation; running pre/post diff would falsely report no-change).
-        const result = await observeAndPack(lookup.session, signal, 'handoff resumed')
+        const result = await observeAndPack(lookup.session, signal, 'handoff resumed', deps.sessionManager)
 
         // Phase 4·3 — snapshot storageState for cross-run rehydration. Two
         // independent gates:
@@ -1188,6 +1312,259 @@ function buildHandoffToUserTool(deps: ComputerUseToolsDeps): Tool {
         }
 
         return result
+      } catch (err) {
+        return mapBrowserSessionError(err)
+      }
+    },
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4b — ComputerObserveActions
+// ---------------------------------------------------------------------------
+
+function buildObserveActionsTool(deps: ComputerUseToolsDeps): Tool {
+  return buildTool({
+    name: 'ComputerObserveActions',
+    description:
+      'List the interactive elements on the current page as ' +
+      '{atomId, role, name, hint?}. Pass an atomId to ComputerActAtom instead of ' +
+      'pixel coordinates when available. Returns text only — no screenshot ' +
+      'attachment, since the model only needs the atom catalog.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'Session id from ComputerStart' },
+      },
+      required: ['sessionId'],
+    },
+    isMutating: false,
+    isReadOnly: true,
+    isConcurrencySafe: () => false,
+
+    async validateInput(input) {
+      return validateSessionId(deps, input.sessionId)
+    },
+
+    async call(input, _context, signal) {
+      const lookup = resolveSession(deps, input.sessionId)
+      if (!lookup.ok) return lookup.result
+      try {
+        const snap = await lookup.session.ariaSnapshot(signal)
+        // User redactionSelectors flow into the atom catalog the same way
+        // they flow into screenshot redaction (`getSensitiveRegions` is
+        // implementation-shared with `playwrightBrowserSession.screenshot`).
+        // Region collection is best-effort: if Playwright errors during
+        // selector resolution, we proceed with no extra regions and the
+        // baseline `isSensitiveNode` predicate still redacts password / MFA
+        // / cc-* fields.
+        let sensitiveRegions: readonly { x: number; y: number; width: number; height: number }[] = []
+        try {
+          sensitiveRegions = await lookup.session.getSensitiveRegions(
+            deps.settings.redactionSelectors,
+            signal,
+          )
+        } catch (err) {
+          if (isAbortError(err)) throw err
+          /* swallow — region collection is best-effort */
+        }
+        const url = lookup.session.currentUrl() ?? ''
+        const cache = buildAtomCache(snap, url, { sensitiveRegions })
+        lookup.session.setAtomCache(cache)
+        // v3 Phase 5 — wrap the page-derived YAML in `<untrusted-page-text>`
+        // delimiters via `wrapUntrustedPageText`, which also neutralizes any
+        // `</untrusted-page-text>` substring inside atom names/hints
+        // (otherwise an atom name carrying the closing tag would escape the
+        // wrapper). Wrapping happens at the call site to keep
+        // `serializeAtoms` pure for tests.
+        return {
+          content: wrapUntrustedPageText(serializeAtoms([...cache.entries.values()])),
+          isError: false,
+          // NO `attachments` — the load-bearing acceptance criterion. Model
+          // gets the atom catalog as text, no image input on this turn.
+        }
+      } catch (err) {
+        return mapBrowserSessionError(err)
+      }
+    },
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4b — ComputerActAtom
+// ---------------------------------------------------------------------------
+
+function validateAtomAction(value: unknown):
+  | { ok: true; action: AtomAction }
+  | { ok: false; message: string } {
+  if (value === null || typeof value !== 'object') {
+    return { ok: false, message: 'action must be an object' }
+  }
+  const a = value as Record<string, unknown>
+  if (a.type === 'click') {
+    if (
+      a.button !== undefined &&
+      a.button !== 'left' &&
+      a.button !== 'middle' &&
+      a.button !== 'right'
+    ) {
+      return { ok: false, message: 'action.button must be "left", "middle", or "right"' }
+    }
+    if (a.double !== undefined && typeof a.double !== 'boolean') {
+      return { ok: false, message: 'action.double must be a boolean' }
+    }
+    return {
+      ok: true,
+      action: {
+        type: 'click',
+        ...(a.button !== undefined && { button: a.button as 'left' | 'middle' | 'right' }),
+        ...(a.double !== undefined && { double: a.double as boolean }),
+      },
+    }
+  }
+  if (a.type === 'fill') {
+    if (typeof a.text !== 'string') {
+      return { ok: false, message: 'action.text must be a string for fill' }
+    }
+    const bytes = Buffer.byteLength(a.text, 'utf8')
+    if (bytes > MAX_TYPE_BYTES) {
+      return { ok: false, message: `action.text exceeds ${MAX_TYPE_BYTES} byte cap (got ${bytes})` }
+    }
+    if (hasDisallowedControlChars(a.text)) {
+      return { ok: false, message: 'action.text contains disallowed control characters' }
+    }
+    if (a.sensitive !== undefined && typeof a.sensitive !== 'boolean') {
+      return { ok: false, message: 'action.sensitive must be a boolean' }
+    }
+    return {
+      ok: true,
+      action: {
+        type: 'fill',
+        text: a.text,
+        ...(a.sensitive !== undefined && { sensitive: a.sensitive as boolean }),
+      },
+    }
+  }
+  if (a.type === 'select') {
+    if (typeof a.value !== 'string') {
+      return { ok: false, message: 'action.value must be a string for select' }
+    }
+    return { ok: true, action: { type: 'select', value: a.value } }
+  }
+  return { ok: false, message: 'action.type must be "click", "fill", or "select"' }
+}
+
+// v3 Phase 5 — the summary becomes the trusted prefix on the ActAtom result
+// text (lives OUTSIDE the `<untrusted-page-text>` delimiter that
+// `formatObservationText` wraps url/title in). Embedding `entry.displayName`
+// — which is page-derived, even though redacted for sensitive nodes — would
+// expose an injection vector for atoms whose accessible name carries
+// adversarial text. The model already saw the displayName one turn earlier
+// inside the wrapped atom catalog (`ComputerObserveActions`), so the summary
+// only needs `atomId` + `role` for the audit/watch-mode trail.
+function formatAtomSummary(
+  atomId: string,
+  entry: { role: string },
+  action: AtomAction,
+): string {
+  const target = `${atomId}: ${entry.role}`
+  switch (action.type) {
+    case 'click':
+      return action.double === true
+        ? `actAtom(${target} → double_click ${action.button ?? 'left'})`
+        : `actAtom(${target} → click ${action.button ?? 'left'})`
+    case 'fill':
+      return action.sensitive === true
+        ? `actAtom(${target} → fill <redacted ${action.text.length} chars>)`
+        : `actAtom(${target} → fill ${action.text.length} chars)`
+    case 'select':
+      return `actAtom(${target} → select "${action.value}")`
+  }
+}
+
+function buildActAtomTool(deps: ComputerUseToolsDeps): Tool {
+  return buildTool({
+    name: 'ComputerActAtom',
+    description:
+      'Perform a click/fill/select on the element identified by atomId. Call ' +
+      'ComputerObserveActions first to discover atomIds. On atom_resolution_failed, ' +
+      're-observe or fall back to ComputerClick / ComputerType. Returns post-action ' +
+      'observation as text only (no screenshot attachment).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string' },
+        atomId: { type: 'string' },
+        action: {
+          type: 'object',
+          properties: {
+            type: { type: 'string', enum: ['click', 'fill', 'select'] },
+            button: { type: 'string', enum: ['left', 'middle', 'right'] },
+            double: { type: 'boolean' },
+            text: { type: 'string' },
+            sensitive: { type: 'boolean' },
+            value: { type: 'string' },
+          },
+          required: ['type'],
+        },
+      },
+      required: ['sessionId', 'atomId', 'action'],
+    },
+    isMutating: true,
+    isReadOnly: false,
+    isConcurrencySafe: () => false,
+    getDomain: makeSessionGetDomain(deps),
+
+    async validateInput(input) {
+      const sv = validateSessionId(deps, input.sessionId)
+      if (!sv.valid) return sv
+      if (typeof input.atomId !== 'string' || input.atomId.length === 0) {
+        return { valid: false, message: 'atomId must be a non-empty string' }
+      }
+      const av = validateAtomAction(input.action)
+      if (!av.ok) return { valid: false, message: av.message }
+      return { valid: true }
+    },
+
+    async call(input, _context, signal) {
+      const lookup = resolveSession(deps, input.sessionId)
+      if (!lookup.ok) return lookup.result
+
+      // Validate inputs first — defense in depth so direct `call` invocations
+      // (e.g., SDK callers that bypass the harness's `validateInput` pass)
+      // still surface validation_failed before reaching atom resolution.
+      // Mirrors the ComputerClick pattern (re-validate point in call body).
+      if (typeof input.atomId !== 'string' || input.atomId.length === 0) {
+        return errorResult('validation_failed', 'atomId must be a non-empty string')
+      }
+      const av = validateAtomAction(input.action)
+      if (!av.ok) return errorResult('validation_failed', av.message)
+      const atomId = input.atomId
+      const action = av.action
+
+      const entry = lookup.session.lookupAtom(atomId)
+      if (entry === null) {
+        return errorResult(
+          'atom_resolution_failed',
+          `atom '${atomId}' is not resolvable in this session. ` +
+            'Call ComputerObserveActions to refresh the catalog, or fall back to ComputerClick / ComputerType.',
+        )
+      }
+
+      const locator = buildLocator(entry)
+      const summary = formatAtomSummary(atomId, entry, action)
+
+      try {
+        return await runActionAndObserve(
+          lookup.session,
+          signal,
+          summary,
+          async () => {
+            await lookup.session.actOnAtom(locator, action, signal)
+          },
+          { verify: deps.settings.verifyActions, attachScreenshot: false, countStep: true },
+          deps.sessionManager,
+        )
       } catch (err) {
         return mapBrowserSessionError(err)
       }

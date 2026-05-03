@@ -1188,6 +1188,9 @@ describe('QueryEngine', () => {
       'ComputerWait',
       'ComputerHandoffToUser',
       'ComputerStop',
+      // Phase 4b — DOM-first action path.
+      'ComputerObserveActions',
+      'ComputerActAtom',
     ] as const
 
     it('does NOT register Computer tools by default (computerUse.enabled = false)', async () => {
@@ -1472,6 +1475,7 @@ function makeFakeSessionManager(): {
   stop: () => Promise<void>
   stopAll: () => Promise<void>
   requestClose: () => Promise<void>
+  recordStep: () => { abort: false }
   stopAllCalls: number
 } {
   const fake = {
@@ -1487,6 +1491,9 @@ function makeFakeSessionManager(): {
       fake.stopAllCalls++
     },
     async requestClose(): Promise<void> {},
+    recordStep(): { abort: false } {
+      return { abort: false }
+    },
   }
   return fake
 }

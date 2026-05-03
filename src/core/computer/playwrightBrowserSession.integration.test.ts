@@ -622,4 +622,272 @@ describe.skipIf(!integrationEnabled)('PlaywrightBrowserSession integration', () 
       }
     })
   })
+
+  // -------------------------------------------------------------------------
+  // Phase 4b — DOM-first action path (atom catalog + actOnAtom).
+  // -------------------------------------------------------------------------
+
+  describe('Phase 4b: DOM-first atom path', () => {
+    /** Fixture with diverse atomable elements for Phase 4b tests. */
+    const PHASE4B_FIXTURE = `<!DOCTYPE html>
+<html>
+<head><title>p4b-fixture</title></head>
+<body style="margin:0">
+  <main>
+    <form aria-label="Sign in">
+      <input id="email" aria-label="Email" type="text" />
+      <input id="pw" aria-label="Password" type="password" />
+      <button id="signin" aria-label="Sign in" type="button">Sign in</button>
+    </form>
+    <form aria-label="Settings">
+      <button id="save1" type="button">Save</button>
+      <button id="save2" type="button">Save</button>
+      <button id="delete-btn" type="button">Delete account</button>
+    </form>
+  </main>
+  <pre id="state"></pre>
+  <script>
+    function setState(s) { document.title = s; document.getElementById('state').textContent = s; }
+    document.getElementById('signin').addEventListener('click', () => setState('clicked:signin'));
+    document.getElementById('save1').addEventListener('click', () => setState('clicked:save1'));
+    document.getElementById('save2').addEventListener('click', () => setState('clicked:save2'));
+    document.getElementById('delete-btn').addEventListener('click', () => setState('clicked:delete'));
+    document.getElementById('email').addEventListener('input', (e) => setState('email:' + e.target.value));
+    document.getElementById('pw').addEventListener('input', (e) => setState('pw:' + e.target.value));
+  </script>
+</body>
+</html>`
+
+    let p4bFixture: Server | undefined
+    let p4bPort: number | undefined
+
+    beforeAll(async () => {
+      // Spin up a dedicated fixture server for Phase 4b tests; the existing
+      // PHASE3_FIXTURE doesn't have aria-labels / a Delete button.
+      p4bFixture = createServer((_req, res) => {
+        res.setHeader('content-type', 'text/html')
+        res.end(PHASE4B_FIXTURE)
+      })
+      await new Promise<void>((resolve) =>
+        (p4bFixture as Server).listen(0, '127.0.0.1', resolve),
+      )
+      p4bPort = ((p4bFixture as Server).address() as AddressInfo).port
+    })
+
+    afterAll(async () => {
+      if (p4bFixture !== undefined) {
+        await new Promise<void>((resolve, reject) =>
+          (p4bFixture as Server).close((err) => (err ? reject(err) : resolve())),
+        )
+      }
+    })
+
+    function p4bStartOptions(): StartSessionOptions {
+      return {
+        headless: true,
+        requireAllowlist: true,
+        allowHttpForTest: true,
+        hostResolverRules: `MAP p4b.local:80 127.0.0.1:${p4bPort}`,
+      }
+    }
+    function p4bSettings(partial: Partial<ComputerUseSettings> = {}): ComputerUseSettings {
+      return makeSettings({ allowedDomains: ['p4b.local'], ...partial })
+    }
+
+    async function startP4bSession(): Promise<{
+      mgr: SessionManager
+      session: Awaited<ReturnType<SessionManager['start']>>
+      ac: AbortController
+    }> {
+      const factory = createPlaywrightSessionFactory()
+      const mgr = new SessionManager({ settings: p4bSettings(), factory })
+      const ac = new AbortController()
+      const session = await mgr.start(p4bStartOptions(), ac.signal)
+      await session.navigate('http://p4b.local/', ac.signal)
+      await session.stabilize(ac.signal)
+      return { mgr, session, ac }
+    }
+
+    it('happy-path: ariaSnapshot lists Sign in button; actOnAtom click fires handler', async () => {
+      const { mgr, session, ac } = await startP4bSession()
+      try {
+        const snap = await session.ariaSnapshot(ac.signal)
+        // Build the cache as ComputerObserveActions does, then drive actOnAtom.
+        const { buildAtomCache } = await import('./selectorCache.js')
+        const { buildLocator } = await import('./atomResolver.js')
+        const cache = buildAtomCache(snap, 'http://p4b.local/')
+        // Find the Sign in button entry.
+        const entries = [...cache.entries.values()]
+        const signin = entries.find((e) => e.role === 'button' && e.locatorName === 'Sign in')
+        expect(signin).toBeDefined()
+        await session.actOnAtom(buildLocator(signin!), { type: 'click' }, ac.signal)
+        await new Promise((r) => setTimeout(r, 50))
+        expect(await session.currentTitle()).toBe('clicked:signin')
+      } finally {
+        await mgr.stop(session.id)
+      }
+    })
+
+    it('locator preflight zero-match → atom_locator_failed when target removed', async () => {
+      const { mgr, session, ac } = await startP4bSession()
+      try {
+        const snap = await session.ariaSnapshot(ac.signal)
+        const { buildAtomCache } = await import('./selectorCache.js')
+        const { buildLocator } = await import('./atomResolver.js')
+        const cache = buildAtomCache(snap, 'http://p4b.local/')
+        const signin = [...cache.entries.values()].find((e) => e.locatorName === 'Sign in')
+        expect(signin).toBeDefined()
+        // Remove the element BEFORE acting so getByRole.count() returns 0.
+        type PageWith = { _page: { evaluate: (fn: () => void) => Promise<void> } }
+        await (session as unknown as PageWith)._page.evaluate(() => {
+          document.getElementById('signin')?.remove()
+        })
+        await expect(
+          session.actOnAtom(buildLocator(signin!), { type: 'click' }, ac.signal),
+        ).rejects.toMatchObject({ kind: 'atom_locator_failed' })
+      } finally {
+        await mgr.stop(session.id)
+      }
+    })
+
+    it('bbox-drift detection: nth shifts to a different element → atom_locator_failed', async () => {
+      const { mgr, session, ac } = await startP4bSession()
+      try {
+        const snap = await session.ariaSnapshot(ac.signal)
+        const { buildAtomCache } = await import('./selectorCache.js')
+        const { buildLocator } = await import('./atomResolver.js')
+        const cache = buildAtomCache(snap, 'http://p4b.local/')
+        // Cache has two `Save` buttons. Capture the SECOND one (nth=1).
+        const saves = [...cache.entries.values()].filter(
+          (e) => e.role === 'button' && e.locatorName === 'Save',
+        )
+        expect(saves).toHaveLength(2)
+        const save2Entry = saves[1]!
+        expect(save2Entry.nth).toBe(1)
+        // INSERT a new Save button BEFORE the first one. count() now returns 3,
+        // .nth(1) points to the OLD nth=0 (which has a different bbox than the
+        // cached nth=1). bbox-drift fires.
+        type PageWith = { _page: { evaluate: (fn: () => void) => Promise<void> } }
+        await (session as unknown as PageWith)._page.evaluate(() => {
+          const form = document.querySelector('form[aria-label="Settings"]')
+          if (!form) return
+          const inserted = document.createElement('button')
+          inserted.type = 'button'
+          inserted.textContent = 'Save'
+          // Position it to take a different on-screen position so bbox differs.
+          inserted.style.cssText = 'display:block; height:80px; width:200px;'
+          form.insertBefore(inserted, form.firstChild)
+        })
+        await expect(
+          session.actOnAtom(buildLocator(save2Entry), { type: 'click' }, ac.signal),
+        ).rejects.toMatchObject({ kind: 'atom_locator_failed' })
+      } finally {
+        await mgr.stop(session.id)
+      }
+    })
+
+    it('cache cleared on navigate (Observe → Navigate → cache empty)', async () => {
+      const { mgr, session, ac } = await startP4bSession()
+      try {
+        const snap = await session.ariaSnapshot(ac.signal)
+        const { buildAtomCache } = await import('./selectorCache.js')
+        session.setAtomCache(buildAtomCache(snap, 'http://p4b.local/'))
+        expect(session.currentAtomCache()).not.toBeNull()
+        await session.navigate('http://p4b.local/', ac.signal)
+        expect(session.currentAtomCache()).toBeNull()
+      } finally {
+        await mgr.stop(session.id)
+      }
+    })
+
+    it('redacted-name parity: password atom resolves via raw locatorName', async () => {
+      const { mgr, session, ac } = await startP4bSession()
+      try {
+        const snap = await session.ariaSnapshot(ac.signal)
+        const { buildAtomCache } = await import('./selectorCache.js')
+        const { buildLocator, serializeAtoms } = await import('./atomResolver.js')
+        const cache = buildAtomCache(snap, 'http://p4b.local/')
+        const entries = [...cache.entries.values()]
+        const pw = entries.find((e) => e.locatorName === 'Password')
+        expect(pw).toBeDefined()
+        // displayName is REDACTED but locatorName remains raw.
+        expect(pw!.displayName).toBe('[REDACTED]')
+        expect(pw!.locatorName).toBe('Password')
+        // serializeAtoms must NEVER emit raw "Password".
+        const yaml = serializeAtoms(entries)
+        expect(yaml).toContain('[REDACTED]')
+        expect(yaml.match(/name:\s*"Password"/)).toBeNull()
+        // actOnAtom uses raw locatorName under the hood — fill must work.
+        await session.actOnAtom(buildLocator(pw!), { type: 'fill', text: 'hunter2', sensitive: true }, ac.signal)
+        await new Promise((r) => setTimeout(r, 50))
+        expect(await session.currentTitle()).toBe('pw:hunter2')
+      } finally {
+        await mgr.stop(session.id)
+      }
+    })
+  })
+
+  describe('Phase 5: step-limit floor through ComputerTools', () => {
+    it('(maxSteps + 1)th mutating action returns step_limit_exceeded and closes the session', async () => {
+      const factory = createPlaywrightSessionFactory()
+      // maxSteps=3 keeps the loop short while still exercising the counter
+      // through a real Playwright run. Each click hits #b1 on the fixture
+      // page; the post-action observation drives the recordStep seam.
+      const settings = makeSettings({ maxSteps: 3 })
+      const mgr = new SessionManager({ settings, factory })
+      const tools = createComputerUseTools({ sessionManager: mgr, settings })
+
+      const ctx = {
+        appState: createStore(getDefaultAppState()),
+        abortController: new AbortController(),
+        messages: [],
+        readFileState: new Map(),
+        toolRegistry: createToolRegistry(),
+      }
+
+      // Bootstrap via the manager directly so we can pass the test-only
+      // start options (`allowHttpForTest`, `hostResolverRules`) — those are
+      // intentionally absent from the ComputerStart tool schema. recordStep
+      // is wired into ComputerTools.runActionAndObserve (not into
+      // BrowserSession.navigate or SessionManager.start), so this bypass
+      // leaves the step counter at 0 — exactly what we want for the
+      // click-budget test below, which drives every counted action through
+      // the tool surface.
+      const session = await mgr.start(makeStartOptions(servers), ctx.abortController.signal)
+      const sessionId = session.id
+
+      try {
+        await session.navigate('http://fixture.local/', ctx.abortController.signal)
+
+        // Three click steps via the tool surface — within budget.
+        for (let i = 0; i < 3; i++) {
+          const r = await tools.click.call(
+            { sessionId, x: 0.5, y: 0.5, button: 'left' },
+            ctx,
+            ctx.abortController.signal,
+          )
+          expect(r.isError).toBe(false)
+        }
+
+        // Step 4 is the (maxSteps + 1)th — must abort with the documented reason.
+        const overR = await tools.click.call(
+          { sessionId, x: 0.5, y: 0.5, button: 'left' },
+          ctx,
+          ctx.abortController.signal,
+        )
+        expect(overR.isError).toBe(true)
+        expect(overR.errorKind).toBe('execution_error')
+        expect(overR.content).toContain('step_limit_exceeded')
+        expect(overR.content).toContain('N=4')
+        expect(overR.content).toContain('max=3')
+
+        // SessionManager schedules close via setImmediate; allow it to run.
+        await new Promise((r) => setImmediate(r))
+        expect(mgr.get(sessionId)).toBeUndefined()
+      } finally {
+        // Idempotent — if recordStep already closed, this is a no-op.
+        await mgr.stop(sessionId)
+      }
+    })
+  })
 })

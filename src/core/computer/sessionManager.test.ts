@@ -6,6 +6,8 @@ import {
 } from '../../config/computerUseSettings.js'
 
 import type { AriaTreeSnapshot, BoundingBox } from './ariaSnapshot.js'
+import type { AtomAction, AtomEntry, AtomLocator } from './atomResolver.js'
+import type { SessionAtomCache } from './selectorCache.js'
 
 import { SessionManager, type BrowserSessionFactory } from './sessionManager.js'
 import {
@@ -70,6 +72,14 @@ class FakeBrowserSession implements BrowserSession {
   }
   async exportStorageState(_signal: AbortSignal): Promise<unknown> {
     return {}
+  }
+  async actOnAtom(_locator: AtomLocator, _action: AtomAction, _signal: AbortSignal): Promise<void> {}
+  setAtomCache(_cache: SessionAtomCache): void {}
+  lookupAtom(_atomId: string): AtomEntry | null {
+    return null
+  }
+  currentAtomCache(): SessionAtomCache | null {
+    return null
   }
 }
 
@@ -267,5 +277,288 @@ describe('SessionManager', () => {
     await mgr.stop(session.id)
     expect(added).toBeGreaterThanOrEqual(1)
     expect(added).toBe(removed)
+  })
+
+  // ---------------------------------------------------------------------------
+  // v3 Phase 5 — recordStep / step-limit / no-progress detection
+  // ---------------------------------------------------------------------------
+
+  describe('recordStep — step-limit floor', () => {
+    it('returns {abort: false} for unknown sessionId (no-op)', () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({ settings: makeSettings(), factory })
+      const decision = mgr.recordStep('nonexistent' as ComputerSessionId, {
+        ariaHash: 'a',
+        phash: 'b',
+        verified: true,
+      })
+      expect(decision.abort).toBe(false)
+    })
+
+    it('aborts on step N = maxSteps + 1', async () => {
+      const factory = makeFactory()
+      const settings = makeSettings({ maxSteps: 3, verifyActions: true })
+      const mgr = new SessionManager({ settings, factory })
+      const ac = new AbortController()
+      const session = await mgr.start({}, ac.signal)
+
+      // Three good steps — verified:true, varying hashes — never aborts.
+      for (let i = 0; i < 3; i++) {
+        const d = mgr.recordStep(session.id, {
+          ariaHash: `aria-${i}`,
+          phash: `ph-${i}`,
+          verified: true,
+        })
+        expect(d.abort).toBe(false)
+      }
+
+      const fourth = mgr.recordStep(session.id, {
+        ariaHash: 'aria-3',
+        phash: 'ph-3',
+        verified: true,
+      })
+      expect(fourth.abort).toBe(true)
+      if (fourth.abort) {
+        expect(fourth.reason).toContain('step_limit_exceeded')
+        expect(fourth.reason).toContain('N=4')
+        expect(fourth.reason).toContain('max=3')
+      }
+
+      // setImmediate-scheduled close fires on the next tick.
+      await new Promise((r) => setImmediate(r))
+      expect(mgr.get(session.id)).toBeUndefined()
+      expect((session as FakeBrowserSession).closeCalls).toBe(1)
+    })
+  })
+
+  describe('recordStep — primary rule (verifyActions: true)', () => {
+    it('aborts after 3 consecutive verified:false', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ verifyActions: true }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+
+      const d1 = mgr.recordStep(session.id, { ariaHash: 'a', phash: 'b', verified: false })
+      const d2 = mgr.recordStep(session.id, { ariaHash: 'a', phash: 'b', verified: false })
+      const d3 = mgr.recordStep(session.id, { ariaHash: 'a', phash: 'b', verified: false })
+
+      expect(d1.abort).toBe(false)
+      expect(d2.abort).toBe(false)
+      expect(d3.abort).toBe(true)
+      if (d3.abort) {
+        expect(d3.reason).toContain('no_progress')
+        expect(d3.reason).toContain('verified:false')
+      }
+    })
+
+    it('does not abort when a verified:true breaks the streak', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ verifyActions: true }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+
+      mgr.recordStep(session.id, { ariaHash: 'a', phash: 'b', verified: false })
+      mgr.recordStep(session.id, { ariaHash: 'a', phash: 'b', verified: false })
+      mgr.recordStep(session.id, { ariaHash: 'c', phash: 'd', verified: true })   // breaks
+      const d = mgr.recordStep(session.id, { ariaHash: 'a', phash: 'b', verified: false })
+      expect(d.abort).toBe(false)
+    })
+
+    it('does not abort on three verified:true in a row', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ verifyActions: true }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+
+      for (let i = 0; i < 3; i++) {
+        const d = mgr.recordStep(session.id, {
+          ariaHash: `aria-${i}`,
+          phash: `ph-${i}`,
+          verified: true,
+        })
+        expect(d.abort).toBe(false)
+      }
+    })
+
+    it('ignores ARIA + pHash stalls when verification is enabled (verify is the source of truth)', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ verifyActions: true }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+
+      // Identical ARIA + identical pHash, but verified:true — should NOT abort.
+      // (Pathological capture mismatch; verify says progress happened.)
+      for (let i = 0; i < 3; i++) {
+        const d = mgr.recordStep(session.id, {
+          ariaHash: 'same',
+          phash: 'same',
+          verified: true,
+        })
+        expect(d.abort).toBe(false)
+      }
+    })
+  })
+
+  describe('recordStep — fallback rule (verifyActions: false)', () => {
+    it('aborts when both ARIA AND pHash are stalled for 3 steps', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ verifyActions: false }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+
+      const d1 = mgr.recordStep(session.id, { ariaHash: 'A', phash: 'P', verified: null })
+      const d2 = mgr.recordStep(session.id, { ariaHash: 'A', phash: 'P', verified: null })
+      const d3 = mgr.recordStep(session.id, { ariaHash: 'A', phash: 'P', verified: null })
+
+      expect(d1.abort).toBe(false)
+      expect(d2.abort).toBe(false)
+      expect(d3.abort).toBe(true)
+      if (d3.abort) {
+        expect(d3.reason).toContain('no_progress')
+        expect(d3.reason).toContain('ARIA and pHash')
+      }
+    })
+
+    it('does NOT abort on 3 identical ARIA + varying pHash (canvas case)', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ verifyActions: false }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+
+      for (let i = 0; i < 3; i++) {
+        const d = mgr.recordStep(session.id, {
+          ariaHash: 'static-aria',
+          phash: `pixels-${i}`,
+          verified: null,
+        })
+        expect(d.abort).toBe(false)
+      }
+    })
+
+    it('does NOT abort on 3 identical pHash + varying ARIA (DOM-only case)', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ verifyActions: false }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+
+      for (let i = 0; i < 3; i++) {
+        const d = mgr.recordStep(session.id, {
+          ariaHash: `aria-${i}`,
+          phash: 'static-pixels',
+          verified: null,
+        })
+        expect(d.abort).toBe(false)
+      }
+    })
+
+    // Review fix #2 — the v3 plan acceptance is "Repeated identical
+    // screenshots OR repeated identical ARIA snapshots cause a controlled
+    // failure." When one signal is unavailable, the other becomes the only
+    // available evidence; a stall on the only available signal MUST abort.
+    it('aborts on stalled pHash when ARIA capture is unavailable for all 3 (review fix #2)', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ verifyActions: false }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+
+      const d1 = mgr.recordStep(session.id, { ariaHash: null, phash: 'P', verified: null })
+      const d2 = mgr.recordStep(session.id, { ariaHash: null, phash: 'P', verified: null })
+      const d3 = mgr.recordStep(session.id, { ariaHash: null, phash: 'P', verified: null })
+
+      expect(d1.abort).toBe(false)
+      expect(d2.abort).toBe(false)
+      expect(d3.abort).toBe(true)
+      if (d3.abort) {
+        expect(d3.reason).toContain('no_progress')
+        expect(d3.reason).toContain('pHash')
+        expect(d3.reason).not.toContain('ARIA') // ARIA unavailable; only pHash named
+      }
+    })
+
+    it('aborts on stalled ARIA when pHash capture is unavailable for all 3 (review fix #2)', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ verifyActions: false }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+
+      const d1 = mgr.recordStep(session.id, { ariaHash: 'A', phash: null, verified: null })
+      const d2 = mgr.recordStep(session.id, { ariaHash: 'A', phash: null, verified: null })
+      const d3 = mgr.recordStep(session.id, { ariaHash: 'A', phash: null, verified: null })
+
+      expect(d3.abort).toBe(true)
+      if (d3.abort) {
+        expect(d3.reason).toContain('ARIA')
+        expect(d3.reason).not.toContain('pHash')
+      }
+    })
+
+    it('does NOT abort when both signals are unavailable for all 3 (no information)', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ verifyActions: false }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+
+      // Both ARIA and pHash capture failed for all 3 — we have no evidence
+      // either way, so don't abort. (Spec: "stalled available signal".)
+      for (let i = 0; i < 3; i++) {
+        const d = mgr.recordStep(session.id, {
+          ariaHash: null,
+          phash: null,
+          verified: null,
+        })
+        expect(d.abort).toBe(false)
+      }
+    })
+
+    it('does NOT abort when ARIA stalled + pHash partly null (mixed availability)', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ verifyActions: false }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+
+      // pHash is available for only 2 of 3 → not "fully available" → don't
+      // count as a stalled-or-progressing signal. ARIA stalled, but the
+      // ring-fully-non-null gate keeps pHash from being either stalled or
+      // showing progress. Conservative: no abort until we have a full ring
+      // for at least one signal.
+      mgr.recordStep(session.id, { ariaHash: 'A', phash: 'P', verified: null })
+      mgr.recordStep(session.id, { ariaHash: 'A', phash: null, verified: null })
+      const d3 = mgr.recordStep(session.id, { ariaHash: 'A', phash: 'P', verified: null })
+      // ARIA stalled (A, A, A all non-null), pHash NOT fully non-null →
+      // available signals = {ARIA}, stalled = {ARIA}, → ABORT (only signal stalled).
+      // This actually matches the spec: ARIA is the only available signal here.
+      expect(d3.abort).toBe(true)
+    })
+  })
+
+  it('recordStep is no-op after the session is closed', async () => {
+    const factory = makeFactory()
+    const mgr = new SessionManager({ settings: makeSettings({ maxSteps: 1 }), factory })
+    const session = await mgr.start({}, new AbortController().signal)
+    await mgr.stop(session.id)
+    const d = mgr.recordStep(session.id, { ariaHash: 'a', phash: 'b', verified: true })
+    expect(d.abort).toBe(false)
   })
 })

@@ -53,6 +53,7 @@ export type ToolErrorKind =
   | 'execution_error'
   | 'aborted'
   | 'hook_blocked'
+  | 'atom_resolution_failed'
 
 export type ToolSource = 'builtin' | 'mcp' | 'custom'
 

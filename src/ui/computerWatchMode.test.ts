@@ -226,4 +226,42 @@ describe('createComputerWatchMode', () => {
       expect(out.text()).toContain('sess-abc…')
     })
   })
+
+  describe('Phase 4b — atom path rendering', () => {
+    it('ComputerObserveActions start renders generic summary', () => {
+      const out = new CapturingStream()
+      const wm = createComputerWatchMode({ output: out, isTTY: true })
+      wm.handle(
+        makeStartEvent({
+          toolName: 'ComputerObserveActions',
+          input: { sessionId: 'sess-abc12345' },
+        }),
+      )
+      const text = out.text()
+      expect(text).toContain('ComputerObserveActions')
+      expect(text).toContain('start')
+      expect(text).toContain('observe-actions')
+    })
+
+    it('ComputerActAtom start shows atomId + action.type, no locatorName', () => {
+      const out = new CapturingStream()
+      const wm = createComputerWatchMode({ output: out, isTTY: true })
+      wm.handle(
+        makeStartEvent({
+          toolName: 'ComputerActAtom',
+          input: {
+            sessionId: 'sess-abc12345',
+            atomId: 'a-7',
+            action: { type: 'click' },
+          },
+        }),
+      )
+      const text = out.text()
+      expect(text).toContain('ComputerActAtom')
+      expect(text).toContain('actAtom(a-7 → click)')
+      // No raw locatorName ever appears (it isn't in the event input).
+      expect(text).not.toContain('Sign in')
+      expect(text).not.toContain('Password')
+    })
+  })
 })

@@ -195,6 +195,18 @@ export function computerActionSummary(toolName: string, input: Record<string, un
       return typeof input.headless === 'boolean'
         ? `start session (headless: ${input.headless})`
         : 'start session'
+    // Phase 4b — DOM-first action path. Renders without echoing locatorName;
+    // ActAtom shows the input atomId + action.type only (no name). The
+    // approval prompt + watch-mode share this formatter so both surfaces
+    // stay redaction-safe.
+    case 'ComputerObserveActions':
+      return 'observe-actions (list interactive atoms)'
+    case 'ComputerActAtom': {
+      const atomId = typeof input.atomId === 'string' ? input.atomId : '?'
+      const action = (input.action ?? {}) as { type?: string }
+      const verb = action.type ?? '?'
+      return `actAtom(${atomId} → ${verb})`
+    }
     default:
       return null
   }
