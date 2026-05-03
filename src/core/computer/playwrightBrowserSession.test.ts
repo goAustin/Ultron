@@ -35,7 +35,9 @@ function makeStubLaunched(): LaunchedBrowser {
   const noop = async () => {}
   const noopRoute = async (_pattern: string, _handler: unknown) => {}
   const noopOn = (_event: string, _handler: unknown) => {}
-  const browser = { close: noop } as unknown as LaunchedBrowser['browser']
+  // v3 Phase 6: `_installDisconnectHandler` calls `browser.on('disconnected', …)`
+  // on every factory build, so the browser stub needs `on`.
+  const browser = { close: noop, on: noopOn } as unknown as LaunchedBrowser['browser']
   const context = {
     close: noop,
     route: noopRoute,
@@ -53,6 +55,49 @@ function makeStubLaunched(): LaunchedBrowser {
   return { browser, context, page }
 }
 
+/**
+ * v3 Phase 6 — variant of `makeStubLaunched` that captures the listener
+ * `_installDisconnectHandler` registers on `browser.on('disconnected', …)`.
+ * The returned `fireDisconnected()` lets tests simulate an unexpected
+ * Chromium crash to exercise the runtime hardening.
+ */
+function makeStubLaunchedCapturingDisconnect(): {
+  launched: LaunchedBrowser
+  fireDisconnected: () => void
+} {
+  const noop = async () => {}
+  const noopRoute = async (_pattern: string, _handler: unknown) => {}
+  const noopOn = (_event: string, _handler: unknown) => {}
+  let captured: (() => void) | null = null
+  const browser = {
+    close: noop,
+    on: (event: string, handler: () => void) => {
+      if (event === 'disconnected') captured = handler
+    },
+  } as unknown as LaunchedBrowser['browser']
+  const context = {
+    close: noop,
+    route: noopRoute,
+    on: noopOn,
+    storageState: async () => ({ cookies: [], origins: [] }),
+  } as unknown as LaunchedBrowser['context']
+  const page = {
+    url: () => 'about:blank',
+    title: async () => '',
+    goto: async () => null,
+    screenshot: async () => Buffer.from([]),
+    waitForLoadState: async () => {},
+    close: noop,
+  } as unknown as LaunchedBrowser['page']
+  return {
+    launched: { browser, context, page },
+    fireDisconnected: () => {
+      if (captured === null) throw new Error('disconnect handler never registered')
+      captured()
+    },
+  }
+}
+
 describe('createPlaywrightSessionFactory', () => {
   it('passes viewport, headless, and args to launchChromium', async () => {
     const launchSpy = vi.fn<LaunchChromiumFn>(async (params) => {
@@ -66,6 +111,7 @@ describe('createPlaywrightSessionFactory', () => {
       settings,
       options: { headless: true },
       requestClose: async () => {},
+      recordScreenshot: () => {},
     })
     expect(launchSpy).toHaveBeenCalledTimes(1)
     const call = launchSpy.mock.calls[0]?.[0]
@@ -89,6 +135,7 @@ describe('createPlaywrightSessionFactory', () => {
         hostResolverRules: 'MAP fixture.local:80 127.0.0.1:8080',
       },
       requestClose: async () => {},
+      recordScreenshot: () => {},
     })
     const args = launchSpy.mock.calls[0]?.[0]?.args
     expect(args).toEqual(['--host-resolver-rules=MAP fixture.local:80 127.0.0.1:8080'])
@@ -102,6 +149,7 @@ describe('createPlaywrightSessionFactory', () => {
       settings: makeSettings(),
       options: {},
       requestClose: async () => {},
+      recordScreenshot: () => {},
     })
     expect(launchSpy.mock.calls[0]?.[0]?.headless).toBe(true)
   })
@@ -119,6 +167,7 @@ describe('createPlaywrightSessionFactory', () => {
         settings: makeSettings(),
         options: {},
         requestClose: async () => {},
+        recordScreenshot: () => {},
       }),
     ).rejects.toMatchObject({
       kind: 'chromium_not_installed',
@@ -139,6 +188,7 @@ describe('createPlaywrightSessionFactory', () => {
         settings: makeSettings(),
         options: {},
         requestClose: async () => {},
+        recordScreenshot: () => {},
       }),
     ).rejects.toMatchObject({ kind: 'chromium_not_installed' })
   })
@@ -154,6 +204,7 @@ describe('createPlaywrightSessionFactory', () => {
         settings: makeSettings(),
         options: {},
         requestClose: async () => {},
+        recordScreenshot: () => {},
       }),
     ).rejects.toThrow(/totally unrelated/)
   })
@@ -171,6 +222,7 @@ describe('createPlaywrightSessionFactory', () => {
         settings: makeSettings(),
         options: {},
         requestClose: async () => {},
+        recordScreenshot: () => {},
       }),
     ).rejects.toThrow(/Timeout 30000ms exceeded/)
     // And NOT translated into chromium_not_installed.
@@ -180,6 +232,7 @@ describe('createPlaywrightSessionFactory', () => {
         settings: makeSettings(),
         options: {},
         requestClose: async () => {},
+        recordScreenshot: () => {},
       }),
     ).rejects.not.toMatchObject({ kind: 'chromium_not_installed' })
   })
@@ -202,6 +255,7 @@ describe('createPlaywrightSessionFactory', () => {
       settings: makeSettings(),
       options: {},
       requestClose: async () => {},
+      recordScreenshot: () => {},
     })
     expect(routeRegistered).toBe(true)
   })
@@ -215,23 +269,128 @@ describe('createPlaywrightSessionFactory', () => {
       settings: makeSettings(),
       options: { headless: false },
       requestClose: async () => {},
+      recordScreenshot: () => {},
     })
     const headlessSession = await factory({
       id: 'sess-h-2' as ComputerSessionId,
       settings: makeSettings(),
       options: { headless: true },
       requestClose: async () => {},
+      recordScreenshot: () => {},
     })
     const defaultSession = await factory({
       id: 'sess-h-3' as ComputerSessionId,
       settings: makeSettings(),
       options: {},
       requestClose: async () => {},
+      recordScreenshot: () => {},
     })
     expect(headedSession.headless).toBe(false)
     expect(headlessSession.headless).toBe(true)
     // Default is true (matches Phase 2's chromium.launch default).
     expect(defaultSession.headless).toBe(true)
+  })
+
+  // ---------------------------------------------------------------------------
+  // v3 Phase 6 — deviceScaleFactor launch option
+  // ---------------------------------------------------------------------------
+
+  it('forwards deviceScaleFactor to launchChromium when set', async () => {
+    const launchSpy = vi.fn<LaunchChromiumFn>(async () => makeStubLaunched())
+    const factory = createPlaywrightSessionFactory({ launchChromium: launchSpy })
+    await factory({
+      id: 'sess-dsf-1' as ComputerSessionId,
+      settings: makeSettings(),
+      options: { deviceScaleFactor: 2 },
+      requestClose: async () => {},
+      recordScreenshot: () => {},
+    })
+    expect(launchSpy.mock.calls[0]?.[0]?.deviceScaleFactor).toBe(2)
+  })
+
+  it('omits deviceScaleFactor from launch params when option is not set (default Playwright behavior preserved)', async () => {
+    const launchSpy = vi.fn<LaunchChromiumFn>(async () => makeStubLaunched())
+    const factory = createPlaywrightSessionFactory({ launchChromium: launchSpy })
+    await factory({
+      id: 'sess-dsf-2' as ComputerSessionId,
+      settings: makeSettings(),
+      options: {},
+      requestClose: async () => {},
+      recordScreenshot: () => {},
+    })
+    expect(launchSpy.mock.calls[0]?.[0]?.deviceScaleFactor).toBeUndefined()
+  })
+
+  it('mirrors deviceScaleFactor onto BrowserSession.viewport.deviceScaleFactor', async () => {
+    const factory = createPlaywrightSessionFactory({
+      launchChromium: async () => makeStubLaunched(),
+    })
+    const dsf2 = await factory({
+      id: 'sess-dsf-3' as ComputerSessionId,
+      settings: makeSettings(),
+      options: { deviceScaleFactor: 2 },
+      requestClose: async () => {},
+      recordScreenshot: () => {},
+    })
+    const dsfDefault = await factory({
+      id: 'sess-dsf-4' as ComputerSessionId,
+      settings: makeSettings(),
+      options: {},
+      requestClose: async () => {},
+      recordScreenshot: () => {},
+    })
+    expect(dsf2.viewport.deviceScaleFactor).toBe(2)
+    expect(dsfDefault.viewport.deviceScaleFactor).toBe(1)
+  })
+
+  // ---------------------------------------------------------------------------
+  // v3 Phase 6 — disconnect handler
+  // ---------------------------------------------------------------------------
+
+  it('installs a browser.on("disconnected") handler that calls requestClose("error")', async () => {
+    const captured = makeStubLaunchedCapturingDisconnect()
+    const requestCloseCalls: Array<'aborted' | 'timeout' | 'error'> = []
+    const factory = createPlaywrightSessionFactory({
+      launchChromium: async () => captured.launched,
+    })
+    await factory({
+      id: 'sess-dc-1' as ComputerSessionId,
+      settings: makeSettings(),
+      options: {},
+      requestClose: async (reason) => {
+        requestCloseCalls.push(reason)
+      },
+      recordScreenshot: () => {},
+    })
+    // Simulate Chromium crash.
+    captured.fireDisconnected()
+    // requestClose is fire-and-forget (`void this._requestClose(...)`); a
+    // microtask flush is enough.
+    await new Promise((r) => setImmediate(r))
+    expect(requestCloseCalls).toEqual(['error'])
+  })
+
+  it('disconnect handler suppresses requestClose when session already initiated close', async () => {
+    const captured = makeStubLaunchedCapturingDisconnect()
+    const requestCloseCalls: Array<'aborted' | 'timeout' | 'error'> = []
+    const factory = createPlaywrightSessionFactory({
+      launchChromium: async () => captured.launched,
+    })
+    const session = await factory({
+      id: 'sess-dc-2' as ComputerSessionId,
+      settings: makeSettings(),
+      options: {},
+      requestClose: async (reason) => {
+        requestCloseCalls.push(reason)
+      },
+      recordScreenshot: () => {},
+    })
+    // Intentional close path sets `_closed`, so the disconnect arriving after
+    // close — Playwright fires it even on graceful shutdown — is suppressed.
+    await session.close()
+    captured.fireDisconnected()
+    await new Promise((r) => setImmediate(r))
+    expect(requestCloseCalls).toEqual([])
   })
 })
 
@@ -574,7 +733,10 @@ describe('PlaywrightBrowserSession action methods', () => {
     function makeSessionWithLocator(
       locatorHandles: Map<string, FakeHandle[]>,
       screenshotPng: Buffer,
-      opts?: { extraSelectors?: readonly string[] },
+      opts?: {
+        extraSelectors?: readonly string[]
+        recordScreenshot?: (bytes: number) => void
+      },
     ): PlaywrightBrowserSession {
       const noop = async () => {}
       const noopRoute = async (_pattern: string, _handler: unknown) => {}
@@ -603,6 +765,7 @@ describe('PlaywrightBrowserSession action methods', () => {
         settings,
         options: { headless: true },
         requestClose: async () => {},
+        ...(opts?.recordScreenshot !== undefined && { recordScreenshot: opts.recordScreenshot }),
         launched,
       })
     }
@@ -688,6 +851,48 @@ describe('PlaywrightBrowserSession action methods', () => {
       const session = makeSessionWithLocator(new Map(), makeWhitePng(32, 32))
       const result = await session.screenshot(new AbortController().signal)
       expect(result.attachment.redacted).toBeFalsy()
+    })
+
+    // v3 Phase 6 — pin the metrics callback wiring at the runtime layer.
+    // sessionMetrics.test.ts proves the manager hands a bound callback to the
+    // factory; this test proves PlaywrightBrowserSession actually invokes it
+    // with the on-the-wire byte count after each successful capture.
+    it('screenshot invokes recordScreenshot exactly once with the encoded byte size', async () => {
+      const recordedBytes: number[] = []
+      const session = makeSessionWithLocator(new Map(), makeWhitePng(32, 32), {
+        recordScreenshot: (bytes) => recordedBytes.push(bytes),
+      })
+      const result = await session.screenshot(new AbortController().signal)
+      expect(recordedBytes).toHaveLength(1)
+      expect(recordedBytes[0]).toBe(result.attachment.byteSize)
+      expect(recordedBytes[0]).toBeGreaterThan(0)
+    })
+
+    it('screenshot does NOT invoke recordScreenshot when capture fails', async () => {
+      // Use a non-PNG buffer that pngCodec rejects → screenshot rejects with
+      // screenshot_failed; the metrics callback must not be called for a
+      // failed capture (count would mislead the eval suite into thinking the
+      // model received a usable image).
+      const handles = new Map<string, FakeHandle[]>([
+        [
+          'input[type="password"]',
+          [
+            {
+              boundingBox: async () => ({ x: 0, y: 0, width: 4, height: 4 }),
+              dispose: async () => {},
+            },
+          ],
+        ],
+      ])
+      const recordedBytes: number[] = []
+      const garbageBuffer = Buffer.from([0, 1, 2, 3, 4, 5, 6, 7])
+      const session = makeSessionWithLocator(handles, garbageBuffer, {
+        recordScreenshot: (bytes) => recordedBytes.push(bytes),
+      })
+      await expect(
+        session.screenshot(new AbortController().signal),
+      ).rejects.toMatchObject({ kind: 'screenshot_failed' })
+      expect(recordedBytes).toHaveLength(0)
     })
 
     it('screenshot FAILS CLOSED when blackout fails AFTER regions are detected (fix #9)', async () => {

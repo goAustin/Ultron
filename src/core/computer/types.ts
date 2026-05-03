@@ -57,6 +57,13 @@ export type StartSessionOptions = {
   // in `storageStateStore.loadStorageState`; we accept the validated object
   // (not a path) so there's exactly one validation seam.
   readonly storageState?: unknown
+  // v3 Phase 6 — per-session DSF override. Defaults to 1 (production path);
+  // the model-facing `ComputerStart` schema does not expose this. Tests and
+  // explicit SDK callers may set it (e.g. to 2) to exercise the bridge
+  // translation contract under DSF≠1. Threaded through to Playwright's
+  // `context.newContext({ deviceScaleFactor })` AND mirrored on
+  // `BrowserSession.viewport.deviceScaleFactor`.
+  readonly deviceScaleFactor?: number
 }
 
 export type BrowserSessionErrorKind =
@@ -210,6 +217,27 @@ export type StepDecision =
   | { readonly abort: true; readonly reason: string }
 
 /**
+ * v3 Phase 6 — per-session metrics surface. Returned from
+ * `ComputerSessionManager.getSessionMetrics(id)`. Live sessions expose
+ * `closedAt: null` / `durationMs: null` / `closeReason: null`; closed sessions
+ * have all three populated. Counters mirror the SessionEntry's mutable state
+ * for live sessions, and the frozen snapshot taken inside `closeOnce` for
+ * closed ones.
+ */
+export type SessionMetrics = {
+  readonly stepCount: number
+  readonly screenshotCount: number
+  readonly screenshotBytesTotal: number
+  /** epoch ms when SessionManager.start() returned. */
+  readonly startedAt: number
+  /** epoch ms when closeOnce ran; null while still open. */
+  readonly closedAt: number | null
+  /** closedAt - startedAt; null while still open. */
+  readonly durationMs: number | null
+  readonly closeReason: 'aborted' | 'timeout' | 'error' | 'stop' | null
+}
+
+/**
  * Public-shape contract for `SessionManager`. The class implements it; test
  * fakes implement it directly (without inheriting the class's private brand,
  * so structural fakes type-cleanly satisfy the QueryEngineConfig seam).
@@ -243,4 +271,22 @@ export interface ComputerSessionManager {
    * measures mutating page interactions.
    */
   recordStep(id: ComputerSessionId, signals: StepSignals): StepDecision
+  /**
+   * v3 Phase 6 — read-only metrics inspector. Returns live counters for an
+   * open session, a frozen snapshot for a closed one, or `null` for genuinely
+   * unknown ids. Used by tests + future SDK callers; not surfaced to the model.
+   */
+  getSessionMetrics(id: ComputerSessionId): SessionMetrics | null
+  /**
+   * v3 Phase 6 — fire-and-forget screenshot accounting. Called by the runtime
+   * (`PlaywrightBrowserSession.screenshot()`) via a pre-bound callback after
+   * each successful capture. No-op for unknown / closed sessions; closed
+   * sessions cannot take more screenshots, and if they somehow did the metrics
+   * snapshot is already frozen.
+   *
+   * Test fakes that supply a custom `BrowserSession` but want to assert on
+   * screenshot metrics must call this themselves; the manager has no way to
+   * intercept screenshot bytes from a third-party session.
+   */
+  recordScreenshot(id: ComputerSessionId, bytes: number): void
 }

@@ -25,10 +25,13 @@ import {
   type BrowserSession,
   type ComputerSessionId,
   type ComputerSessionManager,
+  type SessionMetrics,
   type StartSessionOptions,
   type StepDecision,
   type StepSignals,
 } from './types.js'
+
+type CloseReason = 'aborted' | 'timeout' | 'error' | 'stop'
 
 /**
  * v3 Phase 5 — ring length for the no-progress detector. Hardcoded for v3;
@@ -70,12 +73,18 @@ function ringAllEqual<T>(ring: T[]): boolean {
  * `id`, `viewport`, and `displaySize` are owned by the manager and passed in;
  * the factory only constructs the runtime-specific implementation (Playwright
  * browser+context+page).
+ *
+ * v3 Phase 6 — `recordScreenshot` is a pre-bound (id-closed) callback the
+ * concrete session calls after each successful screenshot capture. The manager
+ * uses it to accumulate per-session byte/count metrics; fire-and-forget,
+ * never throws.
  */
 export type BrowserSessionFactory = (params: {
   readonly id: ComputerSessionId
   readonly settings: ComputerUseSettings
   readonly options: StartSessionOptions
   readonly requestClose: (reason: 'aborted' | 'timeout' | 'error') => Promise<void>
+  readonly recordScreenshot: (bytes: number) => void
 }) => Promise<BrowserSession>
 
 /**
@@ -98,12 +107,21 @@ type SessionEntry = {
   readonly abortSignal: AbortSignal | null
   closed: boolean
   readonly history: StepHistory
+  // v3 Phase 6 — screenshot accounting + lifetime markers. `startedAt` is
+  // frozen at session-create time; counters are mutated by `recordScreenshot`.
+  readonly startedAt: number
+  screenshotCount: number
+  screenshotBytesTotal: number
 }
 
 export class SessionManager implements ComputerSessionManager {
   private readonly _settings: ComputerUseSettings
   private readonly _factory: BrowserSessionFactory
   private readonly _sessions = new Map<ComputerSessionId, SessionEntry>()
+  // v3 Phase 6 — frozen post-close metrics, snapshotted by `closeOnce` BEFORE
+  // the entry is deleted from `_sessions`. Lookup falls through to this map
+  // so callers (tests, audit) can read metrics for closed sessions.
+  private readonly _metrics = new Map<ComputerSessionId, SessionMetrics>()
 
   constructor(deps: {
     readonly settings: ComputerUseSettings
@@ -152,6 +170,10 @@ export class SessionManager implements ComputerSessionManager {
 
     // Construct the entry first (with placeholders) so requestClose can find it
     // even if the factory's onCreate hooks fire callbacks during construction.
+    // `startedAt` is backfilled after the factory succeeds so it reflects
+    // session-usable time, not launch-attempt time — a slow Chromium boot
+    // would otherwise inflate `durationMs` and decouple it from the timeout
+    // timer (which also starts after factory completion).
     const entry: SessionEntry = {
       id,
       session: null as unknown as BrowserSession, // backfilled below
@@ -165,6 +187,9 @@ export class SessionManager implements ComputerSessionManager {
         recentPhashes: [],
         recentVerifyOk: [],
       },
+      startedAt: 0, // backfilled below, after factory returns
+      screenshotCount: 0,
+      screenshotBytesTotal: 0,
     }
 
     // Build the runtime session.
@@ -175,12 +200,14 @@ export class SessionManager implements ComputerSessionManager {
         settings,
         options: opts,
         requestClose: (reason) => this.requestClose(id, reason),
+        recordScreenshot: (bytes) => this.recordScreenshot(id, bytes),
       })
     } catch (err) {
       // Nothing to register; propagate.
       throw err
     }
     ;(entry as { session: BrowserSession }).session = session
+    ;(entry as { startedAt: number }).startedAt = Date.now()
 
     // Wire abort listener.
     const abortListener = (): void => {
@@ -219,21 +246,21 @@ export class SessionManager implements ComputerSessionManager {
 
   /** Explicit user-initiated close. Idempotent. */
   async stop(id: ComputerSessionId): Promise<void> {
-    await this.closeOnce(id)
+    await this.closeOnce(id, 'stop')
   }
 
   /**
    * Internal route used by BrowserSession instances when they need to close
    * due to abort/timeout/error. Guarantees one close path through `closeOnce`.
    */
-  async requestClose(id: ComputerSessionId, _reason: 'aborted' | 'timeout' | 'error'): Promise<void> {
-    await this.closeOnce(id)
+  async requestClose(id: ComputerSessionId, reason: 'aborted' | 'timeout' | 'error'): Promise<void> {
+    await this.closeOnce(id, reason)
   }
 
   /** Close every live session. Used during QueryEngine teardown. */
   async stopAll(): Promise<void> {
     const ids = [...this._sessions.keys()]
-    await Promise.all(ids.map((id) => this.closeOnce(id)))
+    await Promise.all(ids.map((id) => this.closeOnce(id, 'stop')))
   }
 
   /**
@@ -338,10 +365,46 @@ export class SessionManager implements ComputerSessionManager {
   }
 
   /**
+   * v3 Phase 6 — read-only metrics inspector. Returns live counters for an
+   * open session, the frozen post-close snapshot for a closed one, or `null`
+   * for genuinely unknown ids.
+   */
+  getSessionMetrics(id: ComputerSessionId): SessionMetrics | null {
+    const live = this._sessions.get(id)
+    if (live !== undefined && !live.closed) {
+      return {
+        stepCount: live.history.stepCount,
+        screenshotCount: live.screenshotCount,
+        screenshotBytesTotal: live.screenshotBytesTotal,
+        startedAt: live.startedAt,
+        closedAt: null,
+        durationMs: null,
+        closeReason: null,
+      }
+    }
+    return this._metrics.get(id) ?? null
+  }
+
+  /**
+   * v3 Phase 6 — fire-and-forget screenshot accounting. Called by
+   * `PlaywrightBrowserSession.screenshot()` via the pre-bound callback in
+   * the factory params. No-op for unknown / closed sessions.
+   */
+  recordScreenshot(id: ComputerSessionId, bytes: number): void {
+    const entry = this._sessions.get(id)
+    if (!entry || entry.closed) return
+    entry.screenshotCount += 1
+    entry.screenshotBytesTotal += bytes
+  }
+
+  /**
    * Single cleanup path. Ensures `BrowserSession.close()` runs at most once per
    * session even under concurrent stop / timeout / abort / stopAll.
+   *
+   * v3 Phase 6 — snapshots a frozen `SessionMetrics` into `_metrics` BEFORE
+   * deleting from `_sessions`, so post-close callers can still read counters.
    */
-  private async closeOnce(id: ComputerSessionId): Promise<void> {
+  private async closeOnce(id: ComputerSessionId, reason: CloseReason): Promise<void> {
     const entry = this._sessions.get(id)
     if (!entry) return
     if (entry.closed) return
@@ -350,6 +413,16 @@ export class SessionManager implements ComputerSessionManager {
     if (entry.abortListener !== null && entry.abortSignal !== null) {
       entry.abortSignal.removeEventListener('abort', entry.abortListener)
     }
+    const closedAt = Date.now()
+    this._metrics.set(id, {
+      stepCount: entry.history.stepCount,
+      screenshotCount: entry.screenshotCount,
+      screenshotBytesTotal: entry.screenshotBytesTotal,
+      startedAt: entry.startedAt,
+      closedAt,
+      durationMs: closedAt - entry.startedAt,
+      closeReason: reason,
+    })
     try {
       await entry.session.close()
     } finally {

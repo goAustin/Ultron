@@ -130,6 +130,9 @@ class FakeManager implements ComputerSessionManager {
   async stopAll(): Promise<void> {}
   async requestClose(): Promise<void> {}
   recordStep(): StepDecision { return { abort: false } }
+  // v3 Phase 6 — safety-check tests don't exercise metrics; null + no-op suffice.
+  getSessionMetrics(): null { return null }
+  recordScreenshot(): void {}
 }
 
 function fakeTool(name: string): Tool {

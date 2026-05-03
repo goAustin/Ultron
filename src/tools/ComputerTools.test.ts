@@ -24,6 +24,7 @@ import {
   type MouseButton,
   type NormalizedPoint,
   type ScreenshotResult,
+  type SessionMetrics,
   type StartSessionOptions,
   type StepDecision,
   type StepSignals,
@@ -306,6 +307,32 @@ class FakeSessionManager implements ComputerSessionManager {
     this.recordStepCalls.push({ id, signals })
     if (this.recordStepImpl) return this.recordStepImpl(id, signals)
     return { abort: false }
+  }
+
+  // v3 Phase 6 — capture-only metrics fake. Defaults to a zeroed snapshot for
+  // any sessionId the fake has handed out via `start`; returns null otherwise.
+  // Tests that exercise metrics paths can override via `getSessionMetricsImpl`.
+  recordScreenshotCalls: { id: ComputerSessionId; bytes: number }[] = []
+  getSessionMetricsImpl: ((id: ComputerSessionId) => SessionMetrics | null) | null = null
+
+  recordScreenshot(id: ComputerSessionId, bytes: number): void {
+    this.recordScreenshotCalls.push({ id, bytes })
+  }
+
+  getSessionMetrics(id: ComputerSessionId): SessionMetrics | null {
+    if (this.getSessionMetricsImpl) return this.getSessionMetricsImpl(id)
+    if (!this.sessions.has(id)) return null
+    return {
+      stepCount: this.recordStepCalls.filter((c) => c.id === id).length,
+      screenshotCount: this.recordScreenshotCalls.filter((c) => c.id === id).length,
+      screenshotBytesTotal: this.recordScreenshotCalls
+        .filter((c) => c.id === id)
+        .reduce((sum, c) => sum + c.bytes, 0),
+      startedAt: 0,
+      closedAt: null,
+      durationMs: null,
+      closeReason: null,
+    }
   }
 }
 

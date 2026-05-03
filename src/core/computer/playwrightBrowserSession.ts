@@ -73,6 +73,9 @@ export type LaunchChromiumFn = (params: {
   // Phase 4·3 — pre-validated Playwright `storageState` object. Forwarded to
   // `browser.newContext({ storageState })` when present; ignored otherwise.
   readonly storageState?: unknown
+  // v3 Phase 6 — per-session DSF override forwarded to
+  // `browser.newContext({ deviceScaleFactor })`. Defaults to 1 when omitted.
+  readonly deviceScaleFactor?: number
 }) => Promise<LaunchedBrowser>
 
 const NAVIGATION_TIMEOUT_MS = 30_000
@@ -91,6 +94,12 @@ const defaultLaunchChromium: LaunchChromiumFn = async (params) => {
     bypassCSP: false,
     javaScriptEnabled: true,
     serviceWorkers: 'block',
+    // v3 Phase 6 — per-session DSF override; only forwarded when caller set
+    // it. Default `undefined` lets Playwright pick its own default (1 for
+    // headless chromium), matching pre-Phase-6 behavior.
+    ...(params.deviceScaleFactor !== undefined
+      ? { deviceScaleFactor: params.deviceScaleFactor }
+      : {}),
   }
   let context: BrowserContext
   try {
@@ -152,7 +161,7 @@ export function createPlaywrightSessionFactory(deps?: {
   readonly launchChromium?: LaunchChromiumFn
 }): BrowserSessionFactory {
   const launch = deps?.launchChromium ?? defaultLaunchChromium
-  return async ({ id, settings, options, requestClose }) => {
+  return async ({ id, settings, options, requestClose, recordScreenshot }) => {
     let launched: LaunchedBrowser
     try {
       launched = await launch({
@@ -164,6 +173,12 @@ export function createPlaywrightSessionFactory(deps?: {
           width: settings.viewport.width,
           height: settings.viewport.height,
         },
+        // v3 Phase 6 — DSF override (default 1). Forwarded to the launcher so
+        // `context.newContext({ deviceScaleFactor })` matches the value
+        // mirrored on `BrowserSession.viewport.deviceScaleFactor`.
+        ...(options.deviceScaleFactor !== undefined
+          ? { deviceScaleFactor: options.deviceScaleFactor }
+          : {}),
         ...(options.storageState !== undefined ? { storageState: options.storageState } : {}),
       })
     } catch (err) {
@@ -185,10 +200,12 @@ export function createPlaywrightSessionFactory(deps?: {
       settings,
       options,
       requestClose,
+      recordScreenshot,
       launched,
     })
     await session._installRouteInterceptor()
     session._installPopupBlocker()
+    session._installDisconnectHandler()
     return session
   }
 }
@@ -196,6 +213,8 @@ export function createPlaywrightSessionFactory(deps?: {
 type PopupErrorNotifier = (err: unknown) => void
 
 const noopPopupNotifier: PopupErrorNotifier = () => {}
+
+const noopRecordScreenshot = (_bytes: number): void => {}
 
 export class PlaywrightBrowserSession implements BrowserSession {
   readonly id: ComputerSessionId
@@ -206,6 +225,11 @@ export class PlaywrightBrowserSession implements BrowserSession {
   private readonly _settings: ComputerUseSettings
   private readonly _options: StartSessionOptions
   private readonly _requestClose: (reason: 'aborted' | 'timeout' | 'error') => Promise<void>
+  // v3 Phase 6 — pre-bound metrics callback supplied by the manager. Called
+  // after each successful `screenshot()` capture. Fire-and-forget; the manager
+  // no-ops on closed/unknown sessions. `() => {}` is a safe default for
+  // direct-construct test paths that don't care about metrics.
+  private readonly _recordScreenshot: (bytes: number) => void
   private readonly _browser: Browser
   private readonly _context: BrowserContext
   private readonly _page: Page
@@ -227,6 +251,12 @@ export class PlaywrightBrowserSession implements BrowserSession {
     readonly settings: ComputerUseSettings
     readonly options: StartSessionOptions
     readonly requestClose: (reason: 'aborted' | 'timeout' | 'error') => Promise<void>
+    /**
+     * v3 Phase 6 — pre-bound metrics callback supplied by the manager. The
+     * factory plumbs it through; direct-construct test paths that don't care
+     * about metrics can pass `() => {}`.
+     */
+    readonly recordScreenshot?: (bytes: number) => void
     readonly launched: LaunchedBrowser
     readonly onPopupError?: PopupErrorNotifier
   }) {
@@ -234,8 +264,13 @@ export class PlaywrightBrowserSession implements BrowserSession {
     this.viewport = {
       width: params.settings.viewport.width,
       height: params.settings.viewport.height,
-      // DSF=1 is pinned for v3 (see Open Question 1 in the design doc).
-      deviceScaleFactor: 1,
+      // v3 Phase 6 — DSF mirrors the per-session override (default 1).
+      // Coordinate math (`normalizedToCssPx`) intentionally ignores DSF
+      // because Playwright's mouse/keyboard APIs take CSS px, not device px.
+      // The mirror is for callers that read `session.viewport.deviceScaleFactor`
+      // (e.g. native-bridge translation) so they see the value the launch
+      // path actually applied.
+      deviceScaleFactor: params.options.deviceScaleFactor ?? 1,
     }
     this.displaySize = {
       width: params.settings.displaySize.width,
@@ -245,6 +280,7 @@ export class PlaywrightBrowserSession implements BrowserSession {
     this._settings = params.settings
     this._options = params.options
     this._requestClose = params.requestClose
+    this._recordScreenshot = params.recordScreenshot ?? noopRecordScreenshot
     this._browser = params.launched.browser
     this._context = params.launched.context
     this._page = params.launched.page
@@ -283,6 +319,22 @@ export class PlaywrightBrowserSession implements BrowserSession {
       // Popups are converted into close events. The `close().catch()` swallows
       // any teardown race so an exotic popup can't crash the session.
       popup.close().catch((err) => this._onPopupError(err))
+    })
+  }
+
+  /**
+   * v3 Phase 6 — surface unexpected browser disconnects (Chromium SIGKILL,
+   * crash, daemon kill) to the SessionManager so the registry doesn't keep
+   * thinking the session is alive. The `_closed` guard suppresses the event
+   * when an intentional close path (`close()` / `requestClose`) already set
+   * the flag — without it every clean teardown would also fire `requestClose`.
+   * `requestClose → closeOnce` is idempotent, so a residual race in either
+   * direction is at worst a redundant no-op call.
+   */
+  _installDisconnectHandler(): void {
+    this._browser.on('disconnected', () => {
+      if (this._closed) return
+      void this._requestClose('error')
     })
   }
 
@@ -352,6 +404,16 @@ export class PlaywrightBrowserSession implements BrowserSession {
           type: 'png',
           fullPage: false,
           animations: 'disabled',
+          // v3 Phase 6 — `scale: 'css'` keeps screenshot dimensions equal to
+          // the CSS-px viewport regardless of `deviceScaleFactor`. Without
+          // this, a DSF=2 session captures at 2× pixel size (e.g. 2048×1536
+          // for a 1024×768 viewport) and immediately fails
+          // `validateImageAttachment` against the default
+          // `maxScreenshotDimensions: 1024×768`. The model-facing contract is
+          // CSS-px throughout (normalized coords map to CSS px in
+          // `normalizedToCssPx`), so capturing at CSS scale also keeps the
+          // bridge translation contract round-trippable.
+          scale: 'css',
         })
       } catch (err) {
         if (this._closed) {
@@ -420,6 +482,11 @@ export class PlaywrightBrowserSession implements BrowserSession {
       const attachment: ToolResultAttachment = redacted
         ? { ...validated.attachment, redacted: true }
         : validated.attachment
+      // v3 Phase 6 — accumulate screenshot byte/count metrics. Fire-and-forget;
+      // the manager handles unknown/closed sessions. Use the on-the-wire byte
+      // count (post-redaction encoded size) so the total reflects what was
+      // actually shipped to the model.
+      this._recordScreenshot(attachment.byteSize)
       const url = this._page.url()
       let title: string | null = null
       try {

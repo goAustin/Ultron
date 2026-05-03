@@ -1476,6 +1476,10 @@ function makeFakeSessionManager(): {
   stopAll: () => Promise<void>
   requestClose: () => Promise<void>
   recordStep: () => { abort: false }
+  // v3 Phase 6 — metrics surface; QE tests don't read these, so the stubs
+  // return null / no-op.
+  getSessionMetrics: () => null
+  recordScreenshot: () => void
   stopAllCalls: number
 } {
   const fake = {
@@ -1494,6 +1498,10 @@ function makeFakeSessionManager(): {
     recordStep(): { abort: false } {
       return { abort: false }
     },
+    getSessionMetrics(): null {
+      return null
+    },
+    recordScreenshot(): void {},
   }
   return fake
 }
