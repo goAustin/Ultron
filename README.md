@@ -2,7 +2,7 @@
 
 Claude Code source files used as study material live under `reference/`, preserving their original relative paths for easy cross-referencing.
 
-New implementation code lives under `src/`. v1 is complete — the v1 roadmap and per-phase designs are archived under [`docs/ultron_v1/`](docs/ultron_v1/). v2 direction lives in [`docs/v2-scope.md`](docs/v2-scope.md).
+New implementation code lives under `src/`. v1 is complete — the v1 roadmap and per-phase designs are archived under [`docs/ultron_v1/`](docs/ultron_v1/). v2 direction lives in [`docs/v2-scope.md`](docs/v2-scope.md). v3 ships browser-based Computer-Use, **disabled by default**; see [`docs/computer-use.md`](docs/computer-use.md) for enabling, security, settings, and limitations, or [`docs/ultron_v3/v3-computer-use-plan.md`](docs/ultron_v3/v3-computer-use-plan.md) for the engineering plan.
 
 The assistant is aligned to a **single-user personal assistant** scope:
 

@@ -10,6 +10,11 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  defaultComputerUseSettings,
+  type ComputerUseSettings,
+} from '../../config/computerUseSettings.js'
+
+import {
   buildSnapshot,
   type AriaNode,
   type AriaTreeSnapshot,
@@ -111,6 +116,7 @@ class StubSession implements BrowserSession {
   currentAtomCache(): SessionAtomCache | null {
     return this._atomCache
   }
+  refreshSettings(_next: ComputerUseSettings): void {}
 }
 
 class FakeManager implements ComputerSessionManager {
@@ -133,6 +139,24 @@ class FakeManager implements ComputerSessionManager {
   // v3 Phase 6 — safety-check tests don't exercise metrics; null + no-op suffice.
   getSessionMetrics(): null { return null }
   recordScreenshot(): void {}
+  // Domain-prompt UX — minimal stubs. Tests that exercise the navigate
+  // safety check supply a custom subclass that overrides `getSettings` /
+  // `getSessionAllowedHosts` to return curated values.
+  settings: ComputerUseSettings = defaultComputerUseSettings
+  getSettings(): ComputerUseSettings { return this.settings }
+  readonly _overlay = new Map<ComputerSessionId, Set<string>>()
+  getSessionAllowedHosts(id: ComputerSessionId): ReadonlySet<string> {
+    return this._overlay.get(id) ?? new Set()
+  }
+  allowDomainForSession(id: ComputerSessionId, host: string): void {
+    let s = this._overlay.get(id)
+    if (s === undefined) {
+      s = new Set()
+      this._overlay.set(id, s)
+    }
+    s.add(host.toLowerCase())
+  }
+  async persistAllowedDomain(_host: string): Promise<void> {}
 }
 
 function fakeTool(name: string): Tool {
@@ -479,6 +503,74 @@ describe('makeComputerUseSafetyCheck', () => {
           fakeContext(),
         ),
       ).toBeNull()
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // ComputerNavigate (domain-prompt UX)
+  // -------------------------------------------------------------------------
+
+  describe('ComputerNavigate (domain-prompt UX)', () => {
+    function mgrWith(allow: string[], deny: string[] = []): FakeManager {
+      const mgr = new FakeManager()
+      mgr.add('s1', null)
+      mgr.settings = {
+        ...defaultComputerUseSettings,
+        allowedDomains: allow,
+        deniedDomains: deny,
+      }
+      return mgr
+    }
+
+    it('host in allowedDomains → behavior: allow (short-circuits cascade)', () => {
+      const mgr = mgrWith(['*.youtube.com', 'youtube.com'])
+      const check = makeComputerUseSafetyCheck({ sessionManager: mgr })
+      const r = check(
+        fakeTool('ComputerNavigate'),
+        { sessionId: 's1', url: 'https://m.youtube.com/' },
+        fakeContext(),
+      )
+      expect(r?.behavior).toBe('allow')
+      // Reason carries the host so the audit row is searchable.
+      const msg = r?.reason.type === 'safetyCheck' ? r.reason.message : ''
+      expect(msg).toContain('m.youtube.com')
+    })
+
+    it('host in session overlay → behavior: allow (allow_once carry)', () => {
+      const mgr = mgrWith([])
+      mgr.allowDomainForSession('s1' as ComputerSessionId, 'example.com')
+      const check = makeComputerUseSafetyCheck({ sessionManager: mgr })
+      const r = check(
+        fakeTool('ComputerNavigate'),
+        { sessionId: 's1', url: 'https://example.com/' },
+        fakeContext(),
+      )
+      expect(r?.behavior).toBe('allow')
+    })
+
+    it('unknown host → behavior: ask (with host in reason for prompt UI)', () => {
+      const mgr = mgrWith([])
+      const check = makeComputerUseSafetyCheck({ sessionManager: mgr })
+      const r = check(
+        fakeTool('ComputerNavigate'),
+        { sessionId: 's1', url: 'https://www.youtube.com/' },
+        fakeContext(),
+      )
+      expect(r?.behavior).toBe('ask')
+      const msg = r?.reason.type === 'safetyCheck' ? r.reason.message : ''
+      expect(msg).toContain('www.youtube.com')
+      expect(msg).toContain('not in computerUse.allowedDomains')
+    })
+
+    it('host in deniedDomains → behavior: deny (level 4)', () => {
+      const mgr = mgrWith([], ['evil.com'])
+      const check = makeComputerUseSafetyCheck({ sessionManager: mgr })
+      const r = check(
+        fakeTool('ComputerNavigate'),
+        { sessionId: 's1', url: 'https://evil.com/' },
+        fakeContext(),
+      )
+      expect(r?.behavior).toBe('deny')
     })
   })
 })

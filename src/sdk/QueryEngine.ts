@@ -360,10 +360,41 @@ export class QueryEngine {
     const askUser = headless
       ? undefined
       : wrapAskUserWithSessionLookup(config.askUser, this._sessionManager)
+    // Domain-prompt UX — wire the post-decision hook so a user picking
+    // "Allow once" or "Allow by rule" on a `ComputerNavigate` prompt updates
+    // the SessionManager's per-session overlay (both responses) and persists
+    // the host to settings.json (`allow_by_rule` only).
+    //
+    // Scoped to `ComputerNavigate` ONLY. Other Computer tools (Click, Type,
+    // Key, Scroll, Drag, ActAtom, HandoffToUser) also expose `getDomain`
+    // (returning the current page host), but their prompts are about
+    // sensitive inputs / dangerous-label clicks / handoff — NOT about
+    // granting persistent navigation rights to the page's host. Treating
+    // their `allow_by_rule` as "persist this domain" would broaden trust
+    // beyond what the user approved.
+    const sessionManager = this._sessionManager
+    const approvedDomainHook = sessionManager === null
+      ? undefined
+      : async (params: {
+          readonly toolName: string
+          readonly input: Record<string, unknown>
+          readonly host: string
+          readonly response: 'allow_once' | 'allow_by_rule'
+        }): Promise<void> => {
+          if (params.toolName !== 'ComputerNavigate') return
+          const rawSessionId = params.input.sessionId
+          if (typeof rawSessionId !== 'string' || rawSessionId.length === 0) return
+          const sessionId = rawSessionId as ComputerSessionId
+          sessionManager.allowDomainForSession(sessionId, params.host)
+          if (params.response === 'allow_by_rule') {
+            await sessionManager.persistAllowedDomain(params.host)
+          }
+        }
     this.permissionOpts = {
       headless,
       safetyChecks,
       ...(askUser !== undefined && { askUser }),
+      ...(approvedDomainHook !== undefined && { approvedDomainHook }),
     }
     // Hook config is lazily loaded on first submitPrompt. An explicitly-provided
     // hookConfig short-circuits the lazy-load path (tests, SDK embedders).

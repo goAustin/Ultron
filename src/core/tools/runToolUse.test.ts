@@ -5,10 +5,11 @@ import type { Tool, ToolResult } from './types.js'
 import type { ToolUseContext } from './context.js'
 import { createToolUseContext } from './context.js'
 import { createToolRegistry } from './registry.js'
+import type { AppState } from '../state.js'
 import { createStore, getDefaultAppState } from '../state.js'
 import type { PermissionOptions, SafetyCheck } from '../permissions/types.js'
 import type { ToolUseBlock } from '../messages.js'
-import { toolUseId } from '../messages.js'
+import { createAssistantMessage, messageId, toolUseId } from '../messages.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -438,6 +439,133 @@ describe('authorizeToolUse', () => {
     }
   })
 
+  describe('approvedDomainHook (domain-prompt UX)', () => {
+    function navigateTool(): Tool {
+      return buildTool({
+        name: 'ComputerNavigate',
+        inputSchema: { type: 'object', properties: {}, required: [] },
+        call: async () => ({ content: 'ok', isError: false }),
+        checkPermissions: async () => ({ behavior: 'ask', message: 'navigate?' }),
+        getDomain: (input) =>
+          typeof input.url === 'string' ? new URL(input.url).hostname : undefined,
+      })
+    }
+
+    it('fires on allow_once with toolName/host/response', async () => {
+      const ctx = makeContext([navigateTool()], { permissionMode: 'default' })
+      const calls: Array<{
+        toolName: string
+        host: string
+        response: 'allow_once' | 'allow_by_rule'
+      }> = []
+      const opts: PermissionOptions = {
+        headless: false,
+        safetyChecks: [],
+        askUser: async () => 'allow_once',
+        approvedDomainHook: async ({ toolName, host, response }) => {
+          calls.push({ toolName, host, response })
+        },
+      }
+      const auth = await authorizeToolUse(
+        makeToolUse('ComputerNavigate', { sessionId: 's1', url: 'https://www.youtube.com/' }),
+        ctx,
+        makeSignal(),
+        opts,
+      )
+      expect(auth.outcome).toBe('authorized')
+      expect(calls).toEqual([
+        { toolName: 'ComputerNavigate', host: 'www.youtube.com', response: 'allow_once' },
+      ])
+    })
+
+    it('fires on allow_by_rule', async () => {
+      const ctx = makeContext([navigateTool()], { permissionMode: 'default' })
+      const calls: string[] = []
+      const opts: PermissionOptions = {
+        headless: false,
+        safetyChecks: [],
+        askUser: async () => 'allow_by_rule',
+        approvedDomainHook: ({ response }) => {
+          calls.push(response)
+        },
+      }
+      await authorizeToolUse(
+        makeToolUse('ComputerNavigate', { sessionId: 's1', url: 'https://www.youtube.com/' }),
+        ctx,
+        makeSignal(),
+        opts,
+      )
+      expect(calls).toEqual(['allow_by_rule'])
+    })
+
+    it('does NOT fire on deny_once / abort', async () => {
+      const ctx = makeContext([navigateTool()], { permissionMode: 'default' })
+      const calls: unknown[] = []
+      const opts: PermissionOptions = {
+        headless: false,
+        safetyChecks: [],
+        askUser: async () => 'deny_once',
+        approvedDomainHook: () => {
+          calls.push('called')
+        },
+      }
+      await authorizeToolUse(
+        makeToolUse('ComputerNavigate', { sessionId: 's1', url: 'https://www.youtube.com/' }),
+        ctx,
+        makeSignal(),
+        opts,
+      )
+      expect(calls).toEqual([])
+    })
+
+    it('does NOT fire when tool has no getDomain', async () => {
+      const tool = buildTool({
+        name: 'NoDomainTool',
+        inputSchema: { type: 'object', properties: {}, required: [] },
+        call: async () => ({ content: 'ok', isError: false }),
+        checkPermissions: async () => ({ behavior: 'ask', message: 'go?' }),
+      })
+      const ctx = makeContext([tool], { permissionMode: 'default' })
+      const calls: unknown[] = []
+      const opts: PermissionOptions = {
+        headless: false,
+        safetyChecks: [],
+        askUser: async () => 'allow_once',
+        approvedDomainHook: () => {
+          calls.push('called')
+        },
+      }
+      await authorizeToolUse(makeToolUse('NoDomainTool', {}), ctx, makeSignal(), opts)
+      expect(calls).toEqual([])
+    })
+
+    it('hook errors are warned, not propagated (authorization succeeds)', async () => {
+      const ctx = makeContext([navigateTool()], { permissionMode: 'default' })
+      const stderrSpy = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation(() => true)
+      const opts: PermissionOptions = {
+        headless: false,
+        safetyChecks: [],
+        askUser: async () => 'allow_once',
+        approvedDomainHook: async () => {
+          throw new Error('boom')
+        },
+      }
+      const auth = await authorizeToolUse(
+        makeToolUse('ComputerNavigate', { sessionId: 's1', url: 'https://www.youtube.com/' }),
+        ctx,
+        makeSignal(),
+        opts,
+      )
+      expect(auth.outcome).toBe('authorized')
+      expect(
+        stderrSpy.mock.calls.some((c) => String(c[0]).includes('approvedDomainHook failed')),
+      ).toBe(true)
+      stderrSpy.mockRestore()
+    })
+  })
+
   describe('allow_by_rule scope construction (Phase 6a)', () => {
     function askingTool(specOverrides: {
       name: string
@@ -801,5 +929,95 @@ describe('executeToolUse', () => {
     // engineForkSubagent not set → callContext.forkSubagent must stay undefined.
     const result = await executeToolUse(makeToolUse('TestForker'), ctx, makeSignal())
     expect(result.content).toBe('no-fork')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tool-call repetition guard — fires before tool.call when the conversation
+// shows the same tool firing repeatedly with structurally similar input.
+// ---------------------------------------------------------------------------
+
+describe('repetition guard integration', () => {
+  function makeContextWithHistory(
+    tools: Tool[],
+    priorToolUses: Array<{ name: string; input: Record<string, unknown>; id: string }>,
+  ): ToolUseContext {
+    const registry = createToolRegistry()
+    for (const t of tools) registry.register(t)
+
+    const messages = priorToolUses.map((tu, i) =>
+      createAssistantMessage(
+        [{ type: 'tool_use', id: toolUseId(tu.id), name: tu.name, input: tu.input }],
+        { id: messageId(`m-${i}`), timestamp: i },
+      ),
+    )
+
+    const state: AppState = {
+      ...getDefaultAppState(),
+      permissionMode: 'bypassPermissions',
+    }
+    return createToolUseContext({
+      appState: createStore(state),
+      abortController: new AbortController(),
+      messages,
+      toolRegistry: registry,
+    })
+  }
+
+  it('short-circuits when the same tool fires four times with similar coords', async () => {
+    const callFn = vi.fn(async () => ({ content: 'clicked', isError: false }))
+    const tool = buildTool({
+      name: 'ComputerClick',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+      call: callFn,
+    })
+    const ctx = makeContextWithHistory(
+      [tool],
+      [
+        { name: 'ComputerClick', input: { x: 0.388, y: 0.303 }, id: 'p1' },
+        { name: 'ComputerClick', input: { x: 0.389, y: 0.282 }, id: 'p2' },
+        { name: 'ComputerClick', input: { x: 0.389, y: 0.282 }, id: 'p3' },
+      ],
+    )
+    const toolUse: ToolUseBlock = {
+      type: 'tool_use',
+      id: toolUseId('p4'),
+      name: 'ComputerClick',
+      input: { x: 0.380, y: 0.283 },
+    }
+    const result = await runToolUse(toolUse, ctx, makeSignal())
+
+    expect(result.isError).toBe(true)
+    expect(result.content).toContain('execution_error')
+    expect(result.content).toContain('repetition guard')
+    expect(result.content).toContain('OpenInBrowser')
+    expect(callFn).not.toHaveBeenCalled()
+  })
+
+  it('lets the call through when prior calls vary structurally', async () => {
+    const callFn = vi.fn(async () => ({ content: 'ok', isError: false }))
+    const tool = buildTool({
+      name: 'ComputerClick',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+      call: callFn,
+    })
+    const ctx = makeContextWithHistory(
+      [tool],
+      [
+        { name: 'ComputerClick', input: { x: 0.1, y: 0.1 }, id: 'p1' },
+        { name: 'ComputerClick', input: { x: 0.5, y: 0.5 }, id: 'p2' },
+        { name: 'ComputerClick', input: { x: 0.9, y: 0.9 }, id: 'p3' },
+      ],
+    )
+    const toolUse: ToolUseBlock = {
+      type: 'tool_use',
+      id: toolUseId('p4'),
+      name: 'ComputerClick',
+      input: { x: 0.3, y: 0.3 },
+    }
+    const result = await runToolUse(toolUse, ctx, makeSignal())
+
+    expect(result.isError).toBe(false)
+    expect(callFn).toHaveBeenCalledTimes(1)
   })
 })

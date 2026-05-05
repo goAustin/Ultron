@@ -70,6 +70,17 @@ export function makeComputerUseSafetyCheck(
         : null
     const targetNode = atomEntry?.node ?? null
 
+    // Domain-prompt UX — for `ComputerNavigate`, the classifier needs the
+    // live persistent allow/deny lists AND the per-session overlay so it can
+    // return 'allow' for known hosts (short-circuit), 'deny' for explicit
+    // blocks, or 'ask' for unknown hosts (the runtime prompt). Other tools
+    // ignore these fields.
+    const settings = deps.sessionManager.getSettings()
+    const sessionAllowedHosts =
+      typeof sessionId === 'string'
+        ? deps.sessionManager.getSessionAllowedHosts(sessionId as ComputerSessionId)
+        : undefined
+
     const assessment = classifyAction({
       toolName: tool.name,
       input,
@@ -77,6 +88,9 @@ export function makeComputerUseSafetyCheck(
       ariaSnapshot,
       ...(viewport !== undefined && { viewport }),
       targetNode,
+      allowedDomains: settings.allowedDomains,
+      deniedDomains: settings.deniedDomains,
+      ...(sessionAllowedHosts !== undefined && { sessionAllowedHosts }),
     })
 
     return decisionFromAssessment(tool.name, assessment)
@@ -87,6 +101,29 @@ function decisionFromAssessment(
   toolName: string,
   assessment: RiskAssessment,
 ): PermissionDecision | null {
+  // Domain-prompt UX — `known_domain` short-circuits the cascade with
+  // 'allow', so a navigate to a host already in the effective allowlist
+  // (persistent OR session overlay) does not re-prompt or fall through to
+  // the fallback ask. Without this branch, a navigate to a host the user
+  // approved earlier this session would still hit the cascade's
+  // step-7 fallback ask.
+  if (assessment.category === 'known_domain') {
+    const metadata: SafetyMetadata = {
+      checkName: CHECK_NAME,
+      riskLevel: assessment.level,
+      riskCategory: assessment.category,
+      ...(assessment.evidence !== undefined && { evidence: assessment.evidence }),
+    }
+    return {
+      behavior: 'allow',
+      reason: {
+        type: 'safetyCheck',
+        message: `${toolName}: ${assessment.reason}`,
+        metadata,
+      },
+    }
+  }
+
   if (assessment.level <= 1) return null
 
   const metadata: SafetyMetadata = {

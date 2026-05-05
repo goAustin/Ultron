@@ -39,6 +39,7 @@ import {
 } from '../permissions/permissions.js'
 import { isValidDomainPattern } from '../../web/domainPolicy.js'
 import { makeErrorResult, makeAbortResult, checkAbort } from './toolExecution.js'
+import { checkToolRepetition } from './repetitionGuard.js'
 
 // ---------------------------------------------------------------------------
 // authorizeToolUse — resolve + validate + permissions + askUser
@@ -182,6 +183,32 @@ export async function authorizeToolUse(
       context.appState.setState({ permissionRules: [...currentRules, ruleCreated] })
     }
 
+    // Domain-prompt UX — invoke the approval hook for tools that scope to a
+    // host. The QueryEngine wires this to update the Computer-Use
+    // SessionManager's per-session overlay (allow_once + allow_by_rule) and
+    // persist `allowedDomains` for `allow_by_rule`. Errors are warned but
+    // do not block the call the user just authorized.
+    if (
+      (response === 'allow_once' || response === 'allow_by_rule') &&
+      permissionOpts.approvedDomainHook !== undefined
+    ) {
+      const rawHost = tool.getDomain?.(toolUse.input)
+      if (typeof rawHost === 'string' && rawHost.length > 0) {
+        try {
+          await permissionOpts.approvedDomainHook({
+            toolName: toolUse.name,
+            input: toolUse.input,
+            host: rawHost,
+            response,
+          })
+        } catch (err) {
+          process.stderr.write(
+            `[ultron] warning: approvedDomainHook failed for ${toolUse.name}: ${err instanceof Error ? err.message : String(err)}\n`,
+          )
+        }
+      }
+    }
+
     // allow_once or allow_by_rule — fall through to authorized
     return { outcome: 'authorized', decision: payload }
   }
@@ -287,6 +314,15 @@ export async function executeToolUse(
       'validation_failed',
       err instanceof Error ? err.message : String(err),
     )
+  }
+
+  // Tool-call repetition guard. Catches loops the session-level detector
+  // (`SessionManager.recordStep`) misses — e.g., a YouTube auto-preview
+  // that keeps the screenshot pHash varying so the "all available signals
+  // stalled" fallback never fires, or any non-Computer-Use loop.
+  const repetition = checkToolRepetition(toolUse, callContext.messages)
+  if (repetition.tripped) {
+    return makeErrorResult('execution_error', repetition.reason)
   }
 
   try {

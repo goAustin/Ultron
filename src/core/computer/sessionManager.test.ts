@@ -1,9 +1,13 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { mkdtempSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 
 import {
   defaultComputerUseSettings,
   type ComputerUseSettings,
 } from '../../config/computerUseSettings.js'
+import { __setSettingsPathForTest } from '../../config/settingsConfig.js'
 
 import type { AriaTreeSnapshot, BoundingBox } from './ariaSnapshot.js'
 import type { AtomAction, AtomEntry, AtomLocator } from './atomResolver.js'
@@ -81,6 +85,7 @@ class FakeBrowserSession implements BrowserSession {
   currentAtomCache(): SessionAtomCache | null {
     return null
   }
+  refreshSettings(_next: ComputerUseSettings): void {}
 }
 
 function makeSettings(partial: Partial<ComputerUseSettings> = {}): ComputerUseSettings {
@@ -137,9 +142,13 @@ describe('SessionManager', () => {
     })
   })
 
-  it('rejects start with empty allowlist when requireAllowlist=true', async () => {
+  it('rejects start with empty allowlist when requireAllowlistAtStart=true (SDK strict mode)', async () => {
     const factory = makeFactory()
-    const settings = makeSettings({ allowedDomains: [] })
+    // Domain-prompt UX: the empty-allowlist hard-block is now opt-in via
+    // `computerUse.requireAllowlistAtStart`. CLI defaults to false (per-
+    // navigate prompts handle the gate); SDK callers that want pre-flight
+    // failure pass true.
+    const settings = makeSettings({ allowedDomains: [], requireAllowlistAtStart: true })
     const mgr = new SessionManager({ settings, factory })
     const ac = new AbortController()
     await expect(mgr.start({}, ac.signal)).rejects.toMatchObject({
@@ -147,9 +156,19 @@ describe('SessionManager', () => {
     })
   })
 
-  it('allows start with empty allowlist when requireAllowlist=false (test mode)', async () => {
+  it('allows start with empty allowlist when requireAllowlistAtStart=false (CLI default)', async () => {
     const factory = makeFactory()
     const settings = makeSettings({ allowedDomains: [] })
+    const mgr = new SessionManager({ settings, factory })
+    const ac = new AbortController()
+    const session = await mgr.start({}, ac.signal)
+    expect(session).toBeDefined()
+    await mgr.stop(session.id)
+  })
+
+  it('allows start with empty allowlist when requireAllowlist=false (test mode bypass)', async () => {
+    const factory = makeFactory()
+    const settings = makeSettings({ allowedDomains: [], requireAllowlistAtStart: true })
     const mgr = new SessionManager({ settings, factory })
     const ac = new AbortController()
     const session = await mgr.start({ requireAllowlist: false }, ac.signal)
@@ -560,5 +579,121 @@ describe('SessionManager', () => {
     await mgr.stop(session.id)
     const d = mgr.recordStep(session.id, { ariaHash: 'a', phash: 'b', verified: true })
     expect(d.abort).toBe(false)
+  })
+
+  // -------------------------------------------------------------------------
+  // Domain-prompt UX
+  // -------------------------------------------------------------------------
+
+  describe('domain-prompt UX', () => {
+    // Isolate writeSettingsConfig so persistAllowedDomain does not write to
+    // the user's actual ~/.ultron/settings.json during the test run.
+    let tmpDir: string
+    let tmpSettings: string
+    beforeEach(() => {
+      tmpDir = mkdtempSync(join(tmpdir(), 'ultron-sm-'))
+      tmpSettings = join(tmpDir, 'settings.json')
+      __setSettingsPathForTest(tmpSettings)
+    })
+    afterEach(() => {
+      __setSettingsPathForTest(null)
+      rmSync(tmpDir, { recursive: true, force: true })
+    })
+
+    it('allowDomainForSession adds to overlay; getSessionAllowedHosts returns it', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ allowedDomains: [] }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+      mgr.allowDomainForSession(session.id, 'example.com')
+      mgr.allowDomainForSession(session.id, 'OTHER.com') // case-insensitive store
+      const hosts = mgr.getSessionAllowedHosts(session.id)
+      expect(hosts.has('example.com')).toBe(true)
+      expect(hosts.has('other.com')).toBe(true)
+    })
+
+    it('allowDomainForSession is no-op for unknown / closed session', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({ settings: makeSettings(), factory })
+      const session = await mgr.start({}, new AbortController().signal)
+      await mgr.stop(session.id)
+      mgr.allowDomainForSession(session.id, 'example.com')
+      expect(mgr.getSessionAllowedHosts(session.id).size).toBe(0)
+    })
+
+    it('overlay clears when the session closes', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ allowedDomains: [] }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+      mgr.allowDomainForSession(session.id, 'example.com')
+      expect(mgr.getSessionAllowedHosts(session.id).size).toBe(1)
+      await mgr.stop(session.id)
+      expect(mgr.getSessionAllowedHosts(session.id).size).toBe(0)
+    })
+
+    it('persistAllowedDomain extends settings.allowedDomains and calls refreshSettings on every live session', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ allowedDomains: ['existing.com'] }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+      const fake = factory.sessions[0]!
+      const refreshes: ComputerUseSettings[] = []
+      const origRefresh = fake.refreshSettings.bind(fake)
+      fake.refreshSettings = (next): void => {
+        refreshes.push(next)
+        origRefresh(next)
+      }
+
+      await mgr.persistAllowedDomain('www.youtube.com')
+      const after = mgr.getSettings()
+      expect(after.allowedDomains).toEqual(
+        expect.arrayContaining(['existing.com', 'youtube.com', '*.youtube.com']),
+      )
+      // Atomic swap propagates to the session.
+      expect(refreshes.length).toBe(1)
+      expect(refreshes[0]?.allowedDomains).toEqual(after.allowedDomains)
+      await mgr.stop(session.id)
+    })
+
+    it('persistAllowedDomain is a no-op when patterns already exist', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ allowedDomains: ['youtube.com', '*.youtube.com'] }),
+        factory,
+      })
+      const session = await mgr.start({}, new AbortController().signal)
+      const fake = factory.sessions[0]!
+      let refreshCalls = 0
+      const origRefresh = fake.refreshSettings.bind(fake)
+      fake.refreshSettings = (next): void => {
+        refreshCalls++
+        origRefresh(next)
+      }
+
+      await mgr.persistAllowedDomain('youtube.com')
+      // Both derived patterns ('youtube.com' and '*.youtube.com') already
+      // present → no add → no refresh.
+      expect(refreshCalls).toBe(0)
+      await mgr.stop(session.id)
+    })
+
+    it('getSettings returns the live reference (post-persist)', async () => {
+      const factory = makeFactory()
+      const mgr = new SessionManager({
+        settings: makeSettings({ allowedDomains: [] }),
+        factory,
+      })
+      const before = mgr.getSettings().allowedDomains.length
+      await mgr.persistAllowedDomain('www.example.com')
+      const after = mgr.getSettings().allowedDomains.length
+      expect(after).toBeGreaterThan(before)
+    })
   })
 })

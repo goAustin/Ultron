@@ -19,7 +19,12 @@
  */
 
 import { buildTool } from '../core/tools/types.js'
-import { resolveSearchBackend, type SearchResult } from '../web/searchBackend.js'
+import {
+  RECENCY_VALUES,
+  resolveSearchBackend,
+  type Recency,
+  type SearchResult,
+} from '../web/searchBackend.js'
 
 const DESCRIPTION = [
   'Search the web. Returns up to `limit` ranked results, each with',
@@ -45,6 +50,12 @@ export const WebSearchTool = buildTool({
         type: 'number',
         description: 'Max number of results (1–20, default 10).',
       },
+      recency: {
+        type: 'string',
+        enum: ['day', 'week', 'month', 'year'],
+        description:
+          'Restrict results to a recent time window. Set this whenever the user asks for "latest", "newest", "recent", "current", or otherwise implies freshness. Default to "month" for "latest" / "recent"; narrow to "week" or "day" when the user is more specific.',
+      },
     },
     required: ['query'],
   },
@@ -67,6 +78,17 @@ export const WebSearchTool = buildTool({
         return { valid: false, message: `limit must be between 1 and ${MAX_LIMIT}` }
       }
     }
+    if (input.recency !== undefined) {
+      if (
+        typeof input.recency !== 'string' ||
+        !(RECENCY_VALUES as readonly string[]).includes(input.recency)
+      ) {
+        return {
+          valid: false,
+          message: `recency must be one of: ${RECENCY_VALUES.join(', ')}`,
+        }
+      }
+    }
     return { valid: true }
   },
 
@@ -77,6 +99,7 @@ export const WebSearchTool = buildTool({
   async call(input, context, signal) {
     const query = input.query as string
     const limit = (input.limit as number | undefined) ?? 10
+    const recency = input.recency as Recency | undefined
 
     const { backend, source } = resolveSearchBackend()
 
@@ -90,7 +113,11 @@ export const WebSearchTool = buildTool({
     })
 
     try {
-      const results = await backend.search(query, { signal, limit })
+      const results = await backend.search(query, {
+        signal,
+        limit,
+        ...(recency !== undefined && { recency }),
+      })
       return { content: formatResults(query, backend.id, results), isError: false }
     } catch (err) {
       if (signal.aborted) {

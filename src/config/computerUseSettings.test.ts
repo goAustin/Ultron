@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import {
   validateComputerUseSettings,
   defaultComputerUseSettings,
+  derivePersistencePatterns,
   type ComputerUseSettings,
 } from './computerUseSettings.js'
 
@@ -49,6 +50,8 @@ describe('validateComputerUseSettings', () => {
       redactionSelectors: ['.secret-input'],
       verifyActions: false,
       watchMode: true,
+      requireAllowlistAtStart: true,
+      cdpAssumeVisible: true,
     }
     const out = validateComputerUseSettings(valid)
     expect(out).toEqual(valid)
@@ -247,5 +250,135 @@ describe('validateComputerUseSettings', () => {
       expect(validateComputerUseSettings({ watchMode: 'on' }).watchMode).toBe(false)
       expect(stderrSpy).toHaveBeenCalled()
     })
+  })
+
+  describe('requireAllowlistAtStart (domain-prompt UX)', () => {
+    it('defaults to false', () => {
+      expect(validateComputerUseSettings({}).requireAllowlistAtStart).toBe(false)
+    })
+
+    it('accepts true / false', () => {
+      expect(
+        validateComputerUseSettings({ requireAllowlistAtStart: true }).requireAllowlistAtStart,
+      ).toBe(true)
+      expect(
+        validateComputerUseSettings({ requireAllowlistAtStart: false }).requireAllowlistAtStart,
+      ).toBe(false)
+    })
+
+    it('warns and defaults to false when non-boolean', () => {
+      expect(
+        validateComputerUseSettings({ requireAllowlistAtStart: 'yes' }).requireAllowlistAtStart,
+      ).toBe(false)
+      expect(stderrSpy).toHaveBeenCalled()
+    })
+  })
+
+  describe('cdpEndpoint (CDP backend)', () => {
+    it('defaults to undefined (omitted)', () => {
+      const out = validateComputerUseSettings({})
+      expect(out.cdpEndpoint).toBeUndefined()
+      expect(stderrSpy).not.toHaveBeenCalled()
+    })
+
+    it('accepts http://127.0.0.1:9222', () => {
+      const out = validateComputerUseSettings({ cdpEndpoint: 'http://127.0.0.1:9222' })
+      expect(out.cdpEndpoint).toBe('http://127.0.0.1:9222/')
+      expect(stderrSpy).not.toHaveBeenCalled()
+    })
+
+    it('accepts https:// and ws:// and wss://', () => {
+      expect(
+        validateComputerUseSettings({ cdpEndpoint: 'https://localhost:9222' }).cdpEndpoint,
+      ).toBe('https://localhost:9222/')
+      expect(
+        validateComputerUseSettings({ cdpEndpoint: 'ws://127.0.0.1:9222/devtools/browser/abc' })
+          .cdpEndpoint,
+      ).toBe('ws://127.0.0.1:9222/devtools/browser/abc')
+      expect(
+        validateComputerUseSettings({ cdpEndpoint: 'wss://example.com:9222' }).cdpEndpoint,
+      ).toBe('wss://example.com:9222/')
+      expect(stderrSpy).not.toHaveBeenCalled()
+    })
+
+    it('rejects non-string with a warn', () => {
+      const out = validateComputerUseSettings({ cdpEndpoint: 9222 })
+      expect(out.cdpEndpoint).toBeUndefined()
+      expect(stderrSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('rejects empty string with a warn', () => {
+      const out = validateComputerUseSettings({ cdpEndpoint: '' })
+      expect(out.cdpEndpoint).toBeUndefined()
+      expect(stderrSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('rejects malformed URL with a warn', () => {
+      const out = validateComputerUseSettings({ cdpEndpoint: 'not a url' })
+      expect(out.cdpEndpoint).toBeUndefined()
+      expect(stderrSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('rejects javascript: scheme with a warn', () => {
+      const out = validateComputerUseSettings({ cdpEndpoint: 'javascript:alert(1)' })
+      expect(out.cdpEndpoint).toBeUndefined()
+      expect(stderrSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('rejects file: scheme with a warn', () => {
+      const out = validateComputerUseSettings({ cdpEndpoint: 'file:///tmp/x' })
+      expect(out.cdpEndpoint).toBeUndefined()
+      expect(stderrSpy).toHaveBeenCalledTimes(1)
+    })
+  })
+})
+
+describe('derivePersistencePatterns', () => {
+  it('strips leading www. and returns [apex, *.apex]', () => {
+    expect(derivePersistencePatterns('www.youtube.com')).toEqual([
+      'youtube.com',
+      '*.youtube.com',
+    ])
+  })
+
+  it('returns [apex, *.apex] when no www. prefix', () => {
+    expect(derivePersistencePatterns('youtube.com')).toEqual(['youtube.com', '*.youtube.com'])
+  })
+
+  it('does NOT strip non-www subdomains (narrower scope is intentional)', () => {
+    expect(derivePersistencePatterns('studio.youtube.com')).toEqual([
+      'studio.youtube.com',
+      '*.studio.youtube.com',
+    ])
+  })
+
+  it('lowercases the input', () => {
+    expect(derivePersistencePatterns('WWW.YouTube.com')).toEqual([
+      'youtube.com',
+      '*.youtube.com',
+    ])
+  })
+
+  it('returns [apex, *.apex] for eTLD hosts (over-broad; documented limitation)', () => {
+    // No PSL — github.io is treated as a regular domain, producing a wildcard
+    // that matches all of GitHub Pages. Documented in the design doc.
+    expect(derivePersistencePatterns('github.io')).toEqual(['github.io', '*.github.io'])
+  })
+
+  it('returns [] for empty input', () => {
+    expect(derivePersistencePatterns('')).toEqual([])
+  })
+
+  it('returns [] for whitespace input (fails isValidDomainPattern)', () => {
+    expect(derivePersistencePatterns(' ')).toEqual([])
+  })
+
+  it('drops the apex when single-label (apex fails isValidDomainPattern; wildcard form passes)', () => {
+    // 'localhost' has only one label → fails the pattern check; '*.localhost'
+    // has two labels → passes. Output is just the wildcard. This is a
+    // degenerate edge — `localhost` itself never appears in production
+    // settings — but we lock in the current shape so a future helper change
+    // is intentional.
+    expect(derivePersistencePatterns('localhost')).toEqual(['*.localhost'])
   })
 })

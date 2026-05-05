@@ -58,6 +58,9 @@ export function createTavilyBackend(apiKey: string): SearchBackend {
           query,
           max_results: limit,
           search_depth: 'basic',
+          // Tavily's `time_range` accepts the same `day|week|month|year`
+          // values we expose on the tool, so we pass it through verbatim.
+          ...(opts.recency !== undefined && { time_range: opts.recency }),
         },
       })
 

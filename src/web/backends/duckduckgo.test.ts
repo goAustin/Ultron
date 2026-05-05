@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest'
-import { parseDuckDuckGoHtml, unwrapDDGRedirect } from './duckduckgo.js'
+import {
+  afterDateForRecency,
+  parseDuckDuckGoHtml,
+  unwrapDDGRedirect,
+} from './duckduckgo.js'
 
 describe('unwrapDDGRedirect', () => {
   it('extracts the real URL from a /l/?uddg= wrapper', () => {
@@ -112,5 +116,31 @@ describe('parseDuckDuckGoHtml', () => {
 
   it('returns empty array on input with no results', () => {
     expect(parseDuckDuckGoHtml('<html><body>no results</body></html>', 10)).toEqual([])
+  })
+})
+
+describe('afterDateForRecency', () => {
+  // Fixed clock at 2026-05-04 noon UTC so the rolling-window math is
+  // deterministic regardless of the developer's wall clock.
+  const NOON_2026_05_04 = Date.UTC(2026, 4, 4, 12, 0, 0)
+
+  it('day → yesterday', () => {
+    expect(afterDateForRecency('day', NOON_2026_05_04)).toBe('2026-05-03')
+  })
+
+  it('week → seven days ago', () => {
+    expect(afterDateForRecency('week', NOON_2026_05_04)).toBe('2026-04-27')
+  })
+
+  it('month → thirty days ago', () => {
+    expect(afterDateForRecency('month', NOON_2026_05_04)).toBe('2026-04-04')
+  })
+
+  it('year → 365 days ago', () => {
+    expect(afterDateForRecency('year', NOON_2026_05_04)).toBe('2025-05-04')
+  })
+
+  it('returns ISO YYYY-MM-DD format (no time component)', () => {
+    expect(afterDateForRecency('week', NOON_2026_05_04)).toMatch(/^\d{4}-\d{2}-\d{2}$/)
   })
 })

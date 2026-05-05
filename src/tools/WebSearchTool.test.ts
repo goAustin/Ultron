@@ -64,6 +64,22 @@ describe('WebSearchTool.validateInput', () => {
     expect((await WebSearchTool.validateInput({ query: 'x', limit: 1 }, ctx)).valid).toBe(true)
     expect((await WebSearchTool.validateInput({ query: 'x', limit: 20 }, ctx)).valid).toBe(true)
   })
+
+  it.each(['day', 'week', 'month', 'year'])('accepts recency=%s', async (recency) => {
+    const r = await WebSearchTool.validateInput({ query: 'x', recency }, ctx)
+    expect(r.valid).toBe(true)
+  })
+
+  it('rejects unknown recency value', async () => {
+    const r = await WebSearchTool.validateInput({ query: 'x', recency: 'forever' }, ctx)
+    expect(r.valid).toBe(false)
+    if (!r.valid) expect(r.message).toContain('day')
+  })
+
+  it('rejects non-string recency', async () => {
+    const r = await WebSearchTool.validateInput({ query: 'x', recency: 7 }, ctx)
+    expect(r.valid).toBe(false)
+  })
 })
 
 describe('WebSearchTool.checkPermissions', () => {
@@ -164,6 +180,48 @@ describe('WebSearchTool.call', () => {
     expect(r.isError).toBe(true)
     expect(r.errorKind).toBe('execution_error')
     expect(r.content).toContain('network unreachable')
+  })
+
+  it('threads recency through to backend.search when set', async () => {
+    let received: { recency?: string } = {}
+    vi.spyOn(resolverMod, 'resolveSearchBackend').mockReturnValue({
+      backend: {
+        id: 'tavily',
+        async search(_q, opts) {
+          received = { recency: opts.recency }
+          return []
+        },
+      },
+      source: 'env',
+    })
+
+    const ctx = makeContext()
+    const ac = new AbortController()
+    await WebSearchTool.call(
+      { query: 'jensen huang interview', recency: 'month' },
+      ctx,
+      ac.signal,
+    )
+    expect(received.recency).toBe('month')
+  })
+
+  it('omits recency on backend.search when unset (default search behavior preserved)', async () => {
+    let received: { recency?: string } = { recency: 'sentinel' }
+    vi.spyOn(resolverMod, 'resolveSearchBackend').mockReturnValue({
+      backend: {
+        id: 'tavily',
+        async search(_q, opts) {
+          received = { recency: opts.recency }
+          return []
+        },
+      },
+      source: 'env',
+    })
+
+    const ctx = makeContext()
+    const ac = new AbortController()
+    await WebSearchTool.call({ query: 'static docs' }, ctx, ac.signal)
+    expect(received.recency).toBeUndefined()
   })
 
   it('returns aborted when the signal aborts during the backend call', async () => {

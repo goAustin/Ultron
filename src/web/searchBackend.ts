@@ -38,9 +38,20 @@ export type SearchResult = {
 export type SearchBackendId = 'duckduckgo' | 'brave' | 'tavily'
 export type SearchBackendSource = 'env' | 'settings' | 'default'
 
+/**
+ * Recency window for time-sensitive queries. Backends translate this to
+ * their native parameter (Tavily `time_range`, Brave `freshness`); the
+ * DuckDuckGo HTML endpoint has no native filter so we approximate with a
+ * Google-style `after:YYYY-MM-DD` query operator.
+ */
+export type Recency = 'day' | 'week' | 'month' | 'year'
+
+export const RECENCY_VALUES: readonly Recency[] = ['day', 'week', 'month', 'year']
+
 export type SearchOptions = {
   readonly signal: AbortSignal
   readonly limit?: number
+  readonly recency?: Recency
 }
 
 export type SearchBackend = {

@@ -18,10 +18,36 @@
  */
 
 import { fetchWeb, WebFetchTimeoutError } from '../fetcher.js'
-import type { SearchBackend, SearchOptions, SearchResult } from '../searchBackend.js'
+import type {
+  Recency,
+  SearchBackend,
+  SearchOptions,
+  SearchResult,
+} from '../searchBackend.js'
 
 const DDG_HTML_HOST = 'html.duckduckgo.com'
 const DDG_REDIRECT_HOST = 'duckduckgo.com'
+
+// DDG's HTML endpoint has no native recency parameter, but it honors a
+// Google-style `after:YYYY-MM-DD` query operator. The mapping below uses
+// rolling-window day counts so the cutoff date is recomputed each call
+// against `Date.now()`.
+const RECENCY_DAYS: Record<Recency, number> = {
+  day: 1,
+  week: 7,
+  month: 30,
+  year: 365,
+}
+
+/**
+ * Format the cutoff date for DDG's `after:` operator. Exported for tests
+ * so the date math can be driven by an injected `now` instead of the
+ * wall clock.
+ */
+export function afterDateForRecency(recency: Recency, now: number): string {
+  const ms = now - RECENCY_DAYS[recency] * 24 * 60 * 60 * 1000
+  return new Date(ms).toISOString().slice(0, 10)
+}
 
 export class DuckDuckGoBackendError extends Error {
   constructor(message: string) {
@@ -44,7 +70,11 @@ export function createDuckDuckGoBackend(): SearchBackend {
   return {
     id: 'duckduckgo',
     async search(query: string, opts: SearchOptions): Promise<SearchResult[]> {
-      const url = `https://${DDG_HTML_HOST}/html/?q=${encodeURIComponent(query)}&kl=us-en`
+      const effectiveQuery =
+        opts.recency !== undefined
+          ? `${query} after:${afterDateForRecency(opts.recency, Date.now())}`
+          : query
+      const url = `https://${DDG_HTML_HOST}/html/?q=${encodeURIComponent(effectiveQuery)}&kl=us-en`
       let body: string
       try {
         const result = await fetchWeb(url, {

@@ -56,7 +56,7 @@ export type DomainCheck =
 export function isDomainAllowed(
   url: string,
   settings: { allowedDomains: readonly string[]; deniedDomains: readonly string[] },
-  opts: { requireAllowlist: boolean },
+  opts: { requireAllowlist: boolean; sessionAllowedHosts?: ReadonlySet<string> },
 ): DomainCheck {
   const host = extractHost(url)
   if (host === null) {
@@ -68,9 +68,13 @@ export function isDomainAllowed(
     }
   }
   if (opts.requireAllowlist) {
-    if (settings.allowedDomains.length === 0) {
-      // Caller should have rejected earlier with allowlist_empty.
-      // Treat as not_in_allowlist defensively.
+    // Session overlay (populated by `allow_once` approvals) is checked
+    // alongside the persistent allowlist. Overlay entries are exact-host
+    // strings, so a direct Set lookup is enough — no pattern matching needed.
+    if (opts.sessionAllowedHosts?.has(host)) {
+      return { allowed: true }
+    }
+    if (settings.allowedDomains.length === 0 && (opts.sessionAllowedHosts?.size ?? 0) === 0) {
       return { allowed: false, reason: 'not_in_allowlist' }
     }
     for (const pattern of settings.allowedDomains) {
@@ -125,6 +129,8 @@ export type RiskCategory =
   | 'sensitive_input'    // level 2: password, MFA, payment, PII
   | 'irreversible'       // level 3: Submit / Delete / Send / Pay / Confirm / etc.
   | 'prohibited'         // level 4: explicitly banned (CAPTCHA evasion, etc.)
+  | 'known_domain'       // level 0: ComputerNavigate to a host already in the effective allowlist
+  | 'unknown_domain'     // level 2: ComputerNavigate to a host not yet approved (prompt)
 
 export type RiskAssessment = {
   readonly level: RiskLevel
@@ -159,6 +165,20 @@ export type ClassifyContext = {
    * out at execute time with `'atom_resolution_failed'`.
    */
   readonly targetNode?: AriaNode | null
+  /**
+   * Domain-prompt UX — live persistent allowlist, used by `ComputerNavigate`
+   * to classify the URL host. Optional: when undefined, the navigate
+   * classifier falls back to its old level-1 defer behavior so this remains
+   * a non-breaking widening for callers that don't supply domain context.
+   */
+  readonly allowedDomains?: readonly string[]
+  /** Domain-prompt UX — live persistent denylist. Same fallback semantics. */
+  readonly deniedDomains?: readonly string[]
+  /**
+   * Domain-prompt UX — per-session overlay populated by `allow_once` approvals.
+   * Merged with `allowedDomains` for the navigate-host check.
+   */
+  readonly sessionAllowedHosts?: ReadonlySet<string>
 }
 
 // Dangerous-label regex. Matches at the START of an accessible name so the
@@ -215,13 +235,20 @@ export function classifyAction(ctx: ClassifyContext): RiskAssessment {
     }
   }
 
-  // ComputerNavigate: level depends on whether the URL host is already in
-  // the session's allowlist (Phase 2's domain check is the load-bearing
-  // gate; Phase 4 only adds a soft "ask the user about a brand-new host"
-  // signal). For now we classify all navigates as level 1 — the domain
-  // allowlist is enforced at the BrowserSession layer.
+  // ComputerNavigate: domain-aware classification. When the safety check
+  // populates `allowedDomains` / `deniedDomains` / `sessionAllowedHosts` (the
+  // production path via `computerSafetyChecks.ts`), we return one of three
+  // results:
+  //   - host in deniedDomains       → level 4 (cascade returns 'deny')
+  //   - host in effective allowlist → level 0 'known_domain' (cascade short-
+  //     circuits to 'allow', no prompt)
+  //   - host unknown                → level 2 'unknown_domain' (cascade
+  //     returns 'ask' — user sees the Allow once / Allow by rule prompt)
+  // When domain context is missing (older callers, tests that don't supply
+  // settings), fall back to the legacy level-1 defer so the BrowserSession
+  // layer remains the only gate.
   if (toolName === 'ComputerNavigate') {
-    return { level: 1, category: 'reversible_ui', reason: 'navigation to allowed host' }
+    return classifyNavigate(ctx)
   }
 
   // Tools that are level 1 by construction.
@@ -310,6 +337,57 @@ function classifyActAtom(
   // label regex was built for. `classifyTarget` reuses `isSensitiveNode`
   // (catches sensitive-element clicks) and the dangerous-label regex.
   return classifyTarget(target, 'actAtom click')
+}
+
+function classifyNavigate(ctx: ClassifyContext): RiskAssessment {
+  // Old behavior preserved when callers don't supply domain context (legacy
+  // tests, hand-built ClassifyContexts). The BrowserSession layer remains
+  // the gate in that fallback.
+  if (ctx.allowedDomains === undefined && ctx.deniedDomains === undefined) {
+    return { level: 1, category: 'reversible_ui', reason: 'navigation (no domain context)' }
+  }
+  const url = typeof ctx.input.url === 'string' ? ctx.input.url : ''
+  const host = extractHost(url)
+  if (host === null) {
+    return { level: 1, category: 'reversible_ui', reason: 'navigation: unparseable URL' }
+  }
+  const denied = ctx.deniedDomains ?? []
+  for (const pattern of denied) {
+    if (matchDomain(pattern, host)) {
+      return {
+        level: 4,
+        category: 'prohibited',
+        reason: `ComputerNavigate to ${host} — host matches computerUse.deniedDomains pattern ${pattern}`,
+        evidence: { nearbyText: host },
+      }
+    }
+  }
+  // Effective allowlist = persistent ∪ per-session overlay. Overlay entries
+  // are exact-host strings populated by `allow_once`; persistent entries
+  // accept the `*.host` wildcard syntax via matchDomain.
+  if (ctx.sessionAllowedHosts?.has(host)) {
+    return {
+      level: 0,
+      category: 'known_domain',
+      reason: `ComputerNavigate to ${host} — approved earlier this session`,
+    }
+  }
+  const allowed = ctx.allowedDomains ?? []
+  for (const pattern of allowed) {
+    if (matchDomain(pattern, host)) {
+      return {
+        level: 0,
+        category: 'known_domain',
+        reason: `ComputerNavigate to ${host} — host matches computerUse.allowedDomains pattern ${pattern}`,
+      }
+    }
+  }
+  return {
+    level: 2,
+    category: 'unknown_domain',
+    reason: `ComputerNavigate to ${host} — host not in computerUse.allowedDomains`,
+    evidence: { nearbyText: host },
+  }
 }
 
 function classifyType(

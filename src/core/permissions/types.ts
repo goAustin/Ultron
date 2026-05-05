@@ -130,6 +130,23 @@ export type PermissionOptions = {
    * instead of `skillScope`.
    */
   scopeSource?: 'skill' | 'agent'
+  /**
+   * Domain-prompt UX — invoked after `askUser` resolves to `allow_once` or
+   * `allow_by_rule` for a tool whose `getDomain` returns a usable host. Lets
+   * the QueryEngine wire Computer-Use approvals to the SessionManager
+   * (overlay + persistence) without dragging the manager type into the
+   * cascade. The callback inspects `toolName` to decide what to do (e.g.
+   * no-op for non-Computer tools).
+   *
+   * Errors are swallowed in `authorizeToolUse` (warned to stderr) — a
+   * failed persist must not block the tool call the user just authorized.
+   */
+  approvedDomainHook?: (params: {
+    readonly toolName: string
+    readonly input: Record<string, unknown>
+    readonly host: string
+    readonly response: 'allow_once' | 'allow_by_rule'
+  }) => Promise<void> | void
 }
 
 export const DEFAULT_PERMISSION_OPTIONS: PermissionOptions = {

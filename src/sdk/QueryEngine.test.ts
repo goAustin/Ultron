@@ -4,6 +4,10 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { __setSettingsPathForTest, writeSettingsConfig } from '../config/settingsConfig.js'
+import {
+  defaultComputerUseSettings,
+  type ComputerUseSettings,
+} from '../config/computerUseSettings.js'
 import { QueryEngine } from './QueryEngine.js'
 import type { QueryEngineConfig } from './QueryEngine.js'
 import type { QueryEvent } from '../core/queryEvents.js'
@@ -1195,7 +1199,12 @@ describe('QueryEngine', () => {
 
     it('does NOT register Computer tools by default (computerUse.enabled = false)', async () => {
       await withTmpDir(async (cwd) => {
-        const engine = new QueryEngine(makeConfig(cwd))
+        // Explicit override so the test ignores any user-machine
+        // settings.json that has Computer-Use enabled — we're asserting the
+        // *default-disabled* contract, not the resolved-from-disk value.
+        const engine = new QueryEngine(
+          makeConfig(cwd, { computerUseSettings: defaultComputerUseSettings }),
+        )
         const reg = engine.getRegistry()
         for (const name of COMPUTER_TOOL_NAMES) {
           expect(reg.has(name)).toBe(false)
@@ -1227,6 +1236,8 @@ describe('QueryEngine', () => {
               redactionSelectors: [],
               verifyActions: true,
               watchMode: false,
+              requireAllowlistAtStart: false,
+              cdpAssumeVisible: false,
             },
             sessionManager: makeFakeSessionManager(),
           }),
@@ -1263,6 +1274,8 @@ describe('QueryEngine', () => {
               redactionSelectors: [],
               verifyActions: true,
               watchMode: false,
+              requireAllowlistAtStart: false,
+              cdpAssumeVisible: false,
             },
             sessionManager: fake,
           }),
@@ -1283,7 +1296,9 @@ describe('QueryEngine', () => {
       // contract: with disabled settings, _sessionManager stays null, so the
       // factory closure that would do the dynamic import is never created.
       await withTmpDir(async (cwd) => {
-        const engine = new QueryEngine(makeConfig(cwd))
+        const engine = new QueryEngine(
+          makeConfig(cwd, { computerUseSettings: defaultComputerUseSettings }),
+        )
         const priv = engine as unknown as { _sessionManager: unknown }
         expect(priv._sessionManager).toBeNull()
       })
@@ -1312,6 +1327,8 @@ describe('QueryEngine', () => {
         redactionSelectors: [],
         verifyActions: true,
         watchMode: false,
+        requireAllowlistAtStart: false,
+        cdpAssumeVisible: false,
       }
     }
 
@@ -1480,6 +1497,11 @@ function makeFakeSessionManager(): {
   // return null / no-op.
   getSessionMetrics: () => null
   recordScreenshot: () => void
+  // Domain-prompt UX — QE tests don't exercise these directly; minimal stubs.
+  getSettings: () => ComputerUseSettings
+  getSessionAllowedHosts: () => ReadonlySet<string>
+  allowDomainForSession: () => void
+  persistAllowedDomain: () => Promise<void>
   stopAllCalls: number
 } {
   const fake = {
@@ -1502,6 +1524,14 @@ function makeFakeSessionManager(): {
       return null
     },
     recordScreenshot(): void {},
+    getSettings(): ComputerUseSettings {
+      return defaultComputerUseSettings
+    },
+    getSessionAllowedHosts(): ReadonlySet<string> {
+      return new Set()
+    },
+    allowDomainForSession(): void {},
+    async persistAllowedDomain(): Promise<void> {},
   }
   return fake
 }

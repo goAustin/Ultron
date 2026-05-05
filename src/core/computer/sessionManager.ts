@@ -18,7 +18,11 @@
 
 import { randomUUID } from 'node:crypto'
 
-import type { ComputerUseSettings } from '../../config/computerUseSettings.js'
+import {
+  derivePersistencePatterns,
+  type ComputerUseSettings,
+} from '../../config/computerUseSettings.js'
+import { writeSettingsConfig } from '../../config/settingsConfig.js'
 
 import {
   BrowserSessionError,
@@ -85,6 +89,16 @@ export type BrowserSessionFactory = (params: {
   readonly options: StartSessionOptions
   readonly requestClose: (reason: 'aborted' | 'timeout' | 'error') => Promise<void>
   readonly recordScreenshot: (bytes: number) => void
+  /**
+   * Domain-prompt UX — closure that returns the live per-session allow
+   * overlay (populated by `allow_once` approvals). The BrowserSession reads
+   * it on every domain check; the closure semantics let the BrowserSession
+   * see overlay changes without needing a back-pointer to the SessionManager.
+   * Optional in the type so direct-construct test paths can omit it; the
+   * SessionManager always supplies it. When omitted the BrowserSession
+   * falls back to an always-empty overlay.
+   */
+  readonly getSessionAllowedHosts?: () => ReadonlySet<string>
 }) => Promise<BrowserSession>
 
 /**
@@ -115,13 +129,20 @@ type SessionEntry = {
 }
 
 export class SessionManager implements ComputerSessionManager {
-  private readonly _settings: ComputerUseSettings
+  // Domain-prompt UX — `_settings` is mutable so `persistAllowedDomain` can
+  // swap in an extended `allowedDomains`. The reference is replaced
+  // atomically; live sessions are notified via `BrowserSession.refreshSettings`.
+  private _settings: ComputerUseSettings
   private readonly _factory: BrowserSessionFactory
   private readonly _sessions = new Map<ComputerSessionId, SessionEntry>()
   // v3 Phase 6 — frozen post-close metrics, snapshotted by `closeOnce` BEFORE
   // the entry is deleted from `_sessions`. Lookup falls through to this map
   // so callers (tests, audit) can read metrics for closed sessions.
   private readonly _metrics = new Map<ComputerSessionId, SessionMetrics>()
+  // Domain-prompt UX — per-session allow overlay populated by `allow_once`
+  // approvals. Cleared in `closeOnce`; merged with `_settings.allowedDomains`
+  // at the navigate / route-interceptor layer.
+  private readonly _sessionAllowedHosts = new Map<ComputerSessionId, Set<string>>()
 
   constructor(deps: {
     readonly settings: ComputerUseSettings
@@ -156,10 +177,17 @@ export class SessionManager implements ComputerSessionManager {
       )
     }
     const requireAllowlist = opts.requireAllowlist ?? true
-    if (requireAllowlist && settings.allowedDomains.length === 0) {
+    // Domain-prompt UX — empty allowlist at start is now permitted by default
+    // (the per-navigate prompt handles the gate). SDK callers that want the
+    // old fail-fast behavior set `computerUse.requireAllowlistAtStart: true`.
+    if (
+      settings.requireAllowlistAtStart &&
+      requireAllowlist &&
+      settings.allowedDomains.length === 0
+    ) {
       throw new BrowserSessionError(
         'allowlist_empty',
-        'allowedDomains must be non-empty for non-test sessions; configure computerUse.allowedDomains',
+        'allowedDomains must be non-empty when computerUse.requireAllowlistAtStart is true; configure computerUse.allowedDomains',
       )
     }
     if (signal.aborted) {
@@ -201,6 +229,7 @@ export class SessionManager implements ComputerSessionManager {
         options: opts,
         requestClose: (reason) => this.requestClose(id, reason),
         recordScreenshot: (bytes) => this.recordScreenshot(id, bytes),
+        getSessionAllowedHosts: () => this.getSessionAllowedHosts(id),
       })
     } catch (err) {
       // Nothing to register; propagate.
@@ -427,6 +456,68 @@ export class SessionManager implements ComputerSessionManager {
       await entry.session.close()
     } finally {
       this._sessions.delete(id)
+      // Domain-prompt UX — overlay lifetime is tied to the session; drop it
+      // here so a fresh session never inherits a prior session's approvals.
+      this._sessionAllowedHosts.delete(id)
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Domain-prompt UX — settings + per-session overlay accessors / mutators.
+  // ---------------------------------------------------------------------------
+
+  getSettings(): ComputerUseSettings {
+    return this._settings
+  }
+
+  getSessionAllowedHosts(id: ComputerSessionId): ReadonlySet<string> {
+    return this._sessionAllowedHosts.get(id) ?? EMPTY_HOST_SET
+  }
+
+  allowDomainForSession(id: ComputerSessionId, host: string): void {
+    if (typeof host !== 'string' || host.length === 0) return
+    const entry = this._sessions.get(id)
+    if (!entry || entry.closed) return
+    const lowered = host.toLowerCase()
+    let set = this._sessionAllowedHosts.get(id)
+    if (set === undefined) {
+      set = new Set<string>()
+      this._sessionAllowedHosts.set(id, set)
+    }
+    set.add(lowered)
+  }
+
+  async persistAllowedDomain(host: string): Promise<void> {
+    const patterns = derivePersistencePatterns(host)
+    if (patterns.length === 0) return
+    const existing = new Set(this._settings.allowedDomains)
+    let added = false
+    for (const p of patterns) {
+      if (!existing.has(p)) {
+        existing.add(p)
+        added = true
+      }
+    }
+    if (!added) return
+    const nextAllowed: readonly string[] = [...existing]
+    const next: ComputerUseSettings = {
+      ...this._settings,
+      allowedDomains: nextAllowed,
+    }
+    this._settings = next
+    // Notify every live session so the route interceptor and navigate
+    // pre-flight pick up the new list on their next read. Closed sessions
+    // are skipped — they will not navigate again.
+    for (const entry of this._sessions.values()) {
+      if (!entry.closed) {
+        entry.session.refreshSettings(next)
+      }
+    }
+    // Atomic write to ~/.ultron/settings.json. `writeSettingsConfig` swallows
+    // I/O errors and warns to stderr, so a transient disk failure degrades
+    // to "session has it, restart loses it" rather than throwing.
+    writeSettingsConfig({ computerUse: { allowedDomains: nextAllowed as string[] } })
+  }
 }
+
+const EMPTY_HOST_SET: ReadonlySet<string> = new Set<string>()

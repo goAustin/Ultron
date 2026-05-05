@@ -254,6 +254,11 @@ class FakeBrowserSession implements BrowserSession {
   currentAtomCache(): SessionAtomCache | null {
     return this._atomCache
   }
+  // Domain-prompt UX — record-only stub. Tests inspect via `lastRefreshedSettings`.
+  lastRefreshedSettings: ComputerUseSettings | null = null
+  refreshSettings(next: ComputerUseSettings): void {
+    this.lastRefreshedSettings = next
+  }
 }
 
 class FakeSessionManager implements ComputerSessionManager {
@@ -333,6 +338,30 @@ class FakeSessionManager implements ComputerSessionManager {
       durationMs: null,
       closeReason: null,
     }
+  }
+
+  // Domain-prompt UX — minimal stubs sufficient for the existing tool tests.
+  // The new behavior (overlay + persistence) has its own unit tests in
+  // sessionManager.test.ts and computerSafetyChecks.test.ts.
+  settings: ComputerUseSettings = defaultComputerUseSettings
+  getSettings(): ComputerUseSettings { return this.settings }
+  readonly _overlay = new Map<ComputerSessionId, Set<string>>()
+  getSessionAllowedHosts(id: ComputerSessionId): ReadonlySet<string> {
+    return this._overlay.get(id) ?? new Set()
+  }
+  allowDomainForSessionCalls: { id: ComputerSessionId; host: string }[] = []
+  allowDomainForSession(id: ComputerSessionId, host: string): void {
+    this.allowDomainForSessionCalls.push({ id, host })
+    let s = this._overlay.get(id)
+    if (s === undefined) {
+      s = new Set()
+      this._overlay.set(id, s)
+    }
+    s.add(host.toLowerCase())
+  }
+  persistAllowedDomainCalls: string[] = []
+  async persistAllowedDomain(host: string): Promise<void> {
+    this.persistAllowedDomainCalls.push(host)
   }
 }
 
@@ -519,14 +548,14 @@ describe('mapBrowserSessionError', () => {
 // ---------------------------------------------------------------------------
 
 describe('ComputerStart', () => {
-  it('start with default options returns a sessionId and forwards headless=true', async () => {
+  it('start with default options returns a sessionId and forwards headless=false (visible)', async () => {
     const manager = new FakeSessionManager()
     const tools = createComputerUseTools({ sessionManager: manager, settings: makeSettings() })
     const ctx = makeContext()
     const r = await tools.start.call({}, ctx, ctx.abortController.signal)
     expect(r.isError).toBe(false)
     expect(r.content).toMatch(/^sessionId: sess-/)
-    expect(manager.startCalls).toEqual([{ headless: true }])
+    expect(manager.startCalls).toEqual([{ headless: false }])
   })
 
   it('rejects non-boolean headless via validateInput', async () => {
@@ -544,6 +573,145 @@ describe('ComputerStart', () => {
     })
     expect(tools.start.inputSchema.properties).toBeDefined()
     expect(tools.start.inputSchema.properties?.allowedDomainsOverride).toBeUndefined()
+  })
+
+  // -------------------------------------------------------------------------
+  // CDP backend
+  // -------------------------------------------------------------------------
+  describe('backend: cdp', () => {
+    it('rejects backend: "cdp" via validateInput when cdpEndpoint is unset', async () => {
+      const tools = createComputerUseTools({
+        sessionManager: new FakeSessionManager(),
+        settings: makeSettings(), // cdpEndpoint omitted
+      })
+      const ctx = makeContext()
+      const v = await tools.start.validateInput({ backend: 'cdp' }, ctx)
+      expect(v.valid).toBe(false)
+      expect(v.valid === false && v.message).toMatch(/cdpEndpoint/i)
+    })
+
+    it('rejects backend: "cdp" + headless: true via validateInput', async () => {
+      const tools = createComputerUseTools({
+        sessionManager: new FakeSessionManager(),
+        settings: makeSettings({ cdpEndpoint: 'http://127.0.0.1:9222' }),
+      })
+      const ctx = makeContext()
+      const v = await tools.start.validateInput({ backend: 'cdp', headless: true }, ctx)
+      expect(v.valid).toBe(false)
+      expect(v.valid === false && v.message).toMatch(/headless/i)
+    })
+
+    it('rejects { headless: true } when CDP is the DEFAULTED backend (no explicit input.backend)', async () => {
+      // Without computing the effective backend in validateInput, this case
+      // would silently flip to CDP and the factory would drop headless: true
+      // without error. The model's intent ("invisible session") would be lost.
+      const tools = createComputerUseTools({
+        sessionManager: new FakeSessionManager(),
+        settings: makeSettings({ cdpEndpoint: 'http://127.0.0.1:9222' }),
+      })
+      const ctx = makeContext()
+      const v = await tools.start.validateInput({ headless: true }, ctx)
+      expect(v.valid).toBe(false)
+      expect(v.valid === false && v.message).toMatch(/CDP/i)
+    })
+
+    it('accepts { headless: true } + explicit backend: "launch" even when settings.cdpEndpoint is set', async () => {
+      // Escape hatch: a model that explicitly wants the bundled-Chromium
+      // headless path can pass backend: "launch" to bypass the CDP default.
+      const tools = createComputerUseTools({
+        sessionManager: new FakeSessionManager(),
+        settings: makeSettings({ cdpEndpoint: 'http://127.0.0.1:9222' }),
+      })
+      const ctx = makeContext()
+      const v = await tools.start.validateInput(
+        { headless: true, backend: 'launch' },
+        ctx,
+      )
+      expect(v.valid).toBe(true)
+    })
+
+    it('rejects unknown backend strings via validateInput', async () => {
+      const tools = createComputerUseTools({
+        sessionManager: new FakeSessionManager(),
+        settings: makeSettings(),
+      })
+      const ctx = makeContext()
+      const v = await tools.start.validateInput({ backend: 'managed' }, ctx)
+      expect(v.valid).toBe(false)
+    })
+
+    it('threads backend + cdpEndpoint into StartSessionOptions when input.backend = "cdp"', async () => {
+      const manager = new FakeSessionManager()
+      const tools = createComputerUseTools({
+        sessionManager: manager,
+        settings: makeSettings({ cdpEndpoint: 'http://127.0.0.1:9222' }),
+      })
+      const ctx = makeContext()
+      const r = await tools.start.call({ backend: 'cdp' }, ctx, ctx.abortController.signal)
+      expect(r.isError).toBe(false)
+      expect(manager.startCalls[0]).toEqual({
+        headless: false,
+        backend: 'cdp',
+        cdpEndpoint: 'http://127.0.0.1:9222',
+      })
+    })
+
+    it('defaults to backend: "cdp" when settings.cdpEndpoint is set', async () => {
+      const manager = new FakeSessionManager()
+      const tools = createComputerUseTools({
+        sessionManager: manager,
+        settings: makeSettings({ cdpEndpoint: 'http://127.0.0.1:9222' }),
+      })
+      const ctx = makeContext()
+      await tools.start.call({}, ctx, ctx.abortController.signal)
+      expect(manager.startCalls[0]).toEqual({
+        headless: false,
+        backend: 'cdp',
+        cdpEndpoint: 'http://127.0.0.1:9222',
+      })
+    })
+
+    it('defaults to backend: "launch" when settings.cdpEndpoint is unset (no backend in options)', async () => {
+      const manager = new FakeSessionManager()
+      const tools = createComputerUseTools({
+        sessionManager: manager,
+        settings: makeSettings(),
+      })
+      const ctx = makeContext()
+      await tools.start.call({}, ctx, ctx.abortController.signal)
+      // backend omitted from StartSessionOptions when not 'cdp' — the factory
+      // selector triggers on === 'cdp' so missing/launch are equivalent.
+      expect(manager.startCalls[0]).toEqual({ headless: false })
+    })
+
+    it('explicit backend: "launch" overrides settings.cdpEndpoint default', async () => {
+      const manager = new FakeSessionManager()
+      const tools = createComputerUseTools({
+        sessionManager: manager,
+        settings: makeSettings({ cdpEndpoint: 'http://127.0.0.1:9222' }),
+      })
+      const ctx = makeContext()
+      await tools.start.call({ backend: 'launch' }, ctx, ctx.abortController.signal)
+      expect(manager.startCalls[0]).toEqual({ headless: false })
+    })
+
+    it('maps cdp_connect_failed to execution_error', async () => {
+      const manager = new FakeSessionManager()
+      manager.startImpl = async () => {
+        throw new BrowserSessionError(
+          'cdp_connect_failed',
+          'connectOverCDP(http://127.0.0.1:9222) failed: ECONNREFUSED',
+        )
+      }
+      const tools = createComputerUseTools({
+        sessionManager: manager,
+        settings: makeSettings({ cdpEndpoint: 'http://127.0.0.1:9222' }),
+      })
+      const ctx = makeContext()
+      const r = await tools.start.call({ backend: 'cdp' }, ctx, ctx.abortController.signal)
+      expect(r.errorKind).toBe('execution_error')
+      expect(r.content).toContain('connectOverCDP')
+    })
   })
 
   it('returns aborted when start throws BrowserSessionError(aborted)', async () => {
@@ -640,7 +808,7 @@ describe('ComputerStart', () => {
           ctx.abortController.signal,
         )
         expect(r.isError).toBe(false)
-        expect(manager.startCalls[0]).toEqual({ headless: true })
+        expect(manager.startCalls[0]).toEqual({ headless: false })
         expect(manager.startCalls[0]?.storageState).toBeUndefined()
       } finally {
         __setStoragePathForTest(null)
@@ -1192,14 +1360,23 @@ describe('ComputerHandoffToUser', () => {
   })
 
   it('denies when session is headless even if allowAuthHandoff=true', async () => {
-    // Default FakeSessionManager creates a headless session.
-    const { tools, session, context } = await setupWithStartedSession({
-      allowAuthHandoff: true,
-    })
+    const manager = new FakeSessionManager()
+    const settings = makeSettings({ allowAuthHandoff: true })
+    const tools = createComputerUseTools({ sessionManager: manager, settings })
+    const ctx = makeContext()
+    // Explicitly opt into headless — the visible-by-default flip means
+    // setupWithStartedSession now produces a headed session by default.
+    const startResult = await tools.start.call(
+      { headless: true },
+      ctx,
+      ctx.abortController.signal,
+    )
+    const sessionId = startResult.content.replace('sessionId: ', '') as ComputerSessionId
+    const session = manager.sessions.get(sessionId)!
     expect(session.headless).toBe(true)
     const decision = await tools.handoffToUser.checkPermissions(
       { sessionId: session.id, message: 'log in please' },
-      context,
+      ctx,
     )
     expect(decision.behavior).toBe('deny')
     expect(decision.behavior === 'deny' && decision.message).toMatch(/headed/)
@@ -1861,7 +2038,7 @@ describe('ComputerObserveActions', () => {
 
 describe('ComputerActAtom', () => {
   it('cache miss → errorKind atom_resolution_failed with recovery text', async () => {
-    const { tools, session, context } = await setupWithStartedSession()
+    const { tools, manager, session, context } = await setupWithStartedSession()
     // No ObserveActions call → cache empty → unknown atomId.
     const r = await tools.actAtom.call(
       { sessionId: session.id, atomId: 'a-99', action: { type: 'click' } },
@@ -1874,6 +2051,46 @@ describe('ComputerActAtom', () => {
     expect(r.content).toContain('ComputerClick')
     // No actOnAtom call should have fired.
     expect(session.actOnAtomCalls).toHaveLength(0)
+    // Failure must feed the no-progress ring with verified:false so repeated
+    // misses trip the session-level guard.
+    expect(manager.recordStepCalls).toHaveLength(1)
+    expect(manager.recordStepCalls[0]?.signals).toEqual({
+      ariaHash: null,
+      phash: null,
+      verified: false,
+    })
+  })
+
+  it('three consecutive cache misses trip the no-progress guard', async () => {
+    const { tools, manager, session, context } = await setupWithStartedSession({
+      verifyActions: true,
+    })
+    // First two misses: ring fills with verified:false but does not abort.
+    let calls = 0
+    manager.recordStepImpl = () => {
+      calls++
+      return calls >= 3
+        ? { abort: true, reason: 'no_progress: 3 consecutive verified:false steps' }
+        : { abort: false }
+    }
+    for (let i = 0; i < 2; i++) {
+      const r = await tools.actAtom.call(
+        { sessionId: session.id, atomId: 'a-missing', action: { type: 'click' } },
+        context,
+        context.abortController.signal,
+      )
+      expect(r.errorKind).toBe('atom_resolution_failed')
+    }
+    const r = await tools.actAtom.call(
+      { sessionId: session.id, atomId: 'a-missing', action: { type: 'click' } },
+      context,
+      context.abortController.signal,
+    )
+    expect(r.errorKind).toBe('execution_error')
+    expect(r.content).toContain('Computer-Use aborted')
+    expect(r.content).toContain('no_progress')
+    // The widened message points the model at the right escape hatch.
+    expect(r.content).toContain('OpenInBrowser')
   })
 
   it('happy-path click routes through runActionAndObserve with NO attachment', async () => {

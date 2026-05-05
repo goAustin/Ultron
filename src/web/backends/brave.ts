@@ -13,7 +13,21 @@
  */
 
 import https from 'node:https'
-import type { SearchBackend, SearchOptions, SearchResult } from '../searchBackend.js'
+import type {
+  Recency,
+  SearchBackend,
+  SearchOptions,
+  SearchResult,
+} from '../searchBackend.js'
+
+// Brave's freshness vocabulary: pd=past day, pw=past week, pm=past month,
+// py=past year. Maps 1:1 onto our `Recency` type.
+const BRAVE_FRESHNESS: Record<Recency, string> = {
+  day: 'pd',
+  week: 'pw',
+  month: 'pm',
+  year: 'py',
+}
 
 export class BraveBackendError extends Error {
   constructor(message: string) {
@@ -53,6 +67,9 @@ export function createBraveBackend(apiKey: string): SearchBackend {
     async search(query: string, opts: SearchOptions): Promise<SearchResult[]> {
       const limit = Math.max(1, Math.min(opts.limit ?? 10, 20))
       const params = new URLSearchParams({ q: query, count: String(limit) })
+      if (opts.recency !== undefined) {
+        params.set('freshness', BRAVE_FRESHNESS[opts.recency])
+      }
       const path = `${PATH_PREFIX}?${params.toString()}`
 
       const json = await httpsGetJson({

@@ -9,6 +9,7 @@
  * See `docs/ultron_v3/v3-phase2-design.md`.
  */
 
+import type { ComputerUseSettings } from '../../config/computerUseSettings.js'
 import type { ToolResultAttachment } from '../tools/imageAttachment.js'
 import type { AriaTreeSnapshot, BoundingBox } from './ariaSnapshot.js'
 import type { AtomEntry, AtomAction, AtomLocator } from './atomResolver.js'
@@ -64,7 +65,20 @@ export type StartSessionOptions = {
   // `context.newContext({ deviceScaleFactor })` AND mirrored on
   // `BrowserSession.viewport.deviceScaleFactor`.
   readonly deviceScaleFactor?: number
+  // CDP backend selector. `'launch'` (default) spawns Playwright's bundled
+  // Chromium-for-Testing via `chromium.launch()`. `'cdp'` requires
+  // `cdpEndpoint` to be set and attaches via `chromium.connectOverCDP()` to
+  // a Chrome the user has already started with `--remote-debugging-port=…`.
+  // The factory throws `BrowserSessionError(kind: 'cdp_connect_failed')`
+  // synchronously when `'cdp'` is requested without an endpoint.
+  readonly backend?: 'launch' | 'cdp'
+  // CDP endpoint URL. Threaded from `computerUse.cdpEndpoint` (or an
+  // explicit SDK call) through to `chromium.connectOverCDP()`. Validated
+  // upstream — the launcher trusts the shape.
+  readonly cdpEndpoint?: string
 }
+
+export type BrowserChannel = 'chrome' | 'chromium'
 
 export type BrowserSessionErrorKind =
   | 'domain_denied'
@@ -72,6 +86,7 @@ export type BrowserSessionErrorKind =
   | 'allowlist_empty'
   | 'viewport_mismatch'
   | 'chromium_not_installed'
+  | 'cdp_connect_failed'
   | 'navigation_failed'
   | 'screenshot_oversized'
   | 'screenshot_failed'
@@ -188,6 +203,16 @@ export interface BrowserSession {
   setAtomCache(cache: SessionAtomCache): void
   lookupAtom(atomId: string): AtomEntry | null
   currentAtomCache(): SessionAtomCache | null
+
+  /**
+   * Domain-prompt UX — atomic settings swap. SessionManager calls this on
+   * every live session whenever `persistAllowedDomain` extends the persistent
+   * allowlist, so the route interceptor and navigate pre-flight see the new
+   * `allowedDomains` immediately. Implementations replace their internal
+   * settings reference; both call sites already dereference `_settings.*`
+   * per request, so the swap is atomic for any subsequent request.
+   */
+  refreshSettings(next: ComputerUseSettings): void
 }
 
 /**
@@ -289,4 +314,36 @@ export interface ComputerSessionManager {
    * intercept screenshot bytes from a third-party session.
    */
   recordScreenshot(id: ComputerSessionId, bytes: number): void
+
+  /**
+   * Domain-prompt UX — read the live `ComputerUseSettings` so the safety
+   * check can classify `ComputerNavigate` against the current allow/deny
+   * lists. Settings can mutate at runtime via `persistAllowedDomain`; this
+   * accessor returns the current snapshot, not a frozen copy at construction.
+   */
+  getSettings(): ComputerUseSettings
+
+  /**
+   * Domain-prompt UX — read the per-session allow overlay populated by
+   * `allow_once` approvals. Returns an empty set for unknown / closed
+   * sessions. Hosts in the overlay are merged into the effective allowlist
+   * by `BrowserSession.navigate` and the route interceptor.
+   */
+  getSessionAllowedHosts(id: ComputerSessionId): ReadonlySet<string>
+
+  /**
+   * Domain-prompt UX — append a host to the per-session overlay (the
+   * `allow_once` path). Idempotent; no-op for unknown / closed sessions.
+   * Cleared on session close.
+   */
+  allowDomainForSession(id: ComputerSessionId, host: string): void
+
+  /**
+   * Domain-prompt UX — append `derivePersistencePatterns(host)` to the
+   * persistent `allowedDomains`, write `~/.ultron/settings.json` atomically,
+   * and call `refreshSettings(next)` on every live session so subsequent
+   * requests see the new list. Idempotent (re-persisting an existing host
+   * is a no-op write).
+   */
+  persistAllowedDomain(host: string): Promise<void>
 }

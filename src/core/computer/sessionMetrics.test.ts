@@ -89,6 +89,7 @@ class FakeSession implements BrowserSession {
   currentAtomCache(): SessionAtomCache | null {
     return null
   }
+  refreshSettings(_next: ComputerUseSettings): void {}
 }
 
 function makeSettings(partial: Partial<ComputerUseSettings> = {}): ComputerUseSettings {

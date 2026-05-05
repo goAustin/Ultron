@@ -15,7 +15,7 @@
  * registry can read it for tool gating. See `docs/ultron_v3/v3-phase0-design.md`.
  */
 
-import { isValidDomainPattern } from '../web/domainPolicy.js'
+import { extractHost, isValidDomainPattern } from '../web/domainPolicy.js'
 
 export type ComputerUseSettings = {
   enabled: boolean
@@ -61,6 +61,42 @@ export type ComputerUseSettings = {
    * left alone). No-op on piped stderr regardless of this setting.
    */
   watchMode: boolean
+  /**
+   * SDK strict mode. When `true`, `SessionManager.start` throws
+   * `BrowserSessionError(kind: 'allowlist_empty')` if `allowedDomains` is
+   * empty — preserving the old fail-fast behavior for headless callers that
+   * have no operator to answer a runtime prompt. CLI defaults to `false`:
+   * an empty allowlist starts cleanly, and per-navigate prompts handle the
+   * gate. SDK consumers wanting strict pre-flight set this to `true`.
+   */
+  requireAllowlistAtStart: boolean
+  /**
+   * CDP backend endpoint. When set, `ComputerStart` defaults to attaching to
+   * a Chrome the user has already started with `--remote-debugging-port=…`
+   * via `chromium.connectOverCDP()`, instead of launching Playwright's
+   * bundled Chromium-for-Testing binary. The agent runs in an **isolated new
+   * BrowserContext** inside that Chrome process; the user's existing tabs
+   * are untouched. Bind the port to `127.0.0.1` only — anyone with network
+   * access to the port can drive that Chrome.
+   *
+   * Accepted schemes: `http://`, `https://`, `ws://`, `wss://`. Invalid URLs
+   * warn at boot and fall back to undefined (bundled-Chromium launch).
+   * See `docs/computer-use.md` § "Driving your real Chrome via CDP" and
+   * `docs/ultron_v3/v3-cdp-backend-design.md`.
+   */
+  cdpEndpoint?: string
+  /**
+   * Whether the CDP-attached Chrome is operator-visible. Used as the value
+   * of `BrowserSession.headless` for CDP sessions, which `ComputerHandoffToUser`
+   * keys on to refuse handoff against an invisible browser.
+   *
+   * Defaults to `false` (fail-safe): we cannot introspect the connected
+   * Chrome's `--headless` flag, so by default a CDP session reports
+   * `headless: true` (= invisible) and handoff is refused. Set this to
+   * `true` only when you are running a visible Chrome with
+   * `--remote-debugging-port` and want to allow `ComputerHandoffToUser`.
+   */
+  cdpAssumeVisible: boolean
 }
 
 export const defaultComputerUseSettings: ComputerUseSettings = {
@@ -83,6 +119,8 @@ export const defaultComputerUseSettings: ComputerUseSettings = {
   redactionSelectors: [],
   verifyActions: true,
   watchMode: false,
+  requireAllowlistAtStart: false,
+  cdpAssumeVisible: false,
 }
 
 const VIEWPORT_MAX = 4096
@@ -183,6 +221,45 @@ function validateDomainList(v: unknown, field: string): string[] {
 }
 
 /**
+ * CDP backend — validate the optional `cdpEndpoint` URL. Returns the
+ * canonical `URL.toString()` form on success, `undefined` (with a warn) on
+ * any failure. Accepted schemes: `http(s):` for HTTP-served CDP discovery
+ * (`http://127.0.0.1:9222`) and `ws(s):` for direct browser-WS endpoints
+ * (`ws://127.0.0.1:9222/devtools/browser/<uuid>`). All other schemes —
+ * `javascript:`, `file:`, `data:`, etc. — are rejected.
+ */
+function validateCdpEndpoint(v: unknown): string | undefined {
+  if (v === undefined) return undefined
+  if (typeof v !== 'string') {
+    warn(`computerUse.cdpEndpoint must be a string; got ${describeKind(v)}; using default (unset)`)
+    return undefined
+  }
+  if (v.length === 0) {
+    warn('computerUse.cdpEndpoint must be a non-empty string; using default (unset)')
+    return undefined
+  }
+  let parsed: URL
+  try {
+    parsed = new URL(v)
+  } catch {
+    warn(`computerUse.cdpEndpoint = ${JSON.stringify(v)} is not a valid URL; using default (unset)`)
+    return undefined
+  }
+  if (
+    parsed.protocol !== 'http:' &&
+    parsed.protocol !== 'https:' &&
+    parsed.protocol !== 'ws:' &&
+    parsed.protocol !== 'wss:'
+  ) {
+    warn(
+      `computerUse.cdpEndpoint scheme must be http(s): or ws(s):; got ${parsed.protocol.replace(':', '')}; using default (unset)`,
+    )
+    return undefined
+  }
+  return parsed.toString()
+}
+
+/**
  * Phase 4·2 — validate `redactionSelectors`. Each entry must be a non-empty
  * string. We can't fully syntax-check arbitrary CSS selectors here without
  * pulling in a parser, so we just trim + dedupe; the BrowserSession's
@@ -235,6 +312,8 @@ export function validateComputerUseSettings(raw: unknown): ComputerUseSettings {
       deniedDomains: [],
     }
   }
+
+  const cdpEndpoint = validateCdpEndpoint(raw.cdpEndpoint)
 
   return {
     enabled: validateBoolean(raw.enabled, 'enabled', defaultComputerUseSettings.enabled),
@@ -326,5 +405,55 @@ export function validateComputerUseSettings(raw: unknown): ComputerUseSettings {
       'watchMode',
       defaultComputerUseSettings.watchMode,
     ),
+    requireAllowlistAtStart: validateBoolean(
+      raw.requireAllowlistAtStart,
+      'requireAllowlistAtStart',
+      defaultComputerUseSettings.requireAllowlistAtStart,
+    ),
+    ...(cdpEndpoint !== undefined ? { cdpEndpoint } : {}),
+    cdpAssumeVisible: validateBoolean(
+      raw.cdpAssumeVisible,
+      'cdpAssumeVisible',
+      defaultComputerUseSettings.cdpAssumeVisible,
+    ),
   }
 }
+
+/**
+ * Derive the persistence patterns to write into `computerUse.allowedDomains`
+ * when the user picks "Allow by rule" for a host.
+ *
+ * Strips a leading `www.` (if present) and returns `[apex, *.apex]` so that
+ * both the apex and any subdomain of the apex match. The wildcard form does
+ * NOT match the apex by itself (`domainPolicy.ts:84`), so persisting both
+ * patterns is required to cover `youtube.com` AND `m.youtube.com` after a
+ * single approval of `www.youtube.com`.
+ *
+ * Examples:
+ *   www.youtube.com    → [youtube.com, *.youtube.com]
+ *   youtube.com        → [youtube.com, *.youtube.com]
+ *   studio.youtube.com → [studio.youtube.com, *.studio.youtube.com]
+ *   github.io          → [github.io, *.github.io]   (over-broad for eTLDs;
+ *                       no PSL dependency, documented limitation)
+ *
+ * Returns an empty array when the input is unusable (empty, malformed, or
+ * produces patterns that fail `isValidDomainPattern`). Caller treats the
+ * empty case as "skip persistence" — the in-memory overlay still applies.
+ */
+export function derivePersistencePatterns(host: string): readonly string[] {
+  if (typeof host !== 'string' || host.length === 0) return []
+  const lowered = host.toLowerCase()
+  const apex = lowered.startsWith('www.') && lowered.length > 4
+    ? lowered.slice(4)
+    : lowered
+  const wildcard = `*.${apex}`
+  const out: string[] = []
+  if (isValidDomainPattern(apex)) out.push(apex)
+  if (isValidDomainPattern(wildcard)) out.push(wildcard)
+  return out
+}
+
+// Keep `extractHost` re-exported for callers that derive a pattern from a URL
+// in one step. The persistence helper above stays host-only so it's
+// straightforward to unit-test without URL parsing in the inputs.
+export { extractHost as extractHostForPersistence }

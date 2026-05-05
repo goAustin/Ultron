@@ -954,4 +954,98 @@ describe('classifyAction', () => {
       expect(r.reason).toContain('atomId not resolvable')
     })
   })
+
+  // -------------------------------------------------------------------------
+  // ComputerNavigate (domain-prompt UX)
+  // -------------------------------------------------------------------------
+
+  describe('ComputerNavigate', () => {
+    it('without domain context → level 1 defer (legacy behavior)', () => {
+      const r = classifyAction({
+        toolName: 'ComputerNavigate',
+        input: { sessionId: 's1', url: 'https://example.com/' },
+        currentUrl: null,
+      })
+      expect(r.level).toBe(1)
+      expect(r.category).toBe('reversible_ui')
+    })
+
+    it('host in deniedDomains → level 4 prohibited', () => {
+      const r = classifyAction({
+        toolName: 'ComputerNavigate',
+        input: { sessionId: 's1', url: 'https://evil.com/foo' },
+        currentUrl: null,
+        allowedDomains: [],
+        deniedDomains: ['evil.com'],
+      })
+      expect(r.level).toBe(4)
+      expect(r.category).toBe('prohibited')
+      expect(r.reason).toContain('evil.com')
+    })
+
+    it('host in persistent allowedDomains → level 0 known_domain', () => {
+      const r = classifyAction({
+        toolName: 'ComputerNavigate',
+        input: { sessionId: 's1', url: 'https://m.youtube.com/watch?v=x' },
+        currentUrl: null,
+        allowedDomains: ['*.youtube.com'],
+        deniedDomains: [],
+      })
+      expect(r.level).toBe(0)
+      expect(r.category).toBe('known_domain')
+      expect(r.reason).toContain('m.youtube.com')
+    })
+
+    it('host in session overlay → level 0 known_domain (allow_once carry)', () => {
+      const r = classifyAction({
+        toolName: 'ComputerNavigate',
+        input: { sessionId: 's1', url: 'https://example.com/' },
+        currentUrl: null,
+        allowedDomains: [],
+        deniedDomains: [],
+        sessionAllowedHosts: new Set(['example.com']),
+      })
+      expect(r.level).toBe(0)
+      expect(r.category).toBe('known_domain')
+      expect(r.reason).toContain('approved earlier this session')
+    })
+
+    it('unknown host → level 2 unknown_domain (cascade asks)', () => {
+      const r = classifyAction({
+        toolName: 'ComputerNavigate',
+        input: { sessionId: 's1', url: 'https://www.youtube.com/' },
+        currentUrl: null,
+        allowedDomains: [],
+        deniedDomains: [],
+      })
+      expect(r.level).toBe(2)
+      expect(r.category).toBe('unknown_domain')
+      expect(r.reason).toContain('www.youtube.com')
+      expect(r.reason).toContain('not in computerUse.allowedDomains')
+    })
+
+    it('denied beats allowed (defense in depth)', () => {
+      const r = classifyAction({
+        toolName: 'ComputerNavigate',
+        input: { sessionId: 's1', url: 'https://evil.example.com/' },
+        currentUrl: null,
+        allowedDomains: ['*.example.com'],
+        deniedDomains: ['evil.example.com'],
+      })
+      expect(r.level).toBe(4)
+      expect(r.category).toBe('prohibited')
+    })
+
+    it('unparseable URL → level 1 defer', () => {
+      const r = classifyAction({
+        toolName: 'ComputerNavigate',
+        input: { sessionId: 's1', url: 'not a url' },
+        currentUrl: null,
+        allowedDomains: [],
+        deniedDomains: [],
+      })
+      expect(r.level).toBe(1)
+      expect(r.reason).toContain('unparseable URL')
+    })
+  })
 })

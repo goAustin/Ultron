@@ -62,6 +62,17 @@ export type ComputerUseSettingsInput = {
   verifyActions?: boolean
   // Phase 4·3 — opt-in CLI watch-mode renderer. Default false.
   watchMode?: boolean
+  // Domain-prompt UX — SDK strict mode. When true, `SessionManager.start`
+  // throws `allowlist_empty` when `allowedDomains` is empty. Default false.
+  requireAllowlistAtStart?: boolean
+  // CDP backend endpoint. When set, `ComputerStart` defaults to attaching to
+  // a Chrome the user has already started with `--remote-debugging-port=…`.
+  // See `docs/ultron_v3/v3-cdp-backend-design.md`.
+  cdpEndpoint?: string
+  // Whether the CDP-attached Chrome is operator-visible. Drives
+  // `BrowserSession.headless` for CDP sessions and gates
+  // `ComputerHandoffToUser`. Default false (treat as invisible, refuse handoff).
+  cdpAssumeVisible?: boolean
 }
 
 export type SettingsConfig = {

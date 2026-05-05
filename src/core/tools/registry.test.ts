@@ -78,11 +78,11 @@ describe('createToolRegistry', () => {
 describe('createDefaultRegistry', () => {
   const reg = createDefaultRegistry()
 
-  it('has exactly 10 tools', () => {
-    expect(reg.size).toBe(10)
+  it('has exactly 11 tools', () => {
+    expect(reg.size).toBe(11)
   })
 
-  it.each(['FileRead', 'FileWrite', 'FileEdit', 'Glob', 'Grep', 'Bash', 'WebFetch', 'WebSearch', 'CodeSandbox'])(
+  it.each(['FileRead', 'FileWrite', 'FileEdit', 'Glob', 'Grep', 'Bash', 'WebFetch', 'WebSearch', 'OpenInBrowser', 'CodeSandbox'])(
     'contains %s',
     (name) => {
       const tool = reg.get(name)

@@ -12,6 +12,7 @@ import { GrepTool } from '../../tools/GrepTool.js'
 import { BashTool } from '../../tools/BashTool.js'
 import { WebFetchTool } from '../../tools/WebFetchTool.js'
 import { WebSearchTool } from '../../tools/WebSearchTool.js'
+import { OpenInBrowserTool } from '../../tools/OpenInBrowserTool.js'
 import { CodeSandboxTool } from '../../tools/CodeSandboxTool.js'
 import { AgentTool } from '../../agents/agentTool.js'
 
@@ -114,6 +115,7 @@ export function createDefaultRegistry(): ToolRegistry {
   registry.register(BashTool)
   registry.register(WebFetchTool)
   registry.register(WebSearchTool)
+  registry.register(OpenInBrowserTool)
   registry.register(CodeSandboxTool)
   registry.register(AgentTool)
   return registry

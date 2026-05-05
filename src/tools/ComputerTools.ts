@@ -195,6 +195,7 @@ export function mapBrowserSessionError(err: unknown): ToolResult {
       case 'allowlist_empty':
         return errorResult('permission_denied', err.message)
       case 'chromium_not_installed':
+      case 'cdp_connect_failed':
       case 'navigation_failed':
       case 'screenshot_failed':
       case 'screenshot_oversized':
@@ -431,7 +432,9 @@ async function runActionAndObserve(
     if (decision.abort) {
       return errorResult(
         'execution_error',
-        `Computer-Use aborted: ${decision.reason}. Re-plan or hand off to the user.`,
+        `Computer-Use aborted: ${decision.reason}. ` +
+          'Re-plan or hand off to the user. ' +
+          'If the user wants to consume the page themselves, use OpenInBrowser.',
       )
     }
   }
@@ -561,13 +564,14 @@ function buildStartTool(deps: ComputerUseToolsDeps): Tool {
       'is for live-page interaction (login, forms, client-side UI, visual ' +
       'inspection) only. Returns a sessionId that subsequent Computer* tools ' +
       'must reference. Sessions are bounded by the configured maxDurationMs. ' +
-      'Headless by default.',
+      'Visible browser window by default — pass headless=true to suppress the window.',
     inputSchema: {
       type: 'object',
       properties: {
         headless: {
           type: 'boolean',
-          description: 'When false, launches a visible browser window. Required by ComputerHandoffToUser.',
+          description:
+            'When true, runs Chromium without a visible window. Defaults to false (visible window) so the user can monitor agent actions. ComputerHandoffToUser requires false. Rejected when backend is "cdp" — the user controls Chrome visibility through their own launch flags.',
         },
         initialUrl: {
           type: 'string',
@@ -576,6 +580,16 @@ function buildStartTool(deps: ComputerUseToolsDeps): Tool {
             'is on the allowlist AND persistProfiles is enabled, any previously-snapshotted ' +
             'cookies/localStorage for that host are rehydrated into the new session. Does ' +
             'NOT auto-navigate — call ComputerNavigate yourself.',
+        },
+        backend: {
+          type: 'string',
+          enum: ['launch', 'cdp'],
+          description:
+            'Browser backend. "launch" (default) spawns Playwright\'s bundled Chromium. ' +
+            '"cdp" attaches to a Chrome the user has already started with --remote-debugging-port=… ' +
+            'via chromium.connectOverCDP() and runs in an isolated new BrowserContext inside it. ' +
+            'Requires computerUse.cdpEndpoint to be configured. Defaults to "cdp" when ' +
+            'computerUse.cdpEndpoint is set, otherwise "launch".',
         },
       },
     },
@@ -586,6 +600,40 @@ function buildStartTool(deps: ComputerUseToolsDeps): Tool {
     async validateInput(input) {
       if (input.headless !== undefined && typeof input.headless !== 'boolean') {
         return { valid: false, message: 'headless must be a boolean' }
+      }
+      // Validate `backend` shape first.
+      if (
+        input.backend !== undefined &&
+        input.backend !== 'launch' &&
+        input.backend !== 'cdp'
+      ) {
+        return { valid: false, message: 'backend must be "launch" or "cdp"' }
+      }
+      // Compute the EFFECTIVE backend — explicit input wins, otherwise it
+      // defaults to 'cdp' when settings.cdpEndpoint is set, else 'launch'.
+      // Without this, `{ headless: true }` against a settings.cdpEndpoint
+      // config silently flips to CDP and gets dropped by the factory.
+      const effectiveBackend: 'launch' | 'cdp' =
+        input.backend === 'launch' || input.backend === 'cdp'
+          ? input.backend
+          : deps.settings.cdpEndpoint !== undefined
+            ? 'cdp'
+            : 'launch'
+      if (effectiveBackend === 'cdp') {
+        if (deps.settings.cdpEndpoint === undefined) {
+          return {
+            valid: false,
+            message:
+              'backend: "cdp" requires computerUse.cdpEndpoint to be configured in settings.json',
+          }
+        }
+        if (input.headless === true) {
+          return {
+            valid: false,
+            message:
+              'headless: true is not supported under the CDP backend — Chrome visibility is controlled by the user\'s --remote-debugging-port launch command and computerUse.cdpAssumeVisible. Pass backend: "launch" if you want a headless bundled-Chromium session.',
+          }
+        }
       }
       if (input.initialUrl !== undefined) {
         if (typeof input.initialUrl !== 'string' || input.initialUrl.length === 0) {
@@ -655,9 +703,24 @@ function buildStartTool(deps: ComputerUseToolsDeps): Tool {
           }
         }
 
+        // Backend defaulting: when `cdpEndpoint` is configured, default to
+        // CDP. Explicit `input.backend` always wins. The validator above
+        // already rejected `backend: 'cdp'` without an endpoint, and
+        // `backend: 'cdp' + headless: true`. Backend is only threaded when
+        // it's 'cdp' — the factory's selector triggers on `=== 'cdp'`, so
+        // missing-vs-'launch' are equivalent and omitting keeps
+        // StartSessionOptions clean.
+        const explicitBackend = input.backend === 'launch' || input.backend === 'cdp'
+          ? input.backend
+          : undefined
+        const backend: 'launch' | 'cdp' = explicitBackend
+          ?? (deps.settings.cdpEndpoint !== undefined ? 'cdp' : 'launch')
         const session = await deps.sessionManager.start(
           {
-            headless: typeof input.headless === 'boolean' ? input.headless : true,
+            headless: typeof input.headless === 'boolean' ? input.headless : false,
+            ...(backend === 'cdp' && deps.settings.cdpEndpoint !== undefined
+              ? { backend, cdpEndpoint: deps.settings.cdpEndpoint }
+              : {}),
             ...(storageState !== undefined ? { storageState } : {}),
           },
           signal,
@@ -1544,6 +1607,25 @@ function buildActAtomTool(deps: ComputerUseToolsDeps): Tool {
 
       const entry = lookup.session.lookupAtom(atomId)
       if (entry === null) {
+        // Feed the failure into the no-progress ring so repeated misses count
+        // against the session's progress budget. Without this, the model can
+        // re-resolve and re-fail indefinitely (the session-level guard only
+        // sees mutating actions that reach `runActionAndObserve`). `verified:
+        // false` reuses the primary rule's contract; `ariaHash`/`phash` are
+        // null because no observation ran.
+        const decision = deps.sessionManager.recordStep(lookup.session.id, {
+          ariaHash: null,
+          phash: null,
+          verified: false,
+        })
+        if (decision.abort) {
+          return errorResult(
+            'execution_error',
+            `Computer-Use aborted: ${decision.reason}. ` +
+              'Re-plan or hand off to the user. ' +
+              'If the user wants to consume the page themselves, use OpenInBrowser.',
+          )
+        }
         return errorResult(
           'atom_resolution_failed',
           `atom '${atomId}' is not resolvable in this session. ` +

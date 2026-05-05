@@ -138,6 +138,78 @@ const defaultLaunchChromium: LaunchChromiumFn = async (params) => {
 }
 
 /**
+ * CDP backend launcher. Connects via `chromium.connectOverCDP(endpoint)`,
+ * then creates an isolated `BrowserContext` inside the user's Chrome with
+ * the same options `defaultLaunchChromium` uses for storageState, viewport,
+ * DSF, and the route interceptor — so every downstream code path is
+ * launch-mode-agnostic. Per Playwright's type doc
+ * (`playwright-core/types/types.d.ts:9820-9826`), `browser.close()` on a
+ * connected browser closes Playwright-created contexts and disconnects the
+ * WebSocket without terminating the user's Chrome — so the existing
+ * `close()` path is safe to reuse without gating.
+ *
+ * `params.headless` is intentionally ignored: visibility is controlled by
+ * the user's Chrome launch flags. `ComputerStart.validateInput` rejects
+ * `backend: 'cdp' + headless: true` upstream, and `createPlaywrightSessionFactory`
+ * forces the constructed session's `headless` to `false`.
+ */
+export const connectChromiumOverCdp =
+  (endpoint: string): LaunchChromiumFn =>
+  async (params) => {
+    let browser: Browser
+    try {
+      browser = await chromium.connectOverCDP(endpoint)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      throw new BrowserSessionError(
+        'cdp_connect_failed',
+        `connectOverCDP(${endpoint}) failed: ${msg}. ` +
+          'Start Chrome with --remote-debugging-port=… and verify the port is reachable on 127.0.0.1.',
+      )
+    }
+    const baseContextOptions: NonNullable<Parameters<typeof browser.newContext>[0]> = {
+      viewport: { width: params.viewport.width, height: params.viewport.height },
+      acceptDownloads: false,
+      permissions: [],
+      bypassCSP: false,
+      javaScriptEnabled: true,
+      serviceWorkers: 'block',
+      ...(params.deviceScaleFactor !== undefined
+        ? { deviceScaleFactor: params.deviceScaleFactor }
+        : {}),
+    }
+    let context: BrowserContext
+    try {
+      if (params.storageState !== undefined) {
+        const withStorage: typeof baseContextOptions = {
+          ...baseContextOptions,
+          storageState: params.storageState as typeof baseContextOptions.storageState,
+        }
+        try {
+          context = await browser.newContext(withStorage)
+        } catch (storageErr) {
+          // Mirror `defaultLaunchChromium`'s "rehydration must never throw"
+          // posture — bad storageState falls back to cookie-less.
+          const msg = storageErr instanceof Error ? storageErr.message : String(storageErr)
+          process.stderr.write(
+            `[ultron] warning: stored credentials rejected by Playwright; starting cookie-less. ${msg}\n`,
+          )
+          context = await browser.newContext(baseContextOptions)
+        }
+      } else {
+        context = await browser.newContext(baseContextOptions)
+      }
+    } catch (err) {
+      // newContext failed for non-storage reasons: clean up the WebSocket
+      // before propagating so a leaked CDP connection doesn't dangle.
+      await browser.close().catch(() => undefined)
+      throw err
+    }
+    const page = await context.newPage()
+    return { browser, context, page }
+  }
+
+/**
  * Match shapes Playwright surfaces when the chromium binary is missing.
  * Playwright doesn't expose a typed error class, so we substring-match — but
  * only on patterns specific to a missing executable. The previous version
@@ -160,12 +232,38 @@ function isMissingChromiumError(err: unknown): boolean {
 export function createPlaywrightSessionFactory(deps?: {
   readonly launchChromium?: LaunchChromiumFn
 }): BrowserSessionFactory {
-  const launch = deps?.launchChromium ?? defaultLaunchChromium
-  return async ({ id, settings, options, requestClose, recordScreenshot }) => {
+  return async ({
+    id,
+    settings,
+    options,
+    requestClose,
+    recordScreenshot,
+    getSessionAllowedHosts,
+  }) => {
+    // Backend selection. CDP fail-closes synchronously when an endpoint is
+    // missing — SDK callers that bypass `ComputerStart.validateInput` get the
+    // same surface as model-driven calls. `deps?.launchChromium` is honored
+    // for both modes (tests inject stubs); the real `connectChromiumOverCdp`
+    // is exercised by `playwrightBrowserSession.cdp.integration.test.ts`.
+    const useCdp = options.backend === 'cdp'
+    if (useCdp && options.cdpEndpoint === undefined) {
+      throw new BrowserSessionError(
+        'cdp_connect_failed',
+        "backend: 'cdp' requires a cdpEndpoint; configure computerUse.cdpEndpoint or pass cdpEndpoint in StartSessionOptions",
+      )
+    }
+    const launch: LaunchChromiumFn = deps?.launchChromium
+      ?? (useCdp
+        ? connectChromiumOverCdp(options.cdpEndpoint as string)
+        : defaultLaunchChromium)
+
     let launched: LaunchedBrowser
     try {
       launched = await launch({
-        headless: options.headless ?? true,
+        // CDP ignores headless (visibility is controlled by the user's
+        // Chrome flags), but we still pass a value so the launcher signature
+        // stays stable. Local-launch defaults to true (Phase 0 posture).
+        headless: useCdp ? false : (options.headless ?? true),
         args: options.hostResolverRules
           ? [`--host-resolver-rules=${options.hostResolverRules}`]
           : [],
@@ -182,6 +280,7 @@ export function createPlaywrightSessionFactory(deps?: {
         ...(options.storageState !== undefined ? { storageState: options.storageState } : {}),
       })
     } catch (err) {
+      if (err instanceof BrowserSessionError) throw err
       if (isMissingChromiumError(err)) {
         throw new BrowserSessionError(
           'chromium_not_installed',
@@ -195,12 +294,26 @@ export function createPlaywrightSessionFactory(deps?: {
       throw err
     }
 
+    // CDP sessions: `BrowserSession.headless` reflects whether the
+    // CDP-attached Chrome is operator-visible. We can't introspect Chrome's
+    // `--headless` flag from a CDP connection, so the value comes from
+    // `computerUse.cdpAssumeVisible` (default false → treat as invisible →
+    // refuse handoff). `input.headless` is meaningless under CDP — already
+    // rejected when explicitly true by `ComputerStart.validateInput`.
+    const sessionOptions: StartSessionOptions = useCdp
+      ? { ...options, headless: !settings.cdpAssumeVisible }
+      : options
     const session = new PlaywrightBrowserSession({
       id,
       settings,
-      options,
+      options: sessionOptions,
       requestClose,
       recordScreenshot,
+      // Domain-prompt UX — forward the SessionManager's per-session overlay
+      // closure. Without this, `allow_once` for an unknown host gets the
+      // cascade approval but `BrowserSession.navigate()` still rejects with
+      // `domain_denied` because the live overlay is invisible to the session.
+      ...(getSessionAllowedHosts !== undefined && { getSessionAllowedHosts }),
       launched,
     })
     await session._installRouteInterceptor()
@@ -216,15 +329,28 @@ const noopPopupNotifier: PopupErrorNotifier = () => {}
 
 const noopRecordScreenshot = (_bytes: number): void => {}
 
+const EMPTY_HOST_SET: ReadonlySet<string> = new Set<string>()
+const noopHostSet = (): ReadonlySet<string> => EMPTY_HOST_SET
+
 export class PlaywrightBrowserSession implements BrowserSession {
   readonly id: ComputerSessionId
   readonly viewport: ComputerViewport
   readonly displaySize: ComputerDisplaySize
   readonly headless: boolean
 
-  private readonly _settings: ComputerUseSettings
+  // Domain-prompt UX — `_settings` is mutable so `refreshSettings` can swap
+  // in an extended `allowedDomains` after a `persistAllowedDomain` call from
+  // the SessionManager. Both the route interceptor and navigate pre-flight
+  // dereference `this._settings.allowedDomains` per request, so the swap is
+  // atomic for any subsequent request.
+  private _settings: ComputerUseSettings
   private readonly _options: StartSessionOptions
   private readonly _requestClose: (reason: 'aborted' | 'timeout' | 'error') => Promise<void>
+  // Domain-prompt UX — closure over the SessionManager's per-session overlay
+  // for this session id. Read on every domain check so an `allow_once`
+  // approval propagates before the navigate or subresource fetch fires.
+  // Defaults to an always-empty closure for direct-construct test paths.
+  private readonly _getSessionAllowedHosts: () => ReadonlySet<string>
   // v3 Phase 6 — pre-bound metrics callback supplied by the manager. Called
   // after each successful `screenshot()` capture. Fire-and-forget; the manager
   // no-ops on closed/unknown sessions. `() => {}` is a safe default for
@@ -257,6 +383,12 @@ export class PlaywrightBrowserSession implements BrowserSession {
      * about metrics can pass `() => {}`.
      */
     readonly recordScreenshot?: (bytes: number) => void
+    /**
+     * Domain-prompt UX — closure over the SessionManager's per-session allow
+     * overlay. Optional: tests that direct-construct without a manager can
+     * omit it (defaults to always-empty).
+     */
+    readonly getSessionAllowedHosts?: () => ReadonlySet<string>
     readonly launched: LaunchedBrowser
     readonly onPopupError?: PopupErrorNotifier
   }) {
@@ -281,10 +413,21 @@ export class PlaywrightBrowserSession implements BrowserSession {
     this._options = params.options
     this._requestClose = params.requestClose
     this._recordScreenshot = params.recordScreenshot ?? noopRecordScreenshot
+    this._getSessionAllowedHosts = params.getSessionAllowedHosts ?? noopHostSet
     this._browser = params.launched.browser
     this._context = params.launched.context
     this._page = params.launched.page
     this._onPopupError = params.onPopupError ?? noopPopupNotifier
+  }
+
+  /**
+   * Domain-prompt UX — atomic settings swap. Called by the SessionManager
+   * after `persistAllowedDomain` extends the persistent allowlist. Both the
+   * route interceptor and navigate pre-flight read `this._settings.*` per
+   * request, so the swap is observed by the next request without restart.
+   */
+  refreshSettings(next: ComputerUseSettings): void {
+    this._settings = next
   }
 
   async _installRouteInterceptor(): Promise<void> {
@@ -304,7 +447,7 @@ export class PlaywrightBrowserSession implements BrowserSession {
           allowedDomains: this._settings.allowedDomains,
           deniedDomains: this._settings.deniedDomains,
         },
-        { requireAllowlist },
+        { requireAllowlist, sessionAllowedHosts: this._getSessionAllowedHosts() },
       )
       if (!domainCheck.allowed) {
         void route.abort('blockedbyclient')
@@ -367,7 +510,7 @@ export class PlaywrightBrowserSession implements BrowserSession {
         allowedDomains: this._settings.allowedDomains,
         deniedDomains: this._settings.deniedDomains,
       },
-      { requireAllowlist },
+      { requireAllowlist, sessionAllowedHosts: this._getSessionAllowedHosts() },
     )
     if (!domainCheck.allowed) {
       const host = extractHost(url) ?? undefined

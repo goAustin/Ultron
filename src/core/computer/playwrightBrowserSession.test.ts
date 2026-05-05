@@ -260,6 +260,37 @@ describe('createPlaywrightSessionFactory', () => {
     expect(routeRegistered).toBe(true)
   })
 
+  // Domain-prompt UX regression. The factory MUST forward the
+  // `getSessionAllowedHosts` closure to PlaywrightBrowserSession; without it,
+  // the session falls back to the always-empty overlay default, and
+  // `allow_once` for an unknown host fails with `domain_denied` even though
+  // the cascade approved it.
+  it('forwards getSessionAllowedHosts so navigate honors the per-session overlay', async () => {
+    const factory = createPlaywrightSessionFactory({
+      launchChromium: async () => makeStubLaunched(),
+    })
+    const overlay = new Set<string>(['allowed-via-overlay.example'])
+    const session = await factory({
+      id: 'sess-overlay-1' as ComputerSessionId,
+      // Empty persistent allowlist — the overlay is the only thing that
+      // can authorize the navigate below.
+      settings: makeSettings({ allowedDomains: [] }),
+      options: {},
+      requestClose: async () => {},
+      recordScreenshot: () => {},
+      getSessionAllowedHosts: () => overlay,
+    })
+    // Should NOT throw — the overlay contains the host.
+    await expect(
+      session.navigate('https://allowed-via-overlay.example/', new AbortController().signal),
+    ).resolves.toBeUndefined()
+    // Sanity check — a host NOT in the overlay still fails with domain_denied.
+    await expect(
+      session.navigate('https://unauthorized.example/', new AbortController().signal),
+    ).rejects.toMatchObject({ kind: 'domain_denied' })
+    await session.close()
+  })
+
   it('exposes the headless option on the BrowserSession', async () => {
     const factory = createPlaywrightSessionFactory({
       launchChromium: async () => makeStubLaunched(),
@@ -289,6 +320,123 @@ describe('createPlaywrightSessionFactory', () => {
     expect(headlessSession.headless).toBe(true)
     // Default is true (matches Phase 2's chromium.launch default).
     expect(defaultSession.headless).toBe(true)
+  })
+
+  // ---------------------------------------------------------------------------
+  // CDP backend
+  // ---------------------------------------------------------------------------
+
+  describe('CDP backend', () => {
+    it('throws cdp_connect_failed synchronously when backend: cdp is requested without an endpoint', async () => {
+      // The launchChromium stub must NOT be called — the factory fails closed
+      // before any chromium API is touched. This guards SDK callers that bypass
+      // ComputerStart.validateInput.
+      const launchSpy = vi.fn<LaunchChromiumFn>(async () => makeStubLaunched())
+      const factory = createPlaywrightSessionFactory({ launchChromium: launchSpy })
+      await expect(
+        factory({
+          id: 'sess-cdp-no-endpoint' as ComputerSessionId,
+          settings: makeSettings(),
+          options: { backend: 'cdp' },
+          requestClose: async () => {},
+          recordScreenshot: () => {},
+        }),
+      ).rejects.toMatchObject({
+        kind: 'cdp_connect_failed',
+        message: expect.stringContaining('cdpEndpoint'),
+      })
+      expect(launchSpy).not.toHaveBeenCalled()
+    })
+
+    it('CDP session.headless defaults to true (cdpAssumeVisible: false → invisible → handoff refused)', async () => {
+      // We can't introspect Chrome's --headless flag from a CDP connection, so
+      // the conservative default is "treat as invisible." Power users who run
+      // a visible Chrome opt in via cdpAssumeVisible: true.
+      const factory = createPlaywrightSessionFactory({
+        launchChromium: async () => makeStubLaunched(),
+      })
+      const cdpSession = await factory({
+        id: 'sess-cdp-headless-default' as ComputerSessionId,
+        settings: makeSettings(),
+        options: { backend: 'cdp', cdpEndpoint: 'http://127.0.0.1:9222' },
+        requestClose: async () => {},
+        recordScreenshot: () => {},
+      })
+      expect(cdpSession.headless).toBe(true)
+    })
+
+    it('cdpAssumeVisible: true makes session.headless = false', async () => {
+      const factory = createPlaywrightSessionFactory({
+        launchChromium: async () => makeStubLaunched(),
+      })
+      const cdpSession = await factory({
+        id: 'sess-cdp-headless-visible' as ComputerSessionId,
+        settings: makeSettings({ cdpAssumeVisible: true }),
+        options: { backend: 'cdp', cdpEndpoint: 'http://127.0.0.1:9222' },
+        requestClose: async () => {},
+        recordScreenshot: () => {},
+      })
+      expect(cdpSession.headless).toBe(false)
+    })
+
+    it('passes headless: false to the launcher for CDP regardless of input', async () => {
+      // CDP ignores headless (visibility is the user's flag), but the value
+      // forwarded to the launcher should still be false so any downstream
+      // assumption (e.g. about the launch shape) is consistent.
+      const launchSpy = vi.fn<LaunchChromiumFn>(async () => makeStubLaunched())
+      const factory = createPlaywrightSessionFactory({ launchChromium: launchSpy })
+      await factory({
+        id: 'sess-cdp-launch-headless' as ComputerSessionId,
+        settings: makeSettings(),
+        options: { backend: 'cdp', cdpEndpoint: 'http://127.0.0.1:9222' },
+        requestClose: async () => {},
+        recordScreenshot: () => {},
+      })
+      expect(launchSpy.mock.calls[0]?.[0]?.headless).toBe(false)
+    })
+
+    it('session.close() calls both context.close() and browser.close() — same as launch path', async () => {
+      // Per playwright-core/types/types.d.ts:9820-9826, browser.close() over a
+      // CDP-attached browser closes Playwright-created contexts and disconnects
+      // the WebSocket without terminating the user's Chrome. So the session's
+      // close() path is identical for both modes; skipping the call would leak
+      // a CDP WebSocket per session.
+      const noop = async () => {}
+      const noopRoute = async (_pattern: string, _handler: unknown) => {}
+      const noopOn = (_event: string, _handler: unknown) => {}
+      const browserClose = vi.fn(noop)
+      const contextClose = vi.fn(noop)
+      const launched: LaunchedBrowser = {
+        browser: { close: browserClose, on: noopOn } as unknown as LaunchedBrowser['browser'],
+        context: {
+          close: contextClose,
+          route: noopRoute,
+          on: noopOn,
+          storageState: async () => ({ cookies: [], origins: [] }),
+        } as unknown as LaunchedBrowser['context'],
+        page: {
+          url: () => 'about:blank',
+          title: async () => '',
+          goto: async () => null,
+          screenshot: async () => Buffer.from([]),
+          waitForLoadState: async () => {},
+          close: noop,
+        } as unknown as LaunchedBrowser['page'],
+      }
+      const factory = createPlaywrightSessionFactory({
+        launchChromium: async () => launched,
+      })
+      const session = await factory({
+        id: 'sess-cdp-close' as ComputerSessionId,
+        settings: makeSettings(),
+        options: { backend: 'cdp', cdpEndpoint: 'http://127.0.0.1:9222' },
+        requestClose: async () => {},
+        recordScreenshot: () => {},
+      })
+      await session.close()
+      expect(contextClose).toHaveBeenCalledTimes(1)
+      expect(browserClose).toHaveBeenCalledTimes(1)
+    })
   })
 
   // ---------------------------------------------------------------------------
