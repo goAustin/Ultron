@@ -65,7 +65,7 @@ describe('renderAttachment', () => {
   it('renders project_instructions', () => {
     const text = renderAttachment({ type: 'project_instructions', content: 'Build with npm' })
     expect(text).toContain('<system-reminder>')
-    expect(text).toContain('Project instructions (CLAUDE.md) have been updated')
+    expect(text).toContain('Project instructions (ULTRON.md) have been updated')
     expect(text).toContain('Build with npm')
   })
 
@@ -87,10 +87,10 @@ describe('renderAttachment', () => {
 // ---------------------------------------------------------------------------
 
 describe('getInitialAttachments', () => {
-  it('returns git_status and project_instructions in git repo with CLAUDE.md', async () => {
+  it('returns git_status and project_instructions in git repo with ULTRON.md', async () => {
     await withTmpDir(async (dir) => {
       initGitRepo(dir)
-      writeFileSync(join(dir, 'CLAUDE.md'), 'My rules')
+      writeFileSync(join(dir, 'ULTRON.md'), 'My rules')
 
       const msgs = await getInitialAttachments(dir)
       expect(msgs.length).toBe(2)
@@ -105,7 +105,7 @@ describe('getInitialAttachments', () => {
     })
   })
 
-  it('returns only git_status in git repo without CLAUDE.md', async () => {
+  it('returns only git_status in git repo without ULTRON.md', async () => {
     await withTmpDir(async (dir) => {
       initGitRepo(dir)
 
@@ -118,9 +118,9 @@ describe('getInitialAttachments', () => {
     })
   })
 
-  it('returns only project_instructions in non-git dir with CLAUDE.md', async () => {
+  it('returns only project_instructions in non-git dir with ULTRON.md', async () => {
     await withTmpDir(async (dir) => {
-      writeFileSync(join(dir, 'CLAUDE.md'), 'Instructions here')
+      writeFileSync(join(dir, 'ULTRON.md'), 'Instructions here')
 
       const msgs = await getInitialAttachments(dir)
       expect(msgs.length).toBe(1)
@@ -229,20 +229,20 @@ describe('buildGetAttachments', () => {
     })
   })
 
-  it('returns project_instructions when CLAUDE.md was modified', async () => {
+  it('returns project_instructions when ULTRON.md was modified', async () => {
     await withTmpDir(async (dir) => {
-      writeFileSync(join(dir, 'CLAUDE.md'), 'Updated rules')
+      writeFileSync(join(dir, 'ULTRON.md'), 'Updated rules')
 
       const getAttachments = buildGetAttachments(dir)
       const msgs = await getAttachments([
-        makeExecution('FileEdit', { file_path: join(dir, 'CLAUDE.md') }),
+        makeExecution('FileEdit', { file_path: join(dir, 'ULTRON.md') }),
       ])
 
       const texts = msgs.map((m) => {
         const b = m.content[0]
         return b?.type === 'text' ? b.text : ''
       })
-      expect(texts.some((t) => t.includes('Project instructions (CLAUDE.md) have been updated'))).toBe(true)
+      expect(texts.some((t) => t.includes('Project instructions (ULTRON.md) have been updated'))).toBe(true)
       expect(texts.some((t) => t.includes('Updated rules'))).toBe(true)
     })
   })
@@ -291,8 +291,8 @@ describe('date and message shape', () => {
   it('messages have flags.isAttachment === true', async () => {
     await withTmpDir(async (dir) => {
       const msgs = await getInitialAttachments(dir)
-      // Non-git, no CLAUDE.md → empty. Create CLAUDE.md for a result.
-      writeFileSync(join(dir, 'CLAUDE.md'), 'rules')
+      // Non-git, no ULTRON.md → empty. Create ULTRON.md for a result.
+      writeFileSync(join(dir, 'ULTRON.md'), 'rules')
       clearUserContextCache()
       const msgs2 = await getInitialAttachments(dir)
 
@@ -305,7 +305,7 @@ describe('date and message shape', () => {
 
   it('messages contain system-reminder wrapped text', async () => {
     await withTmpDir(async (dir) => {
-      writeFileSync(join(dir, 'CLAUDE.md'), 'rules')
+      writeFileSync(join(dir, 'ULTRON.md'), 'rules')
 
       const msgs = await getInitialAttachments(dir)
       for (const msg of msgs) {

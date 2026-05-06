@@ -23,24 +23,24 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('getProjectInstructions', () => {
-  it('returns file content when CLAUDE.md exists', async () => {
+  it('returns file content when ULTRON.md exists', async () => {
     await withTmpDir(async (dir) => {
-      writeFileSync(join(dir, 'CLAUDE.md'), 'Build instructions here')
+      writeFileSync(join(dir, 'ULTRON.md'), 'Build instructions here')
       const result = await getProjectInstructions(dir)
       expect(result).toBe('Build instructions here')
     })
   })
 
-  it('returns null when CLAUDE.md does not exist', async () => {
+  it('returns null when ULTRON.md does not exist', async () => {
     await withTmpDir(async (dir) => {
       const result = await getProjectInstructions(dir)
       expect(result).toBeNull()
     })
   })
 
-  it('returns null for empty CLAUDE.md', async () => {
+  it('returns null for empty ULTRON.md', async () => {
     await withTmpDir(async (dir) => {
-      writeFileSync(join(dir, 'CLAUDE.md'), '   \n  ')
+      writeFileSync(join(dir, 'ULTRON.md'), '   \n  ')
       const result = await getProjectInstructions(dir)
       expect(result).toBeNull()
     })
@@ -49,8 +49,8 @@ describe('getProjectInstructions', () => {
   it('caches by cwd — different dirs get independent results', async () => {
     await withTmpDir(async (dir1) => {
       await withTmpDir(async (dir2) => {
-        writeFileSync(join(dir1, 'CLAUDE.md'), 'project-one')
-        // dir2 has no CLAUDE.md
+        writeFileSync(join(dir1, 'ULTRON.md'), 'project-one')
+        // dir2 has no ULTRON.md
 
         const r1 = await getProjectInstructions(dir1)
         const r2 = await getProjectInstructions(dir2)
@@ -62,11 +62,11 @@ describe('getProjectInstructions', () => {
 
   it('clearUserContextCache forces re-read', async () => {
     await withTmpDir(async (dir) => {
-      writeFileSync(join(dir, 'CLAUDE.md'), 'original')
+      writeFileSync(join(dir, 'ULTRON.md'), 'original')
       const first = await getProjectInstructions(dir)
       expect(first).toBe('original')
 
-      writeFileSync(join(dir, 'CLAUDE.md'), 'updated')
+      writeFileSync(join(dir, 'ULTRON.md'), 'updated')
       clearUserContextCache()
       const second = await getProjectInstructions(dir)
       expect(second).toBe('updated')

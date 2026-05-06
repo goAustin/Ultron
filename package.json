@@ -4,6 +4,9 @@
   "license": "MIT",
   "type": "module",
   "private": true,
+  "bin": {
+    "ultron": "dist/cli.js"
+  },
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",

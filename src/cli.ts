@@ -24,6 +24,15 @@ import { handleMemoryCommand } from './cli/memoryCommand.js'
 import { handleSkillCommand } from './cli/skillsCommand.js'
 import { handleWebCommand } from './cli/webCommand.js'
 import { installEscAbort, type EscAbortController } from './cli/escAbort.js'
+import { buildTheme, isThemeName, VALID_THEME_NAMES, type ThemeName } from './cli/ui/themes.js'
+import {
+  readlinePrompt,
+  renderHelp,
+  renderSessionHeader,
+  renderWelcome,
+  resolveWidth,
+} from './cli/ui/render.js'
+import { StreamRenderer } from './cli/ui/streamRenderer.js'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -39,6 +48,33 @@ export const FAST_FALLBACK_MODEL = 'claude-sonnet-4-6'
 // `/thinking` CLI toggle in Phase 1c — surface is engine config only.
 const DEFAULT_THINKING_BUDGET = 4096
 
+// Scaffold written by `/init` into the user's working directory. Kept minimal
+// on purpose — users iterate on their own ULTRON.md from this starting point.
+const INIT_TEMPLATE = `# Project Instructions for Ultron
+
+This file is read by Ultron at the start of each session and injected into
+the system prompt. Use it to give Ultron persistent project-level context
+that doesn't belong in conversation: tech stack, conventions, key commands,
+gotchas, things to avoid.
+
+## Overview
+
+<one paragraph: what this project is and who works on it>
+
+## Commands
+
+<the handful of commands you actually run — build, test, lint, dev server>
+
+## Conventions
+
+<project-specific conventions Ultron should respect: code style, file
+layout, naming, directories that are off-limits, formatting tools>
+
+## Notes
+
+<anything else worth pinning: known issues, in-flight migrations, deadlines>
+`
+
 const baseUrl = process.argv.includes('--base-url')
   ? process.argv[process.argv.indexOf('--base-url') + 1]!
   : undefined
@@ -48,7 +84,31 @@ const baseUrl = process.argv.includes('--base-url')
 const cliModel = process.argv.includes('--model')
   ? process.argv[process.argv.indexOf('--model') + 1]!
   : undefined
-const model = cliModel ?? readUserConfig().lastModel ?? DEFAULT_MODEL
+const userConfig = readUserConfig()
+const model = cliModel ?? userConfig.lastModel ?? DEFAULT_MODEL
+
+// Theme & glyph come from ~/.ultron/config.json (set via /theme, /glyph).
+// Default theme is 'dark' since most CLI users run on a dark terminal —
+// users with a light terminal pick `/theme light` once and it persists.
+// Legacy values from earlier builds (paper / ink / phosphor) are migrated.
+const LEGACY_THEME_MAP: Record<string, ThemeName> = {
+  paper: 'light',
+  ink: 'dark',
+  phosphor: 'dark',
+}
+function resolveSavedTheme(saved: unknown): ThemeName {
+  if (isThemeName(saved)) return saved
+  if (typeof saved === 'string' && LEGACY_THEME_MAP[saved]) return LEGACY_THEME_MAP[saved]!
+  return 'dark'
+}
+
+let themeName: ThemeName = resolveSavedTheme(userConfig.theme)
+let glyph: string = typeof userConfig.glyph === 'string' && userConfig.glyph.length > 0
+  ? userConfig.glyph
+  : '❯'
+const width = resolveWidth(process.stdout)
+let theme = buildTheme(themeName, { stream: process.stdout, env: process.env })
+let streamRenderer = new StreamRenderer({ theme, output: process.stdout, width })
 
 let adapter
 try {
@@ -67,6 +127,15 @@ if (!process.env[adapter.envKeyName]) {
 }
 
 const cwd = process.cwd()
+
+// Set the terminal window title (OSC 0). Terminal.app already prepends the
+// working-directory basename and may append shell-command/window-size from
+// its own preferences — we only contribute the middle segment, so we don't
+// repeat the project name here.
+function setTerminalTitle(modelName: string): void {
+  if (!process.stdout.isTTY) return
+  process.stdout.write(`\x1b]0;Ultron — ${modelName}\x07`)
+}
 
 // ---------------------------------------------------------------------------
 // Permission approval callback
@@ -133,7 +202,7 @@ const computerWatchMode: WatchModeRenderer | null =
 
 // One-shot deprecation notice for the retired Phase 1 permissions log.
 // Does not touch the user's existing file; new decisions flow to ~/.ultron/audit.jsonl.
-import { existsSync } from 'node:fs'
+import { existsSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 if (existsSync(join(homedir(), '.ultron', 'permissions.jsonl'))) {
@@ -152,7 +221,8 @@ let rl = createInterface({
 })
 
 function prompt(prefill?: string): void {
-  rl.question('\n\x1b[36myou>\x1b[0m ', async (input) => {
+  const promptStr = '\n' + readlinePrompt(theme, glyph)
+  rl.question(promptStr, async (input) => {
     const trimmed = input.trim()
     if (!trimmed) {
       prompt()
@@ -160,10 +230,91 @@ function prompt(prefill?: string): void {
     }
 
     if (trimmed === '/quit' || trimmed === '/exit') {
-      console.log('Goodbye!')
+      process.stdout.write(theme.style('dim', 'goodbye.') + '\n')
       rl.close()
       await engine.dispose()
       process.exit(0)
+    }
+
+    if (trimmed === '/init') {
+      const target = join(cwd, 'ULTRON.md')
+      if (existsSync(target)) {
+        process.stdout.write(
+          theme.style('faint', `ULTRON.md already exists at ${target}`) + '\n',
+        )
+      } else {
+        try {
+          writeFileSync(target, INIT_TEMPLATE, 'utf-8')
+          process.stdout.write(theme.style('faint', `created ${target}`) + '\n')
+        } catch (err) {
+          process.stderr.write(
+            theme.style('error', `failed to create ULTRON.md: ${err instanceof Error ? err.message : String(err)}`) + '\n',
+          )
+        }
+      }
+      prompt()
+      return
+    }
+
+    if (trimmed === '/help') {
+      process.stdout.write(renderHelp(theme))
+      prompt()
+      return
+    }
+
+    if (trimmed === '/clear') {
+      // ANSI clear-screen + home; readline.write echoes nothing here.
+      process.stdout.write('\x1b[2J\x1b[H')
+      writeStartupBanner()
+      prompt()
+      return
+    }
+
+    if (trimmed === '/theme' || trimmed.startsWith('/theme ')) {
+      const arg = trimmed.slice('/theme'.length).trim()
+      if (!arg) {
+        process.stdout.write(
+          `${theme.style('faint', 'theme:')} ${theme.style('accent', themeName)}\n` +
+            `  ${theme.style('dim', 'usage: /theme <' + VALID_THEME_NAMES.join(' | ') + '>')}\n`,
+        )
+      } else if (!isThemeName(arg)) {
+        process.stderr.write(
+          theme.style('error', `unknown theme '${arg}'`) +
+            ` ${theme.style('dim', '(' + VALID_THEME_NAMES.join(', ') + ')')}\n`,
+        )
+      } else if (arg === themeName) {
+        process.stdout.write(theme.style('faint', `theme unchanged: ${themeName}`) + '\n')
+      } else {
+        themeName = arg
+        theme = buildTheme(themeName, { stream: process.stdout, env: process.env })
+        streamRenderer = new StreamRenderer({ theme, output: process.stdout, width })
+        writeUserConfig({ theme: themeName })
+        process.stdout.write(theme.style('faint', `theme: ${themeName}`) + '\n')
+      }
+      prompt()
+      return
+    }
+
+    if (trimmed === '/glyph' || trimmed.startsWith('/glyph ')) {
+      const arg = trimmed.slice('/glyph'.length).trim()
+      if (!arg) {
+        process.stdout.write(
+          `${theme.style('faint', 'prompt glyph:')} ${theme.style('accent', glyph)}\n` +
+            `  ${theme.style('dim', 'usage: /glyph <char>   examples: ❯ $ ~ ▸')}\n`,
+        )
+      } else {
+        // Take the first non-space character; tolerates "/glyph $ rest".
+        const first = arg.trimStart()[0]
+        if (!first) {
+          process.stderr.write(theme.style('error', 'glyph cannot be empty') + '\n')
+        } else {
+          glyph = first
+          writeUserConfig({ glyph })
+          process.stdout.write(theme.style('faint', `prompt glyph: ${glyph}`) + '\n')
+        }
+      }
+      prompt()
+      return
     }
 
     if (trimmed === '/session') {
@@ -257,6 +408,7 @@ function prompt(prefill?: string): void {
         } else {
           engine.setModel(choice)
           writeUserConfig({ lastModel: choice })
+          setTerminalTitle(choice)
           process.stdout.write(`\x1b[32m[model: ${choice}]\x1b[0m\n`)
         }
       } catch (err) {
@@ -339,6 +491,7 @@ function prompt(prefill?: string): void {
 
     let abortRequested = false
     try {
+      streamRenderer.beginTurn()
       const gen = engine.submitPrompt(trimmed)
       let result = await gen.next()
 
@@ -349,65 +502,25 @@ function prompt(prefill?: string): void {
         // No-op when watchMode is disabled or stderr is not a TTY.
         computerWatchMode?.handle(event)
 
-        switch (event.type) {
-          case 'text_delta':
-            process.stdout.write(event.text)
-            break
-          case 'tool_use_start':
-            process.stdout.write(`\n\x1b[33m[tool: ${event.name}]\x1b[0m `)
-            break
-          case 'tool_result': {
-            const block = event.message.content[0]
-            if (block && block.type === 'tool_result') {
-              const prefix = block.isError ? '\x1b[31m[error]\x1b[0m ' : '\x1b[32m[done]\x1b[0m '
-              const preview = block.content.slice(0, 200)
-              process.stdout.write(`${prefix}${preview}\n`)
-            }
-            break
-          }
-          case 'compaction_finished':
-            if (event.outcome === 'ok') {
-              process.stdout.write(`\n\x1b[35m[compacted: ${event.messagesBefore} → ${event.messagesAfter} messages]\x1b[0m\n`)
-            }
-            break
-          case 'error':
-            process.stderr.write(`\n\x1b[31m[error: ${event.error.message}]\x1b[0m\n`)
-            break
-          case 'request_start':
-          case 'thinking_delta':
-          case 'turn':
-          case 'attachment':
-          case 'permission_decision':
-          case 'tool_call_started':
-          case 'tool_call_finished':
-          case 'tool_progress':
-          case 'hook_started':
-          case 'hook_finished':
-          case 'compaction_started':
-          case 'memory_entry_written':
-          case 'memory_entry_deleted':
-          case 'skill_written':
-          case 'skill_deleted':
-          case 'skill_activated':
-          case 'skill_deactivated':
-          case 'web_backend_resolved':
-            // Intentionally silent in the interactive CLI — these flow to the audit log.
-            break
-          default: {
-            const _exhaustive: never = event
-            void _exhaustive
-          }
-        }
+        streamRenderer.handle(event)
 
         result = await gen.next()
       }
 
       const terminal = result.value
       if (terminal.reason === 'error') {
-        process.stderr.write(`\n\x1b[31m[terminal error: ${terminal.error?.message}]\x1b[0m\n`)
+        process.stderr.write(
+          '\n' +
+            theme.style('error', `! ${terminal.error?.message ?? 'terminal error'}`) +
+            '\n',
+        )
       } else if (terminal.reason === 'aborted') {
         abortRequested = true
-        process.stdout.write('\n\x1b[33m[aborted — press Enter to send, or edit]\x1b[0m\n')
+        process.stdout.write(
+          '\n' +
+            theme.style('accent2', '· aborted — press Enter to send, or edit') +
+            '\n',
+        )
       }
 
       process.stdout.write('\n')
@@ -437,8 +550,16 @@ function prompt(prefill?: string): void {
 // Start
 // ---------------------------------------------------------------------------
 
-console.log(`\x1b[1mUltron v0.1.0\x1b[0m — model: ${model} (${adapter.displayName})${baseUrl ? `, via: ${baseUrl}` : ''}, cwd: ${cwd}`)
-console.log('Type /quit to exit, /session, /model, /memory, /skill, /web, /mcp status, /mcp reload, /mcp list-tools.\n')
+function writeStartupBanner(): void {
+  process.stdout.write(renderSessionHeader(theme, { model, cwd, width }))
+  process.stdout.write('\n')
+  process.stdout.write(renderWelcome(theme, { width }))
+  if (baseUrl) {
+    process.stdout.write(theme.style('faint', `· via ${baseUrl}`) + '\n')
+  }
+}
+writeStartupBanner()
+setTerminalTitle(engine.currentModel)
 
 // Pre-warm MCP so any config errors surface before the first prompt and any
 // server failures are reported up-front.

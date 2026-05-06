@@ -2,7 +2,7 @@
  * CodeSandboxTool — execute ephemeral Python or JavaScript snippets in a
  * WASM-bound sandbox. Each call spawns a fresh `worker_threads.Worker` running
  * QuickJS (for JS) or Pyodide (for Python). No host filesystem, no shell, no
- * Node globals reach the snippet. See `docs/phase6c-v2-design.md`.
+ * Node globals reach the snippet. See `docs/ultron_v2/phase6c-v2-design.md`.
  *
  * Permission model: tool-name-only rules (no path/domain). The cascade asks
  * on first call; user accepts → session rule for `CodeSandbox`. Skill

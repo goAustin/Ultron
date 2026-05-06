@@ -18,7 +18,7 @@ export type ModelEntry = {
   readonly label: string         // e.g. 'Claude Opus 4.7'
   readonly description: string   // e.g. 'Highest capability'
 
-  // Capability metadata — populated by every adapter; see docs/phase1a-v2-design.md.
+  // Capability metadata — populated by every adapter; see docs/ultron_v2/phase1a-v2-design.md.
   readonly maxContextTokens: number
   readonly maxOutputTokens: number
   readonly supportsThinking: boolean

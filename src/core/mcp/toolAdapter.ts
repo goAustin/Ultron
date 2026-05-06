@@ -63,7 +63,7 @@ export function createMcpTool(args: CreateMcpToolArgs): Tool | null {
       return { valid: true }
     },
 
-    // The full rationale lives in docs/phase3a-v2-design.md §Critical invariants.
+    // The full rationale lives in docs/ultron_v2/phase3a-v2-design.md §Critical invariants.
     // Returning `allow` lets the permission cascade fall through to fallback-ask
     // on first use and match session allow rules on subsequent calls.
     async checkPermissions() {

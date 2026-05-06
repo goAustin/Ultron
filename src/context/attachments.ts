@@ -37,7 +37,7 @@ export function renderAttachment(attachment: Attachment): string {
     case 'git_status':
       return `<system-reminder>\nGit status has been updated after tool execution:\n${attachment.status}\n</system-reminder>`
     case 'project_instructions':
-      return `<system-reminder>\nProject instructions (CLAUDE.md) have been updated:\n${attachment.content}\n</system-reminder>`
+      return `<system-reminder>\nProject instructions (ULTRON.md) have been updated:\n${attachment.content}\n</system-reminder>`
     case 'file_change':
       return `<system-reminder>\nFile ${attachment.action}: ${attachment.path}\n</system-reminder>`
     case 'date_change':
@@ -118,9 +118,9 @@ export function buildGetAttachments(cwd: string): GetAttachmentsFn {
       })
     }
 
-    // Project instructions refresh (if CLAUDE.md was modified)
-    const claudeMdModified = modifiedPaths.some((p) => p.endsWith('CLAUDE.md'))
-    if (claudeMdModified) {
+    // Project instructions refresh (if ULTRON.md was modified)
+    const ultronMdModified = modifiedPaths.some((p) => p.endsWith('ULTRON.md'))
+    if (ultronMdModified) {
       clearUserContextCache(cwd)
       const instructions = await getProjectInstructions(cwd)
       if (instructions) {

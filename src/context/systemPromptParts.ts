@@ -8,7 +8,7 @@
  *                  Ultron policy preamble). Eligible for provider global-cache
  *                  lookup where supported.
  * - `'org'`      — content stable within one user but per-install (memory
- *                  entries; future: skills, CLAUDE.md if it ever migrates off
+ *                  entries; future: skills, ULTRON.md if it ever migrates off
  *                  the attachment path). Gets its own cache breakpoint so
  *                  changes don't invalidate the preamble cache.
  * - `'volatile'` — changes every turn (date, env info). No breakpoint.

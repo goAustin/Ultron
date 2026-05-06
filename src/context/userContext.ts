@@ -1,5 +1,5 @@
 /**
- * User context — reads project instructions (CLAUDE.md) from the working directory.
+ * User context — reads project instructions (ULTRON.md) from the working directory.
  *
  * Cached by cwd so multiple calls with the same directory return the same result.
  * The current date is NOT included here — it is computed fresh on each call
@@ -25,7 +25,7 @@ export function clearUserContextCache(cwd?: string): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Read project instructions from CLAUDE.md in the given directory.
+ * Read project instructions from ULTRON.md in the given directory.
  * Returns `null` if the file does not exist or is empty.
  * Result is cached by cwd for the lifetime of the process (or until cleared).
  */
@@ -44,14 +44,14 @@ export function getProjectInstructions(cwd: string): Promise<string | null> {
 
 async function readProjectInstructions(cwd: string): Promise<string | null> {
   try {
-    const content = await readFile(join(cwd, 'CLAUDE.md'), 'utf-8')
+    const content = await readFile(join(cwd, 'ULTRON.md'), 'utf-8')
     return content.trim() || null
   } catch (err: unknown) {
     if (err instanceof Error && 'code' in err && err.code === 'ENOENT') {
       return null
     }
     process.stderr.write(
-      `Warning: failed to read CLAUDE.md: ${err instanceof Error ? err.message : String(err)}\n`,
+      `Warning: failed to read ULTRON.md: ${err instanceof Error ? err.message : String(err)}\n`,
     )
     return null
   }

@@ -12,6 +12,14 @@ import { dirname, join } from 'node:path'
 
 export type UserConfig = {
   lastModel?: string
+  /**
+   * Theme persisted from /theme. One of 'light' | 'dark'. Legacy values
+   * ('paper' | 'ink' | 'phosphor') from earlier builds are migrated to a
+   * close equivalent at startup.
+   */
+  theme?: string
+  /** Prompt glyph persisted from /glyph. Free-form so users can pick their own. */
+  glyph?: string
 }
 
 const CONFIG_DIR = join(homedir(), '.ultron')
